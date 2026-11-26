@@ -1,0 +1,39 @@
+# Long-lived helper pod ("workspace") that holds the node-local work PVC and is the
+# landing pad for kubectl-exec tar streams: data in, repo tarballs in, /out artifacts back
+# out. It requests no GPU, so it never contends for a card. k8s/lib.sh creates it lazily.
+apiVersion: v1
+kind: Pod
+metadata:
+  name: ${WS_NAME}
+  namespace: ${NAMESPACE}
+  labels:
+    app: ${APP_LABEL}
+    app.kubernetes.io/name: ${APP_LABEL}
+    app.kubernetes.io/component: workspace
+    vision-intern/gpu: "${GPU}"
+spec:
+  restartPolicy: Always
+  enableServiceLinks: false
+  nodeSelector:
+    kubernetes.io/hostname: ${NODE}
+  containers:
+    - name: workspace
+      image: ${WS_IMAGE}
+      imagePullPolicy: IfNotPresent
+      command: ["/bin/sh", "-c", "mkdir -p /work/data /work/artifacts /work/repo /work/jobs /work/cache && i=0; while :; do i=$((i+1)); [ $((i % 60)) -eq 0 ] && df -h /work | tail -1; sleep 60; done"]
+      securityContext:
+        # The work dir on the PVC is root-owned (local-path provisions as root), so this pod
+        # stays uid 0; everything else is locked down as far as `default` ns allows.
+        runAsUser: 0
+        allowPrivilegeEscalation: false
+        capabilities: { drop: ["ALL"] }
+        seccompProfile: { type: RuntimeDefault }
+      resources:
+        requests: { cpu: 10m, memory: 16Mi }
+        limits:   { cpu: "1",  memory: 256Mi }
+      volumeMounts:
+        - { name: work, mountPath: /work }
+  volumes:
+    - name: work
+      persistentVolumeClaim:
+        claimName: ${PVC_NAME}

@@ -1,0 +1,121 @@
+# Parameterised GPU experiment Job for the home cluster.
+#
+# Rendered by k8s/submit.sh with plain envsubst: EVERY dollar-brace placeholder below must
+# be set in the environment (k8s/lib.sh:render refuses if one is missing). Placeholders:
+#
+#   JOB_NAME         job name; also /work/jobs/<JOB_NAME>.sh (the uploaded command file);
+#                    the entrypoint symlinks /out -> /work/artifacts/<JOB_NAME>/
+#   GPU              5090 | 6000
+#   NODE             kubernetes.io/hostname of the node that owns that card
+#   PVC_NAME         node-local work PVC created by k8s/stage-data.sh
+#   IMAGE            public CUDA base image (nothing private in it, ever)
+#   REQUESTS         resources.requests flow map,  e.g. {cpu: 2, memory: 8Gi}
+#   LIMITS           resources.limits flow map,    e.g. {cpu: 8, memory: 24Gi,
+#                    nvidia.com/gpu: 1, nvidia.com/gpumem: 8192}
+#   POD_ANNOTATIONS  {nvidia.com/use-gputype: "RTX 5090"}
+#   SCHEDULER_NAME   hami-scheduler (HAMi-booked GPU) or "" (default scheduler)
+#   SHARE_ENV        extra env list items for share mode, rendered as raw YAML lines:
+#                    `- {name: NVIDIA_VISIBLE_DEVICES, value: all}` + the CUDA_DISABLE_CONTROL
+#                    sibling; empty string in hami mode
+#   VI_GPU_MODE      hami | share   (exported to the job so scripts can tell)
+#   VI_GPU_MEM_MB    VRAM this job may use: HAMi quota in hami mode, self-limit in share
+#   SHM_SIZE         /dev/shm size (DataLoader workers put tensors there)
+#   ACTIVE_DEADLINE  hard job timeout, seconds
+#   TTL              ttlSecondsAfterFinished
+#
+# Cluster conventions honoured here (/home/david/dev/home-k8s/AGENTS.md +
+# .agents/skills/hami-gpu-accounting/SKILL.md):
+#   * runtimeClassName: nvidia; enableServiceLinks: false (service env vars are noise at
+#     best and collide with serving-stack env at worst).
+#   * anything that asks for nvidia.com/gpu MUST also set nvidia.com/gpumem: without it HAMi
+#     books the WHOLE card and the resident LLM engines can never co-schedule. Never set
+#     nvidia.com/gpucores -- compute capping is unreliable on Blackwell here.
+#   * pin the card by type as well as by hostname -- "RTX" alone matches BOTH cards.
+#   * share mode is the gpu-vram-exporter / gpu-power-limit pattern: request no GPU
+#     resource, NVIDIA_VISIBLE_DEVICES=all + CUDA_DISABLE_CONTROL=true gives the raw card
+#     with no HAMi booking. Only safe for jobs that self-limit to the VRAM physically free
+#     next to the resident engines -- submit.sh measures that and refuses if we do not fit.
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: ${JOB_NAME}
+  namespace: ${NAMESPACE}
+  labels:
+    app: ${APP_LABEL}
+    app.kubernetes.io/name: ${APP_LABEL}
+    app.kubernetes.io/component: job
+    vision-intern/job: ${JOB_NAME}
+    vision-intern/gpu: "${GPU}"
+spec:
+  backoffLimit: 0
+  ttlSecondsAfterFinished: ${TTL}
+  activeDeadlineSeconds: ${ACTIVE_DEADLINE}
+  template:
+    metadata:
+      labels:
+        app: ${APP_LABEL}
+        app.kubernetes.io/name: ${APP_LABEL}
+        app.kubernetes.io/component: job
+        vision-intern/job: ${JOB_NAME}
+        vision-intern/gpu: "${GPU}"
+      annotations: ${POD_ANNOTATIONS}
+    spec:
+      restartPolicy: Never
+      runtimeClassName: nvidia
+      enableServiceLinks: false
+      schedulerName: ${SCHEDULER_NAME}
+      nodeSelector:
+        kubernetes.io/hostname: ${NODE}
+      containers:
+        - name: job
+          image: ${IMAGE}
+          imagePullPolicy: IfNotPresent
+          workingDir: /src
+          command: ["/bin/bash", "-lc"]
+          args:
+            - |
+              set -euo pipefail
+              t0=$(date +%s)
+              echo "== job on node $(hostname), gpu mode $VI_GPU_MODE, budget ${VI_GPU_MEM_MB} MiB"
+              nvidia-smi -L || true
+              mkdir -p /src
+              echo "== unpack repo snapshot /work/repo/$VI_JOB_NAME.tar (uploaded by submit.sh)"
+              rm -rf /src/*
+              tar -C /src -xf /work/repo/$VI_JOB_NAME.tar
+              mkdir -p /work/artifacts/$VI_JOB_NAME
+              ln -sfn /work/artifacts/$VI_JOB_NAME /out
+              ln -sfn /work/data /src/data
+              cd /src
+              echo "== files: $(find . -maxdepth 1 -type d | tr '\n' ' ')"
+              echo "== command file /work/jobs/${JOB_NAME}.sh"
+              echo "== python: $(python -V 2>&1), torch import starts now ($(date +%s) epoch)"
+              bash -e /work/jobs/${JOB_NAME}.sh
+              echo "== finished in $(( $(date +%s) - t0 )) s"
+          env:
+            - { name: PYTHONPATH, value: /src }
+            - { name: OUT_DIR, value: /out }
+            - { name: HOME, value: /work/cache }
+            - { name: HF_HOME, value: /work/cache/huggingface }
+            - { name: TORCH_HOME, value: /work/cache/torch }
+            - { name: UV_CACHE_DIR, value: /work/cache/uv }
+            - { name: PIP_CACHE_DIR, value: /work/cache/pip }
+            - { name: NVIDIA_DRIVER_CAPABILITIES, value: "compute,utility" }
+            - { name: PYTORCH_CUDA_ALLOC_CONF, value: "expandable_segments:True" }
+            - { name: VI_GPU_MODE, value: "${VI_GPU_MODE}" }
+            - { name: VI_GPU_MEM_MB, value: "${VI_GPU_MEM_MB}" }
+            - { name: VI_JOB_NAME, value: "${JOB_NAME}" }
+            ${SHARE_ENV}
+          resources:
+            requests: ${REQUESTS}
+            limits: ${LIMITS}
+          # ONE mount of the PVC. Mounting the same claim twice, the second time with a
+          # subPath, silently lands the writes somewhere the helper pod cannot see (measured
+          # on this cluster 2026-11-26) -- so /out is a symlink into /work instead.
+          volumeMounts:
+            - { name: work, mountPath: /work }
+            - { name: dshm, mountPath: /dev/shm }
+      volumes:
+        - name: work
+          persistentVolumeClaim: { claimName: ${PVC_NAME} }
+        - name: dshm
+          emptyDir: { medium: Memory, sizeLimit: ${SHM_SIZE} }
