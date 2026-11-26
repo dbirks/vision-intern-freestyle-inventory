@@ -75,3 +75,10 @@ def test_quad_rectifies_pattern():
     assert (result[80, 10] == [255, 0, 0]).all()
     assert (result[20, -10] == [255, 255, 255]).all()
     assert (result[80, -10] == [255, 255, 255]).all()
+
+
+def test_equal_score_fragment_is_suppressed_before_merge():
+    fragment = {"box": [0, 0, 5, 10], "score": 0.8, "category_id": 1}
+    full = {"box": [0, 0, 10, 10], "score": 0.8, "category_id": 1}
+    for mode in ("nms", "wbf"):
+        assert g.merge_tiled([fragment, full], mode=mode, containment_threshold=0.9) == [full]

@@ -301,3 +301,18 @@ def test_status_transitions(review):
     status, payload, _ = review["request"]("GET", "/api/images")
     statuses = {im["image_id"]: im["status"] for im in payload["images"]}
     assert statuses["grp/a.jpg"] == "verified"
+
+
+def test_quad_validation_and_json_content_type(review):
+    from freestyle.review.server import CONTENT_TYPES
+
+    quad = [[1, 2], [3, 2], [3, 4], [1, 4]]
+    ann = {"category": "hi-c", "bbox": [1, 2, 2, 2], "quad": quad}
+    status, payload, _ = review["request"]("PUT", "/api/ann/0", {"annotations": [ann]})
+    assert status == 200
+    assert payload["annotations"][0]["quad"] == quad
+    for invalid in (quad[:3], [1, 2, 3, 4], [[1, 2], [3, 2], [3, 4], [1, "x"]]):
+        ann["quad"] = invalid
+        status, _, _ = review["request"]("PUT", "/api/ann/0", {"annotations": [ann]})
+        assert status == 400
+    assert CONTENT_TYPES[".json"] == "application/json"

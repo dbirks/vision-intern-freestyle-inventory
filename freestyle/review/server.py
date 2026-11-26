@@ -528,7 +528,8 @@ class ReviewStore:
                 attrs = item.get("attributes") if isinstance(item.get("attributes"), dict) else {}
                 quad = item.get("quad")
                 if quad is not None:
-                    quad = _as_floats(quad, 4, "quad")
+                    if not isinstance(quad, list) or len(quad) != 4:
+                        raise ValidationError("quad must contain 4 points")
                     quad = [_as_floats(pt, 2, "quad point") for pt in quad]
                 aid = item.get("id")
                 old = prev.get(aid) if isinstance(aid, int) else None
@@ -700,7 +701,7 @@ CONTENT_TYPES = {
     ".html": "text/html; charset=utf-8",
     ".js": "application/javascript; charset=utf-8",
     ".css": "text/css; charset=utf-8",
-    ".json": "application json",
+    ".json": "application/json",
     ".jpg": "image/jpeg",
     ".jpeg": "image/jpeg",
     ".png": "image/png",

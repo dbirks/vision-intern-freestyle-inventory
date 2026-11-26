@@ -212,6 +212,7 @@ def test_freestyle_e2e_synthetic_pipeline(tmp_path: Path, monkeypatch: pytest.Mo
         identify_cli.main(
             [
                 "embed",
+                "--split", "all",
                 "--split-map",
                 str(splits_path),
                 "--coco",
@@ -549,10 +550,6 @@ counting:
         httpd.server_close()
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason="freestyle/review/server.py:531 calls _as_floats(quad, 4, 'quad') on 4x2 nested points, rejecting valid quad payloads with HTTP 400",
-)
 def test_review_server_quad_roundtrip(tmp_path: Path) -> None:
     """Loading contract COCO with ``quad`` into review.server and PUTting back should succeed."""
     images_root = tmp_path / "images"

@@ -199,7 +199,10 @@ def merge_tiled(dets, iou=0.5, mode="nms", containment_threshold=None, class_agn
         raise ValueError("containment threshold must be in [0, 1]")
     if containment_threshold is not None:
         kept = []
-        for det in sorted(dets, key=lambda d: -d["score"]):
+        for det in sorted(dets, key=lambda d: (
+            -d["score"],
+            -np.prod(np.maximum(0, np.asarray(d["box"])[2:] - np.asarray(d["box"])[:2])),
+        )):
             area = np.prod(np.maximum(0, np.asarray(det["box"])[2:] - np.asarray(det["box"])[:2]))
             if not any(d.get("category_id") == det.get("category_id")
                        and np.prod(np.maximum(0, np.asarray(d["box"])[2:] - np.asarray(d["box"])[:2])) >= area

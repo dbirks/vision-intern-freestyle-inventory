@@ -330,6 +330,7 @@ def test_cli_embed_and_eval_roundtrip(tmp_path: Path, monkeypatch: pytest.Monkey
     rc = identify_cli.main(
         [
             "embed",
+            "--split", "all",
             "--split-map", str(splits_path),
             "--coco",
             str(coco_path),
@@ -351,6 +352,18 @@ def test_cli_embed_and_eval_roundtrip(tmp_path: Path, monkeypatch: pytest.Monkey
         assert d["embeddings"].shape[0] == 6
         assert d["used_quad"].tolist() == [False, False, True, False, False, False]
         np.testing.assert_allclose(np.linalg.norm(d["embeddings"], axis=1), 1.0, atol=1e-5)
+
+    for selected, expected in [(None, "train"), ("val", "val")]:
+        filtered_path = tmp_path / f"{expected}.npz"
+        args = ["embed", "--split-map", str(splits_path), "--coco", str(coco_path),
+                "--images-root", str(images_root), "--out", str(filtered_path), "--model", "stub"]
+        if selected:
+            args += ["--split", selected]
+        assert identify_cli.main(args) == 0
+        with np.load(filtered_path, allow_pickle=False) as filtered:
+            assert len(filtered["splits"]) > 0
+            assert set(filtered["splits"]) == {expected}
+            assert len(filtered["splits"]) == len(filtered["embeddings"])
 
     for clf_name in ("proto", "knn", "linear"):
         out_json = tmp_path / f"metrics_{clf_name}.json"

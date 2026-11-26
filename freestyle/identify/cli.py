@@ -182,12 +182,18 @@ def run_embed(args: argparse.Namespace) -> dict[str, Any]:
     bboxes: list[list[float]] = []
     used_quad: list[bool] = []
     skipped = 0
+    split_data = _load_json(args.split_map)
+    groups: list[str] = []
+    splits: list[str] = []
 
     for img_id, img_rec in images_by_id.items():
         anns = anns_by_image.get(img_id, [])
         if not anns:
             continue
         file_name = str(img_rec.get("file_name") or img_id)
+        img_groups, img_splits = _resolve_groups_and_splits([file_name], [str(img_id)], split_data)
+        if args.split != "all" and img_splits[0] != args.split:
+            continue
         img_path = images_root / file_name
         with Image.open(img_path) as im:
             orig_img = im.convert("RGB")
@@ -215,8 +221,9 @@ def run_embed(args: argparse.Namespace) -> dict[str, Any]:
             annotation_ids.append(str(ann.get("id", len(annotation_ids))))
             bboxes.append([x, y, w, h])
             used_quad.append(is_quad)
+            groups.append(img_groups[0])
+            splits.append(img_splits[0])
 
-    groups, splits = _resolve_groups_and_splits(file_names, image_ids, _load_json(args.split_map))
     embedder = Embedder(
         args.model,
         device=args.device,
@@ -362,6 +369,8 @@ def build_parser() -> argparse.ArgumentParser:
 
     p_embed = sub.add_parser("embed", help="Crop COCO annotations and extract embeddings to .npz.")
     p_embed.add_argument("--split-map", required=True)
+    p_embed.add_argument("--split", choices=("train", "val", "test", "exclude", "all"),
+                         default="train", help="Split to embed (default: train; all for evaluation).")
     p_embed.add_argument("--coco", required=True, help="Input COCO JSON file.")
     p_embed.add_argument("--images-root", required=True, help="Root directory for image files.")
     p_embed.add_argument("--out", required=True, help="Output .npz archive path.")
