@@ -1,6 +1,6 @@
-# Long-lived helper pod ("workspace") that holds the node-local work PVC and is the
-# landing pad for kubectl-exec tar streams: data in, repo tarballs in, /out artifacts back
-# out. It requests no GPU, so it never contends for a card. k8s/lib.sh creates it lazily.
+# Long-lived helper pod ("workspace") that holds a node-local PVC and is the landing
+# pad for kubectl-cp tar streams: data in, repo/scripts in, /out artifacts back out.
+# It requests no GPU, so it never contends for a card. k8s/lib.sh creates it lazily.
 apiVersion: v1
 kind: Pod
 metadata:
@@ -11,6 +11,8 @@ metadata:
     app.kubernetes.io/name: ${APP_LABEL}
     app.kubernetes.io/component: workspace
     vision-intern/gpu: "${GPU}"
+  annotations:
+    vision-intern/owner: "${OWNER}"
 spec:
   restartPolicy: Always
   enableServiceLinks: false

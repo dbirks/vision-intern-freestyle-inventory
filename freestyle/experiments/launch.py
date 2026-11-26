@@ -1,14 +1,37 @@
 """Resolve and launch Freestyle experiments."""
 import argparse
+import hashlib
 import json
+import os
+import re
 import shlex
+import shutil
 import subprocess
 import sys
+import tempfile
 from pathlib import Path
 
 import yaml
 
 from freestyle.experiments import schema
+
+_PINNED_CONSTRAINTS = ('pycocotools==2.0.11', 'scipy==1.18.0')
+
+
+def normalize_job_name(name):
+    """Normalize an experiment/run name to a collision-free DNS-1123 label <= 57 chars."""
+    slug = re.sub(r'[^a-z0-9-]+', '-', name.lower()).strip('-')
+    if not slug:
+        slug = 'job'
+    if slug == name and len(slug) <= 57:
+        return slug
+    if len(slug) <= 57 and re.fullmatch(r'[a-z0-9-]+', name.lower().replace('_', '-')):
+        # Keep simple lowercase/underscore replacements intact when already unambiguous.
+        if '.' not in name and not name.startswith('-') and not name.endswith('-'):
+            return slug
+    suffix = hashlib.sha256(name.encode()).hexdigest()[:8]
+    prefix = slug[:57 - 9].rstrip('-') or 'job'
+    return f'{prefix}-{suffix}'
 
 
 def submit_argv(c, config_path, name, dry_run=False, sha=None, state=None):
@@ -16,10 +39,26 @@ def submit_argv(c, config_path, name, dry_run=False, sha=None, state=None):
     specs = ['transformers==5.24.1', 'pycocotools', 'scipy']
     if c['family'].startswith(('C_', 'D_', 'E_', 'F_')):
         specs.append('rfdetr==1.12.1')
-    argv = ['k8s/submit.sh', name.lower().replace('_', '-'), gpu,
+    needs_hf_token = c.get('needs_hf_token', False)
+    if not isinstance(needs_hf_token, bool):
+        raise ValueError('needs_hf_token must be a boolean')
+    mode = c['compute']['mode']
+    if mode == 'auto':
+        mode = 'hami'
+    wait_for = c['compute']['timeout'] + 300
+    argv = ['k8s/submit.sh', normalize_job_name(name), gpu,
             '--mem', str(c['compute']['vram_mb']), '--timeout', str(c['compute']['timeout']),
-            '--pip', ' '.join(specs), '--wait', '--wait-for', str(c['compute']['timeout']),
-            '--mode', c['compute']['mode']]
+            '--pip', ' '.join(specs), '--wait', '--wait-for', str(wait_for),
+            '--mode', mode,
+            '--pip-constraints', ' '.join(_PINNED_CONSTRAINTS)]
+    if needs_hf_token:
+        argv.append('--hf-token')
+    if sha:
+        argv += ['--expect-git-sha', sha]
+    if state is not None:
+        argv += ['--expect-git-dirty', str(state['dirty']).lower()]
+        if state['diff_hash']:
+            argv += ['--expect-git-diff-hash', state['diff_hash']]
     if dry_run:
         argv.append('--dry-run')
     argv += ['--', 'python', '-m', 'freestyle.experiments.entry', '--config', str(config_path),
@@ -51,6 +90,22 @@ def evaluate(c, run):
     if not c.get('chain_check'):
         subprocess.run([sys.executable, '-m', 'freestyle.eval.report', '--runs-dir', 'runs',
                         '--out', 'docs/freestyle/RESULTS.md'], check=True)
+
+
+def _collect_k8s_run(job_name, run):
+    ctx = os.environ.get('VI_CONTEXT', 'admin@home')
+    ns = os.environ.get('VI_NS', 'default')
+    log_proc = subprocess.run(
+        ['kubectl', '--context', ctx, '-n', ns, 'logs', f'job/{job_name}', '--all-pods=true'],
+        capture_output=True, text=True, check=False,
+    )
+    if log_proc.stdout or log_proc.stderr:
+        (run / 'job.log').write_text(log_proc.stdout + log_proc.stderr)
+    with tempfile.TemporaryDirectory() as temp:
+        collect_proc = subprocess.run(['k8s/collect.sh', job_name, temp], check=False)
+        for item in Path(temp).iterdir():
+            shutil.move(str(item), run / item.name)
+        return collect_proc.returncode
 
 
 def main(argv=None):
@@ -90,15 +145,16 @@ def main(argv=None):
     (run / 'resolved.yaml').write_text(yaml.safe_dump(c, sort_keys=False))
     (run / 'git_sha').write_text(sha + '\n')
     (run / 'git_state.json').write_text(json.dumps(state, indent=2) + '\n')
-    subprocess.run(cmd, check=True)
-    if c['compute']['target'] != 'local':
-        # collect.sh nests the remote directory when the destination already contains files.
-        import tempfile
-        import shutil
-        with tempfile.TemporaryDirectory() as temp:
-            subprocess.run(['k8s/collect.sh', cmd[1], temp], check=True)
-            for item in Path(temp).iterdir():
-                shutil.move(str(item), run / item.name)
+    if c['compute']['target'] == 'local':
+        subprocess.run(cmd, check=True)
+    else:
+        env = {**os.environ, 'VI_WAIT_COLLECT': '0'}
+        proc = subprocess.run(cmd, check=False, env=env)
+        collect_rc = _collect_k8s_run(cmd[1], run)
+        if proc.returncode != 0:
+            raise subprocess.CalledProcessError(proc.returncode, cmd)
+        if collect_rc != 0:
+            raise subprocess.CalledProcessError(collect_rc, ['k8s/collect.sh', cmd[1]])
     evaluate(c, run)
 
 

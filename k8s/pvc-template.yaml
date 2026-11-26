@@ -1,7 +1,7 @@
-# Work directory for vision-intern GPU jobs: one PVC per GPU node, because `local-path`
-# provisions on the node where the first consumer lands (WaitForFirstConsumer) and is RWO.
-# Created by k8s/lib.sh:ensure_pvc(); never hand-apply this without the node-pinned
-# workspace pod that k8s/workspace-template.yaml starts.
+# Work/data/outputs PVC for vision-intern GPU jobs: one PVC per GPU node, because
+# `local-path` provisions on the node where the first consumer lands (WaitForFirstConsumer)
+# and is RWO. Created by k8s/lib.sh:ensure_pvc(); never hand-apply this without the
+# node-pinned workspace pod that k8s/workspace-template.yaml starts.
 apiVersion: v1
 kind: PersistentVolumeClaim
 metadata:
@@ -11,6 +11,8 @@ metadata:
     app: ${APP_LABEL}
     app.kubernetes.io/name: ${APP_LABEL}
     app.kubernetes.io/component: workdir
+  annotations:
+    vision-intern/owner: "${OWNER}"
 spec:
   accessModes: ["ReadWriteOnce"]
   storageClassName: ${STORAGE_CLASS}

@@ -3,38 +3,29 @@
 # Rendered by k8s/submit.sh with plain envsubst: EVERY dollar-brace placeholder below must
 # be set in the environment (k8s/lib.sh:render refuses if one is missing). Placeholders:
 #
-#   JOB_NAME         job name; also /work/jobs/<JOB_NAME>.sh (the uploaded command file);
-#                    the entrypoint symlinks /out -> /work/artifacts/<JOB_NAME>/
-#   GPU              5090 | 6000
-#   NODE             kubernetes.io/hostname of the node that owns that card
-#   PVC_NAME         node-local work PVC created by k8s/stage-data.sh
-#   IMAGE            public CUDA base image (nothing private in it, ever)
-#   REQUESTS         resources.requests flow map,  e.g. {cpu: 2, memory: 8Gi}
-#   LIMITS           resources.limits flow map,    e.g. {cpu: 8, memory: 24Gi,
-#                    nvidia.com/gpu: 1, nvidia.com/gpumem: 8192}
-#   POD_ANNOTATIONS  {nvidia.com/use-gputype: "RTX 5090"}
-#   SCHEDULER_NAME   hami-scheduler (HAMi-booked GPU) or "" (default scheduler)
-#   SHARE_ENV        extra env list items for share mode, rendered as raw YAML lines:
-#                    `- {name: NVIDIA_VISIBLE_DEVICES, value: all}` + the CUDA_DISABLE_CONTROL
-#                    sibling; empty string in hami mode
-#   VI_GPU_MODE      hami | share   (exported to the job so scripts can tell)
-#   VI_GPU_MEM_MB    VRAM this job may use: HAMi quota in hami mode, self-limit in share
-#   SHM_SIZE         /dev/shm size (DataLoader workers put tensors there)
-#   ACTIVE_DEADLINE  hard job timeout, seconds
-#   TTL              ttlSecondsAfterFinished
-#
-# Cluster conventions honoured here (/home/david/dev/home-k8s/AGENTS.md +
-# .agents/skills/hami-gpu-accounting/SKILL.md):
-#   * runtimeClassName: nvidia; enableServiceLinks: false (service env vars are noise at
-#     best and collide with serving-stack env at worst).
-#   * anything that asks for nvidia.com/gpu MUST also set nvidia.com/gpumem: without it HAMi
-#     books the WHOLE card and the resident LLM engines can never co-schedule. Never set
-#     nvidia.com/gpucores -- compute capping is unreliable on Blackwell here.
-#   * pin the card by type as well as by hostname -- "RTX" alone matches BOTH cards.
-#   * share mode is the gpu-vram-exporter / gpu-power-limit pattern: request no GPU
-#     resource, NVIDIA_VISIBLE_DEVICES=all + CUDA_DISABLE_CONTROL=true gives the raw card
-#     with no HAMi booking. Only safe for jobs that self-limit to the VRAM physically free
-#     next to the resident engines -- submit.sh measures that and refuses if we do not fit.
+#   JOB_NAME           DNS-1123 job name
+#   RUN_ID             immutable per-submission run id (keys staged repo/script/artifacts)
+#   OWNER              ownership annotation (must start with VI_OWNER_PREFIX)
+#   GPU                5090 | 6000
+#   NODE               kubernetes.io/hostname of the node that owns that card
+#   DATA_PVC_NAME      node-local data PVC (mounted readOnly: true at /data-ro)
+#   OUT_PVC_NAME       node-local writable outputs/jobs/cache PVC (mounted rw at /outputs)
+#   IMAGE              pinned public CUDA base image (tag + @sha256:... digest)
+#   REQUESTS           resources.requests flow map
+#   LIMITS             resources.limits flow map
+#   POD_GPU_ANNOTATION YAML annotation line (e.g. nvidia.com/use-gputype) or comment
+#   SCHEDULER_NAME     hami-scheduler (HAMi-booked GPU) or "" (default scheduler)
+#   HF_TOKEN_ENV       secretKeyRef env entry for HF_TOKEN when needs_hf_token: true
+#   SHARE_ENV          extra env list items for share/none mode, or comment
+#   PYTHONPATH_VALUE   /_vi_site:/src in share mode, /src otherwise
+#   PYTORCH_ALLOC_CONF PYTORCH_CUDA_ALLOC_CONF value
+#   REPO_TAR_PATH      tarball path inside container (/outputs/repo/...)
+#   REPO_TAR_SHA256    expected sha256 of REPO_TAR_PATH, verified before unpack
+#   VI_GPU_MODE        hami | share | none
+#   VI_GPU_MEM_MB      VRAM this job may use: HAMi quota in hami mode, self-limit in share
+#   SHM_SIZE           /dev/shm size (DataLoader workers put tensors there)
+#   ACTIVE_DEADLINE    hard job timeout, seconds
+#   TTL                ttlSecondsAfterFinished
 apiVersion: batch/v1
 kind: Job
 metadata:
@@ -46,6 +37,9 @@ metadata:
     app.kubernetes.io/component: job
     vision-intern/job: ${JOB_NAME}
     vision-intern/gpu: "${GPU}"
+  annotations:
+    vision-intern/owner: "${OWNER}"
+    vision-intern/run-id: "${RUN_ID}"
 spec:
   backoffLimit: 0
   ttlSecondsAfterFinished: ${TTL}
@@ -58,7 +52,10 @@ spec:
         app.kubernetes.io/component: job
         vision-intern/job: ${JOB_NAME}
         vision-intern/gpu: "${GPU}"
-      annotations: ${POD_ANNOTATIONS}
+      annotations:
+        vision-intern/owner: "${OWNER}"
+        vision-intern/run-id: "${RUN_ID}"
+        ${POD_GPU_ANNOTATION}
     spec:
       restartPolicy: Never
       runtimeClassName: nvidia
@@ -76,46 +73,148 @@ spec:
             - |
               set -euo pipefail
               t0=$(date +%s)
-              echo "== job on node $(hostname), gpu mode $VI_GPU_MODE, budget ${VI_GPU_MEM_MB} MiB"
+              echo "== job on node $(hostname), run $VI_RUN_ID, gpu mode $VI_GPU_MODE, budget $VI_GPU_MEM_MB MiB"
               nvidia-smi -L || true
-              mkdir -p /src
-              echo "== unpack repo snapshot /work/repo/$VI_JOB_NAME.tar (uploaded by submit.sh)"
+              mkdir -p /src /work "/outputs/artifacts/$VI_RUN_ID" /outputs/cache
+              ln -sfn "/outputs/artifacts/$VI_RUN_ID" /out
+              ln -sfn /data-ro/data /work/data
+
+              if [ -f "/outputs/jobs/$VI_RUN_ID.provenance.json" ]; then
+                cp "/outputs/jobs/$VI_RUN_ID.provenance.json" /out/provenance.json
+              fi
+
+              write_env() {
+                {
+                  echo "image=$VI_IMAGE"
+                  echo "run_id=$VI_RUN_ID"
+                  echo "job_name=$VI_JOB_NAME"
+                  echo "gpu_mode=$VI_GPU_MODE"
+                  echo "gpu_mem_mb=$VI_GPU_MEM_MB"
+                  echo "python=$(python -V 2>&1 || true)"
+                  echo "=== pip freeze ==="
+                  python -m pip freeze 2>/dev/null || true
+                } > /out/env.txt
+              }
+              trap write_env EXIT
+
+              actual_tar_sha=$(sha256sum "${REPO_TAR_PATH}" | awk '{print $1}')
+              if [ "$actual_tar_sha" != "${REPO_TAR_SHA256}" ]; then
+                echo "error: repo tarball sha256 mismatch: expected ${REPO_TAR_SHA256}, got $actual_tar_sha" >&2
+                exit 1
+              fi
+              echo "== unpack repo snapshot ${REPO_TAR_PATH} (sha256=$actual_tar_sha)"
               rm -rf /src/*
-              tar -C /src -xf /work/repo/$VI_JOB_NAME.tar
-              mkdir -p /work/artifacts/$VI_JOB_NAME
-              ln -sfn /work/artifacts/$VI_JOB_NAME /out
-              ln -sfn /work/data /src/data
+              tar -C /src -xf "${REPO_TAR_PATH}"
+              ln -sfn /data-ro/data /src/data
+
+              if [ "$VI_GPU_MODE" = "share" ]; then
+                mkdir -p /_vi_site
+                cat <<'PYEOF' > /_vi_site/sitecustomize.py
+              import builtins
+              import importlib
+              import os
+              import sys
+
+              if os.environ.get("VI_GPU_MODE") == "share":
+                  os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True,max_split_size_mb:128")
+                  _applied = False
+                  _cap_fraction = None
+                  _orig_import = builtins.__import__
+                  _orig_import_module = importlib.import_module
+
+                  def _enforce_cuda_cap(torch_mod):
+                      global _applied, _cap_fraction
+                      if _applied:
+                          return
+                      cuda = getattr(torch_mod, "cuda", None)
+                      if cuda is None or not cuda.is_available():
+                          return
+                      _applied = True
+                      mem_mb = int(os.environ.get("VI_GPU_MEM_MB", "0") or 0)
+                      if mem_mb <= 0:
+                          raise RuntimeError("share mode requires positive VI_GPU_MEM_MB")
+                      budget_bytes = mem_mb * 1024 * 1024
+                      for idx in range(cuda.device_count()):
+                          total = cuda.get_device_properties(idx).total_memory
+                          if total > 0:
+                              frac = min(1.0, max(0.0, budget_bytes / float(total)))
+                              _cap_fraction = frac
+                              cuda.set_per_process_memory_fraction(frac, idx)
+                      orig_set_frac = cuda.set_per_process_memory_fraction
+
+                      def _clamped_set_frac(fraction, device=None):
+                          if _cap_fraction is not None and fraction > _cap_fraction:
+                              fraction = _cap_fraction
+                          return orig_set_frac(fraction, device) if device is not None else orig_set_frac(fraction)
+
+                      cuda.set_per_process_memory_fraction = _clamped_set_frac
+
+                  def _maybe_enforce():
+                      t = sys.modules.get("torch")
+                      if t is not None and not _applied:
+                          _enforce_cuda_cap(t)
+
+                  def _vi_import(name, globals=None, locals=None, fromlist=(), level=0):
+                      mod = _orig_import(name, globals, locals, fromlist, level)
+                      if not _applied and (name == "torch" or name.startswith("torch.")):
+                          _maybe_enforce()
+                      return mod
+
+                  def _vi_import_module(name, package=None):
+                      mod = _orig_import_module(name, package)
+                      if not _applied and (name == "torch" or name.startswith("torch.")):
+                          _maybe_enforce()
+                      return mod
+
+                  builtins.__import__ = _vi_import
+                  importlib.import_module = _vi_import_module
+                  _maybe_enforce()
+              PYEOF
+              fi
+
+              if [ -f "/outputs/jobs/$VI_RUN_ID.requirements.txt" ]; then
+                pip_args=(install --no-cache-dir --break-system-packages -r "/outputs/jobs/$VI_RUN_ID.requirements.txt")
+                if [ -f "/outputs/jobs/$VI_RUN_ID.constraints.txt" ]; then
+                  pip_args+=(-c "/outputs/jobs/$VI_RUN_ID.constraints.txt")
+                fi
+                echo "== installing pip requirements"
+                pip "${pip_args[@]}"
+              fi
+
+              write_env
               cd /src
-              echo "== files: $(find . -maxdepth 1 -type d | tr '\n' ' ')"
-              echo "== command file /work/jobs/${JOB_NAME}.sh"
+              echo "== command file /outputs/jobs/$VI_RUN_ID.sh"
               echo "== python: $(python -V 2>&1), torch import starts now ($(date +%s) epoch)"
-              bash -e /work/jobs/${JOB_NAME}.sh
+              bash -e "/outputs/jobs/$VI_RUN_ID.sh"
               echo "== finished in $(( $(date +%s) - t0 )) s"
           env:
-            - { name: PYTHONPATH, value: /src }
+            - { name: PYTHONPATH, value: "${PYTHONPATH_VALUE}" }
             - { name: OUT_DIR, value: /out }
-            - { name: HOME, value: /work/cache }
-            - { name: HF_HOME, value: /work/cache/huggingface }
-            - { name: TORCH_HOME, value: /work/cache/torch }
-            - { name: UV_CACHE_DIR, value: /work/cache/uv }
-            - { name: PIP_CACHE_DIR, value: /work/cache/pip }
+            - { name: HOME, value: /outputs/cache }
+            - { name: HF_HOME, value: /outputs/cache/huggingface }
+            - { name: TORCH_HOME, value: /outputs/cache/torch }
+            - { name: UV_CACHE_DIR, value: /outputs/cache/uv }
+            - { name: PIP_CACHE_DIR, value: /outputs/cache/pip }
             - { name: NVIDIA_DRIVER_CAPABILITIES, value: "compute,utility" }
-            - { name: PYTORCH_CUDA_ALLOC_CONF, value: "expandable_segments:True" }
+            - { name: PYTORCH_CUDA_ALLOC_CONF, value: "${PYTORCH_ALLOC_CONF}" }
             - { name: VI_GPU_MODE, value: "${VI_GPU_MODE}" }
             - { name: VI_GPU_MEM_MB, value: "${VI_GPU_MEM_MB}" }
             - { name: VI_JOB_NAME, value: "${JOB_NAME}" }
+            - { name: VI_RUN_ID, value: "${RUN_ID}" }
+            - { name: VI_IMAGE, value: "${IMAGE}" }
+            ${HF_TOKEN_ENV}
             ${SHARE_ENV}
           resources:
             requests: ${REQUESTS}
             limits: ${LIMITS}
-          # ONE mount of the PVC. Mounting the same claim twice, the second time with a
-          # subPath, silently lands the writes somewhere the helper pod cannot see (measured
-          # on this cluster 2026-11-26) -- so /out is a symlink into /work instead.
           volumeMounts:
-            - { name: work, mountPath: /work }
+            - { name: data, mountPath: /data-ro, readOnly: true }
+            - { name: outputs, mountPath: /outputs }
             - { name: dshm, mountPath: /dev/shm }
       volumes:
-        - name: work
-          persistentVolumeClaim: { claimName: ${PVC_NAME} }
+        - name: data
+          persistentVolumeClaim: { claimName: ${DATA_PVC_NAME} }
+        - name: outputs
+          persistentVolumeClaim: { claimName: ${OUT_PVC_NAME} }
         - name: dshm
           emptyDir: { medium: Memory, sizeLimit: ${SHM_SIZE} }
