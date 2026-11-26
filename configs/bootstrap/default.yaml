@@ -2,10 +2,11 @@ base_url: https://llm-collective.e-gineering.com/v1
 api_key_env: LLMC_API_KEY
 primary_labeller: david-birks/inkling-2-mini
 fusion_iou: 0.55
+# NOTE: qwen3-8-flash-next was dropped as the second labeller for the 2026-11
+# smoke run (see runs/bootstrap_v1/summary.md): it is at capacity on the
+# collective and one label call took ~530 s with repeated 429s, vs ~7 s for
+# inkling. It is kept only for the judge (light crops-mode calls, ~30 s/image).
 labellers:
-  - name: flash-full
-    model: qwen3-8-flash-next
-    max_tokens: 8192
   - name: inkling-full
     model: david-birks/inkling-2-mini
     max_tokens: 8192

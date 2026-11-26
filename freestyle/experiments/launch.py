@@ -18,7 +18,8 @@ def submit_argv(c, config_path, name, dry_run=False, sha=None, state=None):
         specs.append('rfdetr==1.12.1')
     argv = ['k8s/submit.sh', name.lower().replace('_', '-'), gpu,
             '--mem', str(c['compute']['vram_mb']), '--timeout', str(c['compute']['timeout']),
-            '--pip', ' '.join(specs), '--wait', '--wait-for', str(c['compute']['timeout'])]
+            '--pip', ' '.join(specs), '--wait', '--wait-for', str(c['compute']['timeout']),
+            '--mode', c['compute']['mode']]
     if dry_run:
         argv.append('--dry-run')
     argv += ['--', 'python', '-m', 'freestyle.experiments.entry', '--config', str(config_path),
@@ -45,8 +46,11 @@ def evaluate(c, run):
     subprocess.run([sys.executable, '-m', 'freestyle.eval.failures', '--gt', str(data / c['data']['test']),
                     '--pred', str(pred), '--images-root', str(data / c['data']['images_root']),
                     '--score-thr', str(threshold), '--out', str(run / 'failures')], check=True)
-    subprocess.run([sys.executable, '-m', 'freestyle.eval.report', '--runs-dir', 'runs',
-                    '--out', 'docs/freestyle/RESULTS.md'], check=True)
+    # A chain-check run is not a reported experiment; it must not regenerate (or clobber a
+    # concurrent worker's) shared RESULTS.md. metrics.json + failures/ above are the point.
+    if not c.get('chain_check'):
+        subprocess.run([sys.executable, '-m', 'freestyle.eval.report', '--runs-dir', 'runs',
+                        '--out', 'docs/freestyle/RESULTS.md'], check=True)
 
 
 def main(argv=None):
@@ -65,7 +69,11 @@ def main(argv=None):
     c = schema.load(args.config)
     sha = schema.git_sha()
     state = schema.git_state()
-    run = schema.run_dir(c, sha, state=state)
+    # A chain-check run is plumbing validation on CPU with a stand-in GT, not a real
+    # experiment: keep it under runs/chain-check/ so `freestyle.eval.report`'s
+    # `runs/*/metrics.json` glob (one level) never lists it in RESULTS.md.
+    run_root = 'runs/chain-check' if c['chain_check'] else 'runs'
+    run = schema.run_dir(c, sha, run_root, state=state)
     if c['compute']['target'] == 'local':
         cmd = [sys.executable, '-m', 'freestyle.experiments.entry', '--config', str(run / 'resolved.yaml'),
                '--data-root', 'data', '--out', str(run), '--git-sha', sha]
@@ -78,7 +86,7 @@ def main(argv=None):
     if args.dry_run:
         print(shlex.join(cmd))
         return
-    schema.create_run_dir(c, sha, state=state)
+    schema.create_run_dir(c, sha, run_root, state=state)
     (run / 'resolved.yaml').write_text(yaml.safe_dump(c, sort_keys=False))
     (run / 'git_sha').write_text(sha + '\n')
     (run / 'git_state.json').write_text(json.dumps(state, indent=2) + '\n')

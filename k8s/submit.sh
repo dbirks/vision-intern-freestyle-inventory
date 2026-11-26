@@ -71,6 +71,10 @@ log "gpu $GPU ($TYPE on $NODE): HAMi reservation free=${HAMI_FREE:-?} MiB, physi
 if [ "$MODE" = auto ]; then
   if [ -n "$HAMI_FREE" ] && [ "$HAMI_FREE" -ge "$MEM" ]; then MODE=hami
   elif [ -n "$PHYS_FREE" ] && [ "$PHYS_FREE" -ge $((MEM + VI_CTX_SLACK)) ]; then MODE=share
+  elif [ "$DRY" = 1 ]; then
+    # --dry-run previews the command a job would get once the card is free: render the
+    # polite HAMi shape instead of refusing on today's (booked) occupancy.
+    MODE=hami; log "dry-run: no room today (HAMi ${HAMI_FREE:-?}/phys ${PHYS_FREE:-?} MiB); previewing the hami command a free card would use"
   else
     die "no card room for ${MEM} MiB on $GPU (HAMi free ${HAMI_FREE:-?} MiB, physical free ${PHYS_FREE:-?} MiB).
 Free VRAM by scaling a resident engine to 0 (GitOps, apps/*.yaml), shrink its
@@ -83,7 +87,15 @@ if [ "$MODE" = none ]; then
   LIMITS="{cpu: $CPU_LIM, memory: $MEM_LIM}"
   POD_ANNOTATIONS="{}"
   SCHEDULER_NAME=""
-  SHARE_ENV=""
+  # runtimeClassName: nvidia + NVIDIA_DRIVER_CAPABILITIES stay set (the image needs the
+  # runtime), so the card is otherwise VISIBLE here: I measured a `--mode none` pod whose
+  # nvidia-smi reported the RTX 5090 and torch.cuda.is_available() was True. Without an
+  # explicit device the zero-shot backends' `_resolve_device(None)` would pick 'cuda' and
+  # silently allocate on the raw card next to the serving engines. NVIDIA_VISIBLE_DEVICES=""
+  # makes 'none' mean no GPU at all (torch.cuda.is_available() -> False), which is exactly
+  # what this mode promises; experiments that truly need the card use hami/share.
+  SHARE_ENV='- { name: NVIDIA_VISIBLE_DEVICES, value: "" }'
+  log "none mode: card hidden (NVIDIA_VISIBLE_DEVICES=empty) so no code path can touch it"
 else
 if [ "$MODE" = hami ]; then
   LIMITS="{cpu: $CPU_LIM, memory: $MEM_LIM, nvidia.com/gpu: 1, nvidia.com/gpumem: $MEM}"

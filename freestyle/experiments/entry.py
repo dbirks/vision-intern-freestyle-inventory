@@ -117,7 +117,17 @@ def stage_split(c, root, out, split):
                 '--images-root', str(root / c['data']['images_root']), '--splits',
                 str(root / c['data']['splits']), '--out', str(out / f'proposals_{split}')]
         for k, v in loc.items():
-            args.extend(['--' + k.replace('_', '-'), str(v)])
+            key = '--' + k.replace('_', '-')
+            # List-valued knobs (e.g. prompts) map to argparse `nargs='*'` flags: pass
+            # each element as its own token, otherwise str(v) would emit a Python repr
+            # like "['cartridge box']" and become a single mangled prompt.
+            if isinstance(v, (list, tuple)):
+                args.extend([key, *(str(x) for x in v)])
+            elif isinstance(v, bool):
+                if v:
+                    args.append(key)
+            else:
+                args.extend([key, str(v)])
         propose(args)
         loc = {'type': 'proposals', 'path': str(out / f'proposals_{split}' / 'predictions.json')}
     elif loc['type'] == 'tiled_detector':

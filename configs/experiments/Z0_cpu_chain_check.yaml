@@ -1,0 +1,40 @@
+# Z0: CPU end-to-end chain check -- NOT a real experiment (never reported in RESULTS.md).
+#
+# Purpose: de-risk the future GPU window by proving the whole pipeline on the cluster in
+# CPU-only `--mode none` (no card touched): repo tarball -> data on PVC -> `--pip` installs
+# -> HF model download in the pod -> freestyle.experiments.entry -> collect ->
+# freestyle.eval.evaluate -> failures. `chain_check: true` keeps the run dir under
+# runs/chain-check/ so the report glob never lists it as a real result.
+id: Z0_cpu_chain_check
+family: B_zeroshot_plus_embed
+chain_check: true            # plumbing smoke run, not a reported experiment result
+compute:
+  target: k8s:5090
+  mode: none                 # CPU only: no GPU resource requested, no card touched
+  vram_mb: 4096              # ignored under --mode none (submit.sh: LIMITS has no nvidia.*)
+  timeout: 3600
+data:
+  # Fake, human-deletable stand-in manifests (see data/gt/_chaincheck_*.json). Model
+  # labels are never GT; bootstrap_v1.json has no 'cartridge' super-class so it cannot
+  # drive a class-agnostic proposal manifest without clobbering category ids.
+  val: gt/_chaincheck_val.json
+  test: gt/_chaincheck_test.json
+  splits: splits.json
+  images_root: raw/freestyle-vision-data/images
+  label_source: gt
+localizer:
+  type: zeroshot
+  backend: owlv2
+  model_id: google/owlv2-base-patch16-ensemble
+  prompts:
+    - cartridge box
+  tile: 1024
+  score_thr: 0.05
+  device: cpu                # belt-and-suspenders: never probe CUDA in this check
+identifier:
+  type: none
+count:
+  identity_thr: 0.5
+eval:
+  score_thr: val
+seed: 42

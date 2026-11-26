@@ -28,11 +28,21 @@ def resolve(config):
     compute.setdefault('target', 'local')
     compute.setdefault('vram_mb', 8192)
     compute.setdefault('timeout', 3600)
+    # k8s submit mode: how the GPU (or its absence) is accounted for. 'none' runs the
+    # whole chain CPU-only (no card touched) to de-risk a future GPU window.
+    compute.setdefault('mode', 'auto')
     if compute['target'] not in ('local', 'k8s:5090', 'k8s:6000'):
         raise ValueError('invalid compute target')
+    if compute['mode'] not in ('auto', 'hami', 'share', 'none'):
+        raise ValueError('invalid compute mode')
     for key in ('vram_mb', 'timeout'):
         if not isinstance(compute[key], int) or isinstance(compute[key], bool) or compute[key] <= 0:
             raise ValueError(f'compute.{key} must be a positive integer')
+    # chain_check: a plumbing smoke run (CPU, no human GT) that must never be reported
+    # as a real experiment result.
+    c.setdefault('chain_check', False)
+    if not isinstance(c['chain_check'], bool):
+        raise ValueError('chain_check must be a boolean')
     data = c['data']
     for key, value in {'train': 'gt/train.json', 'val': 'gt/val.json', 'test': 'gt/test.json',
                        'splits': 'splits.json', 'images_root': 'raw/freestyle-vision-data/images',

@@ -46,6 +46,15 @@ def _cache(directory, key, call):
 
 
 def _retry(call):
+    """Retry *call* on 429/5xx/timeout/connection errors (exp. backoff + jitter).
+
+    Bounded to ~10 min total per request, matching the project rule that the
+    Collective is often at capacity (HTTP 429 "backend at capacity").
+    """
+    import random
+
+    import openai
+
     deadline = time.monotonic() + 600
     attempt = 0
     while True:
@@ -53,9 +62,14 @@ def _retry(call):
             return call()
         except Exception as exc:
             status = getattr(exc, 'status_code', None)
-            if status != 429 and not (isinstance(status, int) and status >= 500):
+            retryable = (
+                isinstance(exc, (openai.RateLimitError, openai.APITimeoutError,
+                                openai.APIConnectionError))
+                or (isinstance(status, int) and (status == 429 or status >= 500))
+            )
+            if not retryable:
                 raise
-            delay = min(60, 2 ** min(attempt + 1, 6))
+            delay = min(60, 2 ** min(attempt + 1, 6)) * (1 + random.random() * 0.3)
             if time.monotonic() + delay > deadline:
                 raise
             time.sleep(delay)

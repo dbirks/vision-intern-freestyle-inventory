@@ -56,7 +56,10 @@ for g in $GPUS; do
   ensure_workspace "$g"
   if [ "$DO_DATA" = 1 ]; then
     push_file "$g" "$tmp/data.tar" /work/data.tar
-    ws_sh "$g" 'rm -rf /work/data && tar -C /work -xf /work/data.tar && rm -f /work/data.tar'
+    # chmod first: a previous job can leave /work/data read-only (0555), and the
+    # workspace pod runs uid 0 with capabilities dropped -- as owner it can chmod, but
+    # `rm -rf` would otherwise fail to unlink inside the non-writable directory.
+    ws_sh "$g" 'chmod -R u+w /work/data 2>/dev/null; rm -rf /work/data && tar -C /work -xf /work/data.tar && rm -f /work/data.tar'
   fi
   if [ "$DO_CODE" = 1 ]; then
     push_file "$g" "$tmp/repo.tar" /work/repo/repo.tar
