@@ -11,10 +11,10 @@ import yaml
 from freestyle.experiments import schema
 
 
-def submit_argv(c, config_path, name, dry_run=False, sha=None):
+def submit_argv(c, config_path, name, dry_run=False, sha=None, state=None):
     gpu = c['compute']['target'].split(':', 1)[1]
     specs = ['transformers==5.24.1', 'pycocotools', 'scipy']
-    if c['family'].startswith(('C_', 'D_', 'F_')):
+    if c['family'].startswith(('C_', 'D_', 'E_', 'F_')):
         specs.append('rfdetr==1.12.1')
     argv = ['k8s/submit.sh', name.lower().replace('_', '-'), gpu,
             '--mem', str(c['compute']['vram_mb']), '--timeout', str(c['compute']['timeout']),
@@ -25,6 +25,10 @@ def submit_argv(c, config_path, name, dry_run=False, sha=None):
              '--data-root', '/work/data', '--out', '/out']
     if sha:
         argv += ['--git-sha', sha]
+    if state is not None:
+        argv += ['--git-dirty', str(state['dirty']).lower()]
+        if state['diff_hash']:
+            argv += ['--git-diff-hash', state['diff_hash']]
     return argv
 
 
@@ -60,18 +64,24 @@ def main(argv=None):
         p.error('config is required')
     c = schema.load(args.config)
     sha = schema.git_sha()
-    run = schema.run_dir(c, sha)
+    state = schema.git_state()
+    run = schema.run_dir(c, sha, state=state)
     if c['compute']['target'] == 'local':
         cmd = [sys.executable, '-m', 'freestyle.experiments.entry', '--config', str(run / 'resolved.yaml'),
                '--data-root', 'data', '--out', str(run), '--git-sha', sha]
     else:
-        cmd = submit_argv(c, args.config, run.name, args.dry_run, sha)
+        cmd = submit_argv(c, args.config, run.name, args.dry_run, sha, state)
+    if c['compute']['target'] == 'local':
+        cmd += ['--git-dirty', str(state['dirty']).lower()]
+        if state['diff_hash']:
+            cmd += ['--git-diff-hash', state['diff_hash']]
     if args.dry_run:
         print(shlex.join(cmd))
         return
-    schema.create_run_dir(c, sha)
+    schema.create_run_dir(c, sha, state=state)
     (run / 'resolved.yaml').write_text(yaml.safe_dump(c, sort_keys=False))
     (run / 'git_sha').write_text(sha + '\n')
+    (run / 'git_state.json').write_text(json.dumps(state, indent=2) + '\n')
     subprocess.run(cmd, check=True)
     if c['compute']['target'] != 'local':
         # collect.sh nests the remote directory when the destination already contains files.

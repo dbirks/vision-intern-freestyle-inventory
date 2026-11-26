@@ -40,11 +40,31 @@ def resolve(config):
         data.setdefault(key, value)
     if data['label_source'] not in ('gt', 'bootstrap', 'bootstrap+gt'):
         raise ValueError('invalid label source')
-    for key in ('train', 'val', 'test', 'splits', 'images_root'):
+    if data['label_source'] != 'gt':
+        if 'bootstrap' not in data:
+            raise ValueError('data.bootstrap is required for bootstrap labels')
+        data.setdefault('bootstrap_filter', {})
+        filt = data['bootstrap_filter']
+        if not isinstance(filt, dict):
+            raise ValueError('data.bootstrap_filter must be a mapping')
+        filt.setdefault('verdicts', ['correct'])
+        if not isinstance(filt['verdicts'], list) or not filt['verdicts'] or not all(isinstance(x, str) for x in filt['verdicts']):
+            raise ValueError('bootstrap verdicts must be a nonempty list')
+        for key in ('min_judge_score', 'min_support', 'min_id_confidence'):
+            filt.setdefault(key, 0.0)
+            if isinstance(filt[key], bool) or not isinstance(filt[key], (int, float)) or not 0 <= filt[key] <= 1:
+                raise ValueError(f'invalid bootstrap threshold {key}')
+        if not isinstance(data['bootstrap'], str) or not data['bootstrap'].startswith('labels/'):
+            raise ValueError('data.bootstrap must be under labels/')
+    for key in ('train', 'val', 'test', 'splits', 'images_root', *(['bootstrap'] if 'bootstrap' in data else [])):
         if not isinstance(data[key], str) or not data[key] or Path(data[key]).is_absolute() or '..' in Path(data[key]).parts:
             raise ValueError(f'data.{key} must be a relative path within data root')
     c['identifier'].setdefault('type', 'none')
     c['count'].setdefault('identity_thr', 0.5)
+    if c['family'] == 'E_shelf':
+        if c['count'].get('neighbour_vote', 'report') != 'report':
+            raise ValueError('E_shelf requires neighbour_vote=report')
+        c['count']['neighbour_vote'] = 'report'
     c['eval'].setdefault('score_thr', 'val')
     if c['eval']['score_thr'] != 'val':
         raise ValueError('score threshold must be selected on val')
@@ -64,17 +84,46 @@ def git_sha():
     return subprocess.check_output(['git', 'rev-parse', 'HEAD'], text=True).strip()
 
 
-def content_hash(config, sha):
-    payload = json.dumps({'config': resolve(config), 'git_sha': sha}, sort_keys=True,
-                         separators=(',', ':'), allow_nan=False)
+def git_state():
+    """Hash tracked diffs and untracked non-ignored files without touching private data."""
+    pathspecs = ['--', '.', ':(exclude)data', ':(exclude)runs']
+    staged = subprocess.check_output(['git', 'diff', '--cached', '--binary', 'HEAD', *pathspecs])
+    unstaged = subprocess.check_output(['git', 'diff', '--binary', *pathspecs])
+    names = subprocess.check_output(['git', 'ls-files', '--others', '--exclude-standard', '-z',
+                                     '--', '.', ':(exclude)data', ':(exclude)runs']).split(b'\0')
+    digest = hashlib.sha256()
+    digest.update(len(staged).to_bytes(8, 'big'))
+    digest.update(staged)
+    digest.update(unstaged)
+    dirty = bool(staged or unstaged)
+    for name in sorted(filter(None, names)):
+        path = Path(name.decode('utf-8', 'surrogateescape'))
+        dirty = True
+        digest.update(len(name).to_bytes(8, 'big'))
+        digest.update(name)
+        if path.is_symlink():
+            contents = str(path.readlink()).encode()
+            digest.update(b'symlink')
+        else:
+            contents = path.read_bytes()
+            digest.update(b'file')
+        digest.update(len(contents).to_bytes(8, 'big'))
+        digest.update(contents)
+    return {'dirty': dirty, 'diff_hash': digest.hexdigest() if dirty else None}
+
+
+def content_hash(config, sha, state=None):
+    state = state if state is not None else {'dirty': False, 'diff_hash': None}
+    payload = json.dumps({'config': resolve(config), 'git_sha': sha, 'git_state': state},
+                         sort_keys=True, separators=(',', ':'), allow_nan=False)
     return hashlib.sha256(payload.encode()).hexdigest()
 
 
-def run_dir(config, sha, root='runs'):
-    return Path(root) / f"{config['id']}-{content_hash(config, sha)[:8]}"
+def run_dir(config, sha, root='runs', state=None):
+    return Path(root) / f"{config['id']}-{content_hash(config, sha, state)[:8]}"
 
 
-def create_run_dir(config, sha, root='runs'):
-    path = run_dir(config, sha, root)
+def create_run_dir(config, sha, root='runs', state=None):
+    path = run_dir(config, sha, root, state)
     path.mkdir(parents=True, exist_ok=False)
     return path

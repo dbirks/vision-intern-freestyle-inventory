@@ -11,36 +11,85 @@ import yaml
 from freestyle.experiments.schema import load
 
 
+def prepare_training(c, root, out, filename='training_input.json'):
+    """Build a train-only COCO file; human annotations replace pseudo labels per image."""
+    data = c['data']
+    splits = json.loads((root / data['splits']).read_text())['images']
+    gt = json.loads((root / data['train']).read_text())
+    categories = gt['categories']
+    ids = {category['name']: category['id'] for category in categories}
+    source = data['label_source']
+    sources = []
+    if source in ('gt', 'bootstrap+gt'):
+        sources.append((gt, False))
+    if source in ('bootstrap', 'bootstrap+gt'):
+        sources.append((json.loads((root / data['bootstrap']).read_text()), True))
+    result = {'info': {}, 'licenses': [], 'categories': categories, 'images': [], 'annotations': []}
+    seen = set()
+    for coco, pseudo in sources:
+        source_names = {cat['id']: cat['name'] for cat in coco['categories']}
+        anns = {}
+        for ann in coco['annotations']:
+            anns.setdefault(ann['image_id'], []).append(ann)
+        for image in coco['images']:
+            name = image['file_name']
+            if splits.get(name) != 'train' or name in seen:
+                continue
+            seen.add(name)
+            image_id = len(result['images']) + 1
+            result['images'].append({**image, 'id': image_id})
+            for ann in anns.get(image['id'], []):
+                if pseudo:
+                    attrs = ann.get('attributes', {})
+                    filters = data['bootstrap_filter']
+                    if (attrs.get('judge_verdict') not in filters['verdicts'] or
+                        attrs.get('judge_score', 0) < filters['min_judge_score'] or
+                        attrs.get('support', 0) < filters['min_support'] or
+                        attrs.get('id_confidence', 0) < filters['min_id_confidence']):
+                        continue
+                category = source_names.get(ann['category_id'])
+                if category not in ids:
+                    raise ValueError(f'unknown training category: {category}')
+                result['annotations'].append({**ann, 'id': len(result['annotations']) + 1,
+                                              'image_id': image_id, 'category_id': ids[category]})
+    if not result['images']:
+        raise ValueError('no training images in selected label source')
+    path = out / filename
+    path.write_text(json.dumps(result))
+    return path
+
+
 def stage_train(c, root, out):
-    if c['family'] not in ('C_det_agnostic_plus_embed', 'D_det_multiclass', 'F_det_plus_vlm_id'):
+    if c['family'] not in ('C_det_agnostic_plus_embed', 'D_det_multiclass', 'E_shelf',
+                           'F_det_plus_vlm_id'):
         return
-    if c['data']['label_source'] != 'gt':
-        raise NotImplementedError('bootstrap training requires an explicit prepared dataset')
     from freestyle.train.export_tiles import export_tiles
     from freestyle.train.train_detector import train
 
-    loc = c['localizer']
     dataset = out / 'dataset'
-    train_gt = json.loads((root / c['data']['train']).read_text())
-    val_gt = json.loads((root / c['data']['val']).read_text())
-    if train_gt['categories'] != val_gt['categories']:
-        raise ValueError('train and val category mappings must match')
-    combined = dict(train_gt)
-    combined['images'] = list(train_gt['images'])
-    combined['annotations'] = list(train_gt['annotations'])
-    next_id = max((i['id'] for i in combined['images']), default=0) + 1
-    for image in val_gt['images']:
-        new_id = next_id
-        next_id += 1
-        combined['images'].append({**image, 'id': new_id})
-        combined['annotations'].extend({**a, 'image_id': new_id} for a in val_gt['annotations']
-                                       if a['image_id'] == image['id'])
-    combined_path = out / 'training_input.json'
-    combined_path.write_text(json.dumps(combined))
+    combined_path = prepare_training(c, root, out)
+    train_coco = json.loads(combined_path.read_text())
+    split_map = json.loads((root / c['data']['splits']).read_text())
+    from freestyle.identify.cli import _resolve_groups_and_splits
+    images = train_coco['images']
+    groups, _ = _resolve_groups_and_splits([i['file_name'] for i in images],
+                                           [str(i['id']) for i in images], split_map)
+    unique_groups = sorted(set(groups))
+    if len(unique_groups) < 2:
+        raise ValueError('detector training requires at least two train groups for validation')
+    # A deterministic group holdout avoids using experiment val or test in training.
+    import random
+    random.Random(c['seed']).shuffle(unique_groups)
+    held_out = set(unique_groups[:max(1, len(unique_groups) // 5)])
+    training_splits = {'images': {i['file_name']: 'val' if g in held_out else 'train'
+                                  for i, g in zip(images, groups)}}
+    training_split_path = out / 'training_splits.json'
+    training_split_path.write_text(json.dumps(training_splits))
     export_tiles(str(combined_path), str(root / c['data']['images_root']),
-                 str(dataset), str(root / c['data']['splits']),
+                 str(dataset), str(training_split_path),
                  class_agnostic=c['family'] != 'D_det_multiclass')
-    train({**loc['training'], 'dataset_dir': str(dataset), 'seed': c['seed']}, out / 'training')
+    train({**c['localizer']['training'], 'dataset_dir': str(dataset), 'seed': c['seed']},
+          out / 'training')
 
 
 def stage_gallery(c, root, out):
@@ -48,8 +97,10 @@ def stage_gallery(c, root, out):
     if ident['type'] != 'embedding_knn':
         return
     from freestyle.identify.cli import main
+    gt_config = {**c, 'data': {**c['data'], 'label_source': 'gt'}}
+    gallery_input = prepare_training(gt_config, root, out, 'gallery_input.json')
     main(['embed', '--split-map', str(root / c['data']['splits']), '--coco',
-          str(root / c['data']['train']), '--images-root', str(root / c['data']['images_root']),
+          str(gallery_input), '--images-root', str(root / c['data']['images_root']),
           '--out', str(out / 'gallery.npz'), '--model', ident['model']])
 
 
@@ -86,7 +137,7 @@ def stage_split(c, root, out, split):
           '--out', str(out / split)])
 
 
-def run(c, root, out, stages=None, git_sha=None):
+def run(c, root, out, stages=None, git_sha=None, git_state=None):
     root, out = Path(root), Path(out)
     out.mkdir(parents=True, exist_ok=True)
     markers = out / 'stages'
@@ -98,6 +149,8 @@ def run(c, root, out, stages=None, git_sha=None):
     meta_path = out / 'meta.json'
     meta = json.loads(meta_path.read_text()) if meta_path.exists() else {'timings': {}}
     meta.update(experiment=c['id'], config=c, git_sha=git_sha,
+                git_dirty=git_state['dirty'] if git_state else None,
+                git_diff_hash=git_state['diff_hash'] if git_state else None,
                 versions={'python': platform.python_version()})
     try:
         import torch
@@ -131,8 +184,12 @@ def main(argv=None):
     p.add_argument('--data-root', required=True)
     p.add_argument('--out', required=True)
     p.add_argument('--git-sha')
+    p.add_argument('--git-dirty', choices=('true', 'false'))
+    p.add_argument('--git-diff-hash')
     args = p.parse_args(argv)
-    run(load(args.config), args.data_root, args.out, git_sha=args.git_sha)
+    state = ({'dirty': args.git_dirty == 'true', 'diff_hash': args.git_diff_hash}
+             if args.git_dirty is not None else None)
+    run(load(args.config), args.data_root, args.out, git_sha=args.git_sha, git_state=state)
 
 
 if __name__ == '__main__':
