@@ -24,6 +24,7 @@ from __future__ import annotations
 import argparse
 import json
 import re
+import warnings
 from typing import Any
 
 from PIL import Image
@@ -135,6 +136,9 @@ def vlm_detect(
     base_url: str | None = None,
     api_key: str | None = None,
     class_descriptions: dict[str, str] | None = None,
+    max_dimension: int | None = 1280, image_format: str | None = None,
+    jpeg_quality: int = 85, max_tokens: int = 4096,
+    tile: int | None = None, tile_overlap: float = 0.2, n_samples: int = 1,
 ) -> list[dict]:
     """Detect objects in *image* using a VLM with a free-form prompt.
 
@@ -209,27 +213,82 @@ def vlm_detect(
         else:
             prompt = DEFAULT_PROMPT
 
-    response = run_vlm(
-        image, prompt, model_id,
-        backend=backend, base_url=base_url, api_key=api_key,
-        max_tokens=4096,
-    )
+    if tile is not None and tile <= 0:
+        raise ValueError("tile must be positive")
+    if not 0 <= tile_overlap < 1 or n_samples < 1:
+        raise ValueError("tile_overlap must be in [0, 1) and n_samples positive")
+    from .bbox_utils import containment, nms
 
-    parsed = parse_bboxes_from_response(response)
+    class DetectionList(list):
+        truncated = False
 
-    detections = []
-    for obj in parsed:
-        raw = obj.get("bbox_2d", [])
-        raw = [float(x) for x in raw] if isinstance(raw, list) and len(raw) == 4 else []
-        bbox = denormalize_bbox(raw, w, h)
-        if len(bbox) != 4 or bbox[2] <= bbox[0] or bbox[3] <= bbox[1]:
-            continue
-        detections.append({
-            "bbox": bbox,
-            "label": str(obj.get("label", "")),
-            "sub_label": str(obj.get("sub_label") or ""),
-        })
-    return detections
+    def detect_region(region: tuple[int, int, int, int], retry: bool) -> DetectionList:
+        x, y, right, bottom = region
+        crop = image.crop(region)
+        response = run_vlm(
+            crop, prompt, model_id, backend=backend, base_url=base_url, api_key=api_key,
+            max_tokens=max_tokens, max_dimension=max_dimension, image_format=image_format,
+            jpeg_quality=jpeg_quality,
+        )
+        truncated = getattr(response, "finish_reason", None) == "length"
+        if truncated and retry and right - x > 1 and bottom - y > 1:
+            mx, my = (x + right) // 2, (y + bottom) // 2
+            result = DetectionList()
+            for box in ((x, y, mx, my), (mx, y, right, my),
+                        (x, my, mx, bottom), (mx, my, right, bottom)):
+                part = detect_region(box, False)
+                result.extend(part)
+                result.truncated |= part.truncated
+            return result
+        result = DetectionList()
+        result.truncated = truncated
+        if truncated:
+            warnings.warn("VLM detection response was truncated", RuntimeWarning, stacklevel=2)
+        for obj in parse_bboxes_from_response(response):
+            raw = obj.get("bbox_2d", [])
+            raw = [float(v) for v in raw] if isinstance(raw, list) and len(raw) == 4 else []
+            bbox = denormalize_bbox(raw, right - x, bottom - y)
+            if len(bbox) != 4 or bbox[2] <= bbox[0] or bbox[3] <= bbox[1]:
+                continue
+            result.append({"bbox": [bbox[0] + x, bbox[1] + y, bbox[2] + x, bbox[3] + y],
+                           "label": str(obj.get("label", "")),
+                           "sub_label": str(obj.get("sub_label") or "")})
+        return result
+
+    def starts(length: int) -> list[int]:
+        if tile is None or length <= tile:
+            return [0]
+        step = max(1, round(tile * (1 - tile_overlap)))
+        return list(range(0, length - tile, step)) + [length - tile]
+
+    samples = []
+    truncated = False
+    for _ in range(n_samples):
+        detections = []
+        for y in starts(h):
+            for x in starts(w):
+                part = detect_region((x, y, min(w, x + (tile or w)),
+                                      min(h, y + (tile or h))), tile is not None)
+                truncated |= part.truncated
+                detections.extend(part)
+        samples.append(nms(detections) if tile is not None else detections)
+    result = DetectionList()
+    result.truncated = truncated
+    if n_samples == 1:
+        result.extend(samples[0])
+        return result
+    clusters: list[dict] = []
+    for sample_index, detections in enumerate(samples):
+        for det in detections:
+            match = next((c for c in clusters if sample_index not in c["samples"]
+                          and c["det"]["label"].casefold() == det["label"].casefold()
+                          and containment(c["det"]["bbox"], det["bbox"]) >= 0.7), None)
+            if match is None:
+                clusters.append({"det": det, "samples": {sample_index}})
+            else:
+                match["samples"].add(sample_index)
+    result.extend({**c["det"], "score": len(c["samples"]) / n_samples} for c in clusters)
+    return result
 
 
 # ------------------------------------------------------------------

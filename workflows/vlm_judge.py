@@ -21,6 +21,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import warnings
 import re
 from pathlib import Path
 from typing import Any
@@ -269,20 +270,44 @@ def _parse_verdicts(text: str) -> dict[int, dict]:
         except (TypeError, ValueError):
             continue
         out[idx] = {
-            "verdict": item.get("verdict", "incorrect"),
+            "verdict": item.get("verdict", "unjudged"),
             "score": float(item.get("score", 0.0)),
             "reason": item.get("reason", ""),
         }
     return out
 
 
-_NO_VERDICT = {"verdict": "incorrect", "score": 0.0, "reason": "no verdict"}
+_NO_VERDICT = {"verdict": "unjudged", "score": 0.0, "reason": "no verdict"}
 
 
 # ------------------------------------------------------------------
 # Reusable scoring + ensemble  (shared by in-process multi-judge and
 # the per-judge HF Jobs that write verdicts to a bucket)
 # ------------------------------------------------------------------
+
+def _crop_sheet(image: Image.Image, detections: list[dict]) -> Image.Image:
+    """Make numbered, padded crops from the original pixels."""
+    import math
+    from PIL import ImageDraw
+
+    crops = []
+    for det in detections:
+        x1, y1, x2, y2 = det["bbox"]
+        pad_x, pad_y = (x2 - x1) * 0.15, (y2 - y1) * 0.15
+        box = (max(0, int(x1 - pad_x)), max(0, int(y1 - pad_y)),
+               min(image.width, math.ceil(x2 + pad_x)), min(image.height, math.ceil(y2 + pad_y)))
+        crop = image.crop(box).convert("RGB")
+        crop.thumbnail((256, 256))
+        crops.append(crop)
+    cols = math.ceil(math.sqrt(len(crops)))
+    sheet = Image.new("RGB", (cols * 276, math.ceil(len(crops) / cols) * 286), "white")
+    draw = ImageDraw.Draw(sheet)
+    for i, crop in enumerate(crops):
+        x, y = (i % cols) * 276, (i // cols) * 286
+        draw.text((x + 5, y + 2), f"#{i}", fill="black")
+        sheet.paste(crop, (x + 10, y + 20))
+    return sheet
+
 
 def score_detections(
     img: Image.Image,
@@ -294,6 +319,9 @@ def score_detections(
     api_key: str | None,
     overlay_img: Image.Image | None = None,
     class_descriptions: dict[str, str] | None = None,
+    judge_batch_size: int | None = None, judge_mode: str = "overlay",
+    max_tokens: int | None = None, max_dimension: int | None = 1280,
+    image_format: str | None = None, jpeg_quality: int = 85,
 ) -> list[dict]:
     """Run a single judge over one image's detections.
 
@@ -308,6 +336,24 @@ def score_detections(
     """
     if not detections:
         return []
+    if judge_mode not in ("overlay", "crops"):
+        raise ValueError("judge_mode must be overlay or crops")
+    if judge_batch_size is not None and judge_batch_size <= 0:
+        raise ValueError("judge_batch_size must be positive")
+    if judge_batch_size is not None or judge_mode == "crops":
+        size = judge_batch_size or len(detections)
+        results = []
+        for start in range(0, len(detections), size):
+            chunk = detections[start:start + size]
+            sheet = _crop_sheet(img, chunk) if judge_mode == "crops" else None
+            verdicts = score_detections(
+                img, chunk, model_id, backend=backend, base_url=base_url, api_key=api_key,
+                overlay_img=sheet, class_descriptions=class_descriptions,
+                max_tokens=max_tokens, max_dimension=max_dimension,
+                image_format=image_format, jpeg_quality=jpeg_quality,
+            )
+            results.extend({**v, "detection_idx": v["detection_idx"] + start} for v in verdicts)
+        return results
     if overlay_img is None:
         from tools.bbox_viz import draw_detections
         overlay_img = draw_detections(img, detections, show_index=True)
@@ -323,11 +369,14 @@ def score_detections(
         response = run_vlm(
             overlay_img, prompt, model_id,
             backend=backend, base_url=base_url, api_key=api_key,
-            max_tokens=16384 if "lfm3-vl" in model_id.lower() else 1024,
+            max_tokens=max_tokens or (16384 if "lfm3-vl" in model_id.lower() else 1024),
+            max_dimension=max_dimension, image_format=image_format, jpeg_quality=jpeg_quality,
         )
     except Exception as e:  # noqa: BLE001 — a dead judge must not abort the run
         print(f"\n  [warn] judge {model_id} failed: {e}")
         response = "[]"
+    if getattr(response, "finish_reason", None) == "length":
+        warnings.warn("VLM judge response was truncated", RuntimeWarning, stacklevel=2)
     return _verdicts_for(detections, response)
 
 
@@ -429,7 +478,7 @@ def ensemble_row(
             vmap = {v["detection_idx"]: v for v in verdicts}
             v = vmap.get(i, _NO_VERDICT)
             per_judge[label] = {
-                "verdict": v.get("verdict", "incorrect"),
+                "verdict": v.get("verdict", "unjudged"),
                 "score": float(v.get("score", 0.0)),
                 "reason": v.get("reason", ""),
             }
@@ -489,6 +538,7 @@ def _judge_local(
     base_url: str | None,
     api_key: str | None,
     class_descriptions: dict[str, str] | None = None,
+    overlay: bool = False, judge_options: dict | None = None,
 ) -> dict:
     with open(annotations_path) as f:
         coco = json.load(f)
@@ -508,14 +558,14 @@ def _judge_local(
 
         image = load_image(image_dir / img_info["file_name"])
         from tools.d1 import is_d1
-        if is_d1(model_id):
+        if is_d1(model_id) or overlay or (judge_options or {}).get("judge_mode") == "crops" or (judge_options or {}).get("judge_batch_size"):
             dets = [{"label": id2name[a["category_id"]],
                      "bbox": [a["bbox"][0], a["bbox"][1],
                               a["bbox"][0] + a["bbox"][2],
                               a["bbox"][1] + a["bbox"][3]]} for a in anns]
             scored = score_detections(image, dets, model_id, backend=backend,
                                       base_url=base_url, api_key=api_key,
-                                      class_descriptions=class_descriptions)
+                                      class_descriptions=class_descriptions, **(judge_options or {}))
             verdicts = {a["id"]: v for a, v in zip(anns, scored)}
         else:
             prompt = _build_judge_prompt_coco(
@@ -525,8 +575,13 @@ def _judge_local(
             response = run_vlm(
                 image, prompt, model_id,
                 backend=backend, base_url=base_url, api_key=api_key,
-                max_tokens=16384 if "lfm3-vl" in model_id.lower() else 1024,
+                max_tokens=(judge_options or {}).get("max_tokens") or (16384 if "lfm3-vl" in model_id.lower() else 1024),
+                max_dimension=(judge_options or {}).get("max_dimension", 1280),
+                image_format=(judge_options or {}).get("image_format"),
+                jpeg_quality=(judge_options or {}).get("jpeg_quality", 85),
             )
+            if getattr(response, "finish_reason", None) == "length":
+                warnings.warn("VLM judge response was truncated", RuntimeWarning, stacklevel=2)
             verdicts = _parse_verdicts(response)
         for ann in anns:
             v = verdicts.get(ann["id"], _NO_VERDICT)
@@ -573,6 +628,7 @@ def _judge_hub(
     hf_token: str | None,
     dataset_config: str | None = None,
     class_descriptions: dict[str, str] | None = None,
+    judge_options: dict | None = None,
 ) -> Any:
     from datasets import load_dataset
 
@@ -604,7 +660,7 @@ def _judge_hub(
                 img, dets, spec["model_id"],
                 backend=spec["backend"], base_url=spec["base_url"],
                 api_key=spec["api_key"], overlay_img=overlay,
-                class_descriptions=class_descriptions,
+                class_descriptions=class_descriptions, **(judge_options or {}),
             )
             for spec in judge_specs
         }
@@ -666,6 +722,10 @@ def judge_labels(
     push_to_hub: bool = False,
     hf_token: str | None = None,
     dataset_config: str | None = None,
+    max_dimension: int | None = 1280, image_format: str | None = None,
+    jpeg_quality: int = 85, max_tokens: int | None = None,
+    judge_batch_size: int | None = None, overlay: bool = False,
+    judge_mode: str = "overlay",
 ) -> dict | Any:
     """Score annotations with a VLM judge and keep those above *threshold*.
 
@@ -719,6 +779,9 @@ def judge_labels(
     dict or datasets.Dataset
         Filtered COCO dict (local) or HF Dataset (Hub).
     """
+    judge_options = dict(max_dimension=max_dimension, image_format=image_format,
+                         jpeg_quality=jpeg_quality, max_tokens=max_tokens,
+                         judge_batch_size=judge_batch_size, judge_mode=judge_mode)
     judge_specs = _normalize_judges(judges, model_id, backend, base_url, api_key)
 
     # Build the category definitions once: use what the caller supplied, else
@@ -746,14 +809,14 @@ def judge_labels(
             Path(source), Path(annotations), Path(output),
             first["model_id"], threshold, first["backend"],
             first["base_url"], first["api_key"],
-            class_descriptions=class_descriptions,
+            class_descriptions=class_descriptions, overlay=overlay, judge_options=judge_options,
         )
     return _judge_hub(
         str(source), str(output),
         judge_specs, threshold, min_agree,
         image_column, detections_column, split, max_samples,
         push_to_hub, hf_token, dataset_config=dataset_config,
-        class_descriptions=class_descriptions,
+        class_descriptions=class_descriptions, judge_options=judge_options,
     )
 
 

@@ -218,3 +218,12 @@ that HF Jobs will clone.
   it can be `pip install`ed and imported from anywhere (would touch every import +
   the `jobs/` clone bootstrap; the top-level `vision_agent.py` shim gives the
   `import vision_agent` ergonomics in the meantime).
+
+## Dense scenes
+
+For small, crowded objects, `label_dataset` accepts `tile`, `tile_overlap`,
+`max_dimension=None`, `image_format="png"`, `max_tokens`, and `n_samples`.
+Use `label_aliases` and `keep_unmatched` to audit label matching; `recursive`
+or `image_paths` retain local relative paths. `judge_labels` accepts `overlay=True`,
+`judge_mode="crops"`, and `judge_batch_size`, plus the same image and token options.
+Truncated detection responses are flagged; missing judge verdicts are `unjudged`.

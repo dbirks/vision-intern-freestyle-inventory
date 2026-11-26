@@ -110,6 +110,40 @@ def convert_annotations(
     return out
 
 
+def containment(a: list[float], b: list[float]) -> float:
+    """Intersection divided by the smaller box area, for xyxy boxes."""
+    intersection = max(0, min(a[2], b[2]) - max(a[0], b[0])) * max(
+        0, min(a[3], b[3]) - max(a[1], b[1]))
+    area_a = max(0, a[2] - a[0]) * max(0, a[3] - a[1])
+    area_b = max(0, b[2] - b[0]) * max(0, b[3] - b[1])
+    return intersection / min(area_a, area_b) if min(area_a, area_b) else 0.0
+
+
+def nms(detections: list[dict], iou_threshold: float = 0.5,
+        containment_threshold: float = 0.9) -> list[dict]:
+    """Suppress same-label duplicate xyxy detections, preferring higher scores."""
+    ordered = sorted(detections, key=lambda d: d.get("score", 1.0), reverse=True)
+    kept = []
+    for det in ordered:
+        a = det["bbox"]
+        duplicate = False
+        for other in kept:
+            if det.get("label", "").casefold() != other.get("label", "").casefold():
+                continue
+            b = other["bbox"]
+            inter = max(0, min(a[2], b[2]) - max(a[0], b[0])) * max(
+                0, min(a[3], b[3]) - max(a[1], b[1]))
+            union = ((a[2]-a[0])*(a[3]-a[1]) + (b[2]-b[0])*(b[3]-b[1]) - inter)
+            if (union > 0 and inter / union >= iou_threshold) or (
+                containment(a, b) >= containment_threshold
+            ):
+                duplicate = True
+                break
+        if not duplicate:
+            kept.append(det)
+    return kept
+
+
 # ------------------------------------------------------------------
 # Validation
 # ------------------------------------------------------------------

@@ -26,6 +26,15 @@ from PIL import Image
 
 from .model_options import structured_output_template_kwargs
 
+class VLMResponse(str):
+    """String response carrying the provider finish reason when available."""
+
+    def __new__(cls, text: str, finish_reason: str | None = None):
+        obj = super().__new__(cls, text)
+        obj.finish_reason = finish_reason
+        return obj
+
+
 # Cached OpenAI clients keyed by (base_url, api_key).
 _openai_clients: dict[tuple[str, str], Any] = {}
 _client_lock = threading.Lock()
@@ -40,25 +49,32 @@ HF_INFERENCE_URL = "https://router.huggingface.co/v1"
 _MAX_DIMENSION = 1280
 
 
-def _pil_to_data_url(image: Image.Image) -> str:
+def _pil_to_data_url(image: Image.Image, max_dimension: int | None = 1280,
+                     image_format: str | None = None, jpeg_quality: int = 85) -> str:
     """Encode a PIL Image as a base64 data URL, resizing if needed.
 
     Large images are downscaled to fit within _MAX_DIMENSION and saved as
     JPEG to avoid hitting API request-size limits.
     """
     w, h = image.size
-    if max(w, h) > _MAX_DIMENSION:
-        scale = _MAX_DIMENSION / max(w, h)
+    if max_dimension is not None and max_dimension <= 0:
+        raise ValueError("max_dimension must be positive or None")
+    if image_format not in (None, "jpeg", "png"):
+        raise ValueError("image_format must be jpeg or png")
+    if not 1 <= jpeg_quality <= 100:
+        raise ValueError("jpeg_quality must be between 1 and 100")
+    if max_dimension is not None and max(w, h) > max_dimension:
+        scale = max_dimension / max(w, h)
         image = image.resize(
             (int(w * scale), int(h * scale)), Image.LANCZOS,
         )
 
     buf = io.BytesIO()
-    if image.mode == "RGBA":
+    if image_format == "png" or (image_format is None and image.mode == "RGBA"):
         image.save(buf, format="PNG")
         mime = "image/png"
     else:
-        image.save(buf, format="JPEG", quality=85)
+        image.convert("RGB").save(buf, format="JPEG", quality=jpeg_quality)
         mime = "image/jpeg"
 
     return f"data:{mime};base64,{base64.b64encode(buf.getvalue()).decode()}"
@@ -96,6 +112,9 @@ def _run_openai(
     base_url: str | None,
     api_key: str | None,
     max_tokens: int,
+    max_dimension: int | None = 1280,
+    image_format: str | None = None,
+    jpeg_quality: int = 85,
 ) -> str:
     import time
 
@@ -103,7 +122,7 @@ def _run_openai(
     api_key = _resolve_api_key(api_key)
     client = _get_client(base_url, api_key)
 
-    data_url = _pil_to_data_url(image)
+    data_url = _pil_to_data_url(image, max_dimension, image_format, jpeg_quality)
     template_kwargs = structured_output_template_kwargs(model_id)
     request_kwargs = ({"extra_body": {"chat_template_kwargs": template_kwargs}}
                       if template_kwargs else {})
@@ -124,7 +143,8 @@ def _run_openai(
                 temperature=0,
                 **request_kwargs,
             )
-            return response.choices[0].message.content or ""
+            choice = response.choices[0]
+            return VLMResponse(choice.message.content or "", getattr(choice, "finish_reason", None))
         except Exception as e:
             last_err = e
             if attempt < 2:
@@ -224,6 +244,9 @@ def run_vlm(
     base_url: str | None = None,
     api_key: str | None = None,
     max_tokens: int = 4096,
+    max_dimension: int | None = 1280,
+    image_format: str | None = None,
+    jpeg_quality: int = 85,
 ) -> str:
     """Send *image* + *prompt* to a VLM and return the response text.
 
@@ -257,7 +280,8 @@ def run_vlm(
         The model's response text.
     """
     if backend == "openai":
-        return _run_openai(image, prompt, model_id, base_url, api_key, max_tokens)
+        return _run_openai(image, prompt, model_id, base_url, api_key, max_tokens,
+                           max_dimension, image_format, jpeg_quality)
     if backend == "transformers":
         return _run_transformers(image, prompt, model_id, max_tokens)
     raise ValueError(

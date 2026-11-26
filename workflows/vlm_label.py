@@ -19,6 +19,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import re
 from pathlib import Path
 from typing import Any
 
@@ -36,6 +37,27 @@ def _is_local_dir(source: str | Path) -> bool:
     return Path(source).is_dir()
 
 
+def _normalize_detections(detections: list[dict], classes: list[str],
+                          aliases: dict[str, str] | None, keep_unmatched: bool) -> list[dict]:
+    def key(value: str) -> str:
+        return re.sub(r"[^\w]+|_", "", value.casefold())
+    canonical = {key(c): c for c in classes}
+    for alias, target in (aliases or {}).items():
+        if key(target) not in canonical:
+            raise ValueError(f"Alias target {target!r} is not a class")
+        canonical[key(alias)] = canonical[key(target)]
+    out = []
+    for det in detections:
+        raw = det.get("label", "")
+        label = canonical.get(key(raw))
+        if label is None:
+            if not keep_unmatched:
+                continue
+            label = "unmatched:" + raw
+        out.append({**det, "label": label})
+    return out
+
+
 # ------------------------------------------------------------------
 # Local mode  (image_dir → COCO JSON)
 # ------------------------------------------------------------------
@@ -48,10 +70,16 @@ def _label_local(
     backend: str,
     base_url: str | None,
     api_key: str | None,
+    detect_options: dict, aliases: dict | None, keep_unmatched: bool,
+    recursive: bool, image_paths: list[str] | None, max_samples: int | None,
 ) -> dict:
-    image_files = sorted(
-        p for p in image_dir.iterdir() if p.suffix.lower() in _IMAGE_EXT
-    )
+    image_files = ([image_dir / p for p in image_paths] if image_paths is not None else
+                   sorted(p for p in (image_dir.rglob("*") if recursive else image_dir.iterdir())
+                          if p.is_file() and p.suffix.lower() in _IMAGE_EXT))
+    if any(not p.resolve().is_relative_to(image_dir.resolve()) for p in image_files):
+        raise ValueError("image_paths must stay within source")
+    if max_samples is not None:
+        image_files = image_files[:max_samples]
     if not image_files:
         raise FileNotFoundError(f"No images found in {image_dir}")
 
@@ -69,16 +97,20 @@ def _label_local(
 
         detections = vlm_detect(
             image, classes=classes, model_id=model_id,
-            backend=backend, base_url=base_url, api_key=api_key,
+            backend=backend, base_url=base_url, api_key=api_key, **detect_options,
         )
+        truncated = getattr(detections, "truncated", False)
+        detections = _normalize_detections(detections, classes, aliases, keep_unmatched)
 
         coco["images"].append(
-            {"id": img_id, "file_name": path.name, "width": w, "height": h},
+            {"id": img_id, "file_name": path.relative_to(image_dir).as_posix(), "width": w, "height": h,
+             **({"truncated": True} if truncated else {})},
         )
         for det in detections:
-            label = det["label"].lower()
+            label = det["label"]
             if label not in name2id:
-                continue
+                name2id[label] = len(categories)
+                categories.append({"id": name2id[label], "name": label})
             x1, y1, x2, y2 = det["bbox"]
             bw, bh = x2 - x1, y2 - y1
             coco["annotations"].append({
@@ -88,6 +120,7 @@ def _label_local(
                 "bbox": [round(x1, 1), round(y1, 1), round(bw, 1), round(bh, 1)],
                 "area": round(bw * bh, 1),
                 "iscrowd": 0,
+                **({"score": det["score"]} if "score" in det else {}),
             })
             ann_id += 1
 
@@ -117,6 +150,8 @@ def _label_hub(
     dataset_config: str | None = None,
     dedupe: bool = False,
     dedupe_key_columns: list[str] | None = None,
+    detect_options: dict | None = None, aliases: dict | None = None,
+    keep_unmatched: bool = False,
 ) -> Any:
     from datasets import load_dataset
 
@@ -141,7 +176,6 @@ def _label_hub(
     if max_samples:
         ds = ds.select(range(min(max_samples, len(ds))))
 
-    class_set = set(classes)
 
     def _label_row(img: Any) -> list[dict]:
         if not isinstance(img, Image.Image):
@@ -149,12 +183,12 @@ def _label_hub(
         try:
             dets = vlm_detect(
                 img, classes=classes, model_id=model_id,
-                backend=backend, base_url=base_url, api_key=api_key,
+                backend=backend, base_url=base_url, api_key=api_key, **(detect_options or {}),
             )
         except Exception as e:
             print(f"\n  [warn] vlm_detect failed, skipping: {e}")
             dets = []
-        return [d for d in dets if d.get("label", "").lower() in class_set]
+        return _normalize_detections(dets, classes, aliases, keep_unmatched), getattr(dets, "truncated", False)
 
     # Router/openai calls are I/O-bound and the per-image router latency is the
     # long pole for large splits, so fan them out across threads (order
@@ -180,7 +214,9 @@ def _label_hub(
             ):
                 all_detections[futures[fut]] = fut.result()
 
-    ds = ds.add_column("detections", all_detections)
+    ds = ds.add_column("detections", [row[0] for row in all_detections])
+    if any(row[1] for row in all_detections):
+        ds = ds.add_column("truncated", [row[1] for row in all_detections])
 
     if push_to_hub:
         from tools.hub_viz import push_dataset_with_viz
@@ -217,6 +253,11 @@ def label_dataset(
     dataset_config: str | None = None,
     dedupe: bool = False,
     dedupe_key_columns: list[str] | None = None,
+    max_dimension: int | None = 1280, image_format: str | None = None,
+    jpeg_quality: int = 85, max_tokens: int = 4096, tile: int | None = None,
+    tile_overlap: float = 0.2, n_samples: int = 1,
+    label_aliases: dict[str, str] | None = None, keep_unmatched: bool = False,
+    recursive: bool = False, image_paths: list[str] | None = None,
 ) -> dict | Any:
     """Auto-label images and write detection annotations.
 
@@ -260,11 +301,15 @@ def label_dataset(
         column (Hub mode).
     """
     classes_lower = [c.lower() for c in classes]
+    detect_options = dict(max_dimension=max_dimension, image_format=image_format,
+                          jpeg_quality=jpeg_quality, max_tokens=max_tokens, tile=tile,
+                          tile_overlap=tile_overlap, n_samples=n_samples)
 
     if _is_local_dir(source):
         return _label_local(
             Path(source), classes_lower, Path(output),
-            model_id, backend, base_url, api_key,
+            model_id, backend, base_url, api_key, detect_options, label_aliases,
+            keep_unmatched, recursive, image_paths, max_samples,
         )
     return _label_hub(
         str(source), classes_lower, str(output),
@@ -272,6 +317,7 @@ def label_dataset(
         image_column, split, max_samples, push_to_hub, hf_token,
         dataset_config=dataset_config,
         dedupe=dedupe, dedupe_key_columns=dedupe_key_columns,
+        detect_options=detect_options, aliases=label_aliases, keep_unmatched=keep_unmatched,
     )
 
 
