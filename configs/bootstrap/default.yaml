@@ -1,0 +1,25 @@
+base_url: https://llm-collective.e-gineering.com/v1
+api_key_env: LLMC_API_KEY
+primary_labeller: david-birks/inkling-2-mini
+fusion_iou: 0.55
+labellers:
+  - name: flash-full
+    model: qwen3-8-flash-next
+    max_tokens: 8192
+  - name: inkling-full
+    model: david-birks/inkling-2-mini
+    max_tokens: 8192
+  - name: inkling-tiles
+    model: david-birks/inkling-2-mini
+    tile: 1280
+    tile_overlap: 0.2
+    max_tokens: 8192
+judge:
+  model: qwen3-8-flash-next
+  batch_size: 8
+  max_tokens: 4096
+identifier:
+  model: david-birks/inkling-2-mini
+  batch_size: 8
+  upscale: 2
+  min_confidence: 0.5
