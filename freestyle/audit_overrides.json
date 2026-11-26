@@ -1,0 +1,21 @@
+{
+  "_comment": "Manual corrections to the VLM scene triage (freestyle/audit.py). Model labels are never ground truth; these are the obvious errors found by eyeballing the contact sheets in data/derived/audit/ and a few frames at full resolution. Field meanings are the same as in the audit rows; 'rotated_90' is an extra field we add for frames whose scene is sideways (the VLM's upside_down means 180 degrees only). See docs/freestyle/DATA_AUDIT.md.",
+  "local/downloads/frame.jpg": {
+    "motion_blur": "none",
+    "_why": "the sharpest frame in the corpus (package README: 'lit and sharp, signage readable'); VLM said mild"
+  },
+  "island-cabinet-01/c40dc230-fc17-4edc-969a-1fea7043807a/019.jpg": {
+    "rotated_90": true,
+    "motion_blur": "mild",
+    "_why": "scene is rotated ~90 degrees (cartridge boxes lie on their side); labels still readable, so not severe"
+  },
+  "island-cabinet-01/de19c989-a538-47d7-9173-a9fce2a49e7e/032.jpg": {
+    "upside_down": true,
+    "rotated_90": false,
+    "_why": "camera upside down relative to the shelves (~180 deg): rotated 180 the two shelf boards are horizontal, the cartridge heads point up and the red Coca-Cola boxes sit on the LOWER shelf, exactly as in local/downloads/frame.jpg. The earlier 'rotated_90, shelf line runs vertically' note was wrong - that describes c40dc230/019, not this frame (near-duplicate of ab8c7fc6/043, same door angle, same flip)."
+  },
+  "island-cabinet-01/ab8c7fc6-943c-4c3d-b95f-3a71f0966ec6/043.jpg": {
+    "upside_down": true,
+    "_why": "same ~180 deg flip as de19c989/032 (the two are near-duplicate views, pHash distance 3): VLM said upside_down=false; in the original the shelf-edge label strip sits ABOVE the cartridge row and the dark connector heads hang BELOW the brand colour, and the lower (Coca-Cola) shelf appears at the top of the frame."
+  }
+}
