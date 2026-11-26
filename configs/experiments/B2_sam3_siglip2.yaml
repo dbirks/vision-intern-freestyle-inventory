@@ -1,0 +1,13 @@
+# B2 sam3 siglip2 comparison.
+id: B2_sam3_siglip2
+family: B_zeroshot_plus_embed
+compute:
+  target: k8s:5090
+  vram_mb: 12000
+  timeout: 14400
+localizer:
+  type: zeroshot
+  backend: sam3
+identifier:
+  type: embedding_knn
+  model: google/siglip2-base-patch16-224

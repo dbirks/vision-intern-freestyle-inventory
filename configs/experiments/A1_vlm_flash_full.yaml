@@ -1,0 +1,14 @@
+# A1 vlm flash full comparison.
+id: A1_vlm_flash_full
+family: A_vlm
+compute:
+  target: local
+  vram_mb: 12000
+  timeout: 14400
+localizer:
+  type: vlm
+  model: gemini-2.5-flash
+  with_identity: true
+  tile: 0
+identifier:
+  type: none

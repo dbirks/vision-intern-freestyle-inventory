@@ -1,0 +1,14 @@
+# A3 vlm inkling tiles comparison.
+id: A3_vlm_inkling_tiles
+family: A_vlm
+compute:
+  target: local
+  vram_mb: 12000
+  timeout: 14400
+localizer:
+  type: vlm
+  model: inkling
+  with_identity: true
+  tile: 1024
+identifier:
+  type: none

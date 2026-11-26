@@ -1,0 +1,13 @@
+# B1 owlv2 dinov2 comparison.
+id: B1_owlv2_dinov2
+family: B_zeroshot_plus_embed
+compute:
+  target: k8s:5090
+  vram_mb: 12000
+  timeout: 14400
+localizer:
+  type: zeroshot
+  backend: owlv2
+identifier:
+  type: embedding_knn
+  model: facebook/dinov2-base
