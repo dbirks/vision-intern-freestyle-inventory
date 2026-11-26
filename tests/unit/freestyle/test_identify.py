@@ -330,6 +330,7 @@ def test_cli_embed_and_eval_roundtrip(tmp_path: Path, monkeypatch: pytest.Monkey
     rc = identify_cli.main(
         [
             "embed",
+            "--split-map", str(splits_path),
             "--coco",
             str(coco_path),
             "--images-root",
@@ -357,8 +358,9 @@ def test_cli_embed_and_eval_roundtrip(tmp_path: Path, monkeypatch: pytest.Monkey
             "eval",
             "--npz",
             str(npz_path),
-            "--groups",
+            "--split-map",
             str(splits_path),
+            "--include-val",
             "--clf",
             clf_name,
             "--out",
@@ -406,11 +408,15 @@ def test_cli_eval_stdout_unknown_exclusion_and_calibration(
         model=np.array(["stub"], dtype=str),
     )
 
+    split_path = tmp_path / "splits.json"
+    split_path.write_text(json.dumps({"groups": {"g1": "train", "g2": "train"},
+        "images": {f"g{g}/{i}.png": "train" for g, indices in [(1, (1, 2)), (2, (1, 2, 3))] for i in indices}}))
     rc = identify_cli.main(
         [
             "eval",
             "--npz",
             str(npz_path),
+            "--split-map", str(split_path),
             "--clf",
             "proto",
             "--calibrate-unknown-coverage",
@@ -421,7 +427,7 @@ def test_cli_eval_stdout_unknown_exclusion_and_calibration(
     out_json = json.loads(capsys.readouterr().out)
     assert out_json["n_samples"] == 4
     assert out_json["n_excluded_unknown"] == 1
-    assert out_json["n_groups"] == 4
+    assert out_json["n_groups"] == 2
     assert out_json["accuracy"] == pytest.approx(1.0)
     assert out_json["calibrated_unknown"]["target_met"] is True
 
@@ -431,3 +437,23 @@ def test_hf_embedder_raises_helpful_error_without_train_extra(monkeypatch: pytes
     with pytest.raises(ImportError, match="train"):
         Embedder("facebook/dinov2-base")
 
+
+
+def test_identification_rejects_missing_split_provenance():
+    with pytest.raises(ValueError, match='provenance'):
+        identify_cli._resolve_groups_and_splits(['g/a'], ['1'], None)
+
+
+def test_holdout_uses_train_gallery_only(tmp_path):
+    path = tmp_path / 'embeddings.npz'
+    np.savez(path, embeddings=np.array([[1., 0.], [0., 1.], [1., 0.], [0., 1.]]),
+             labels=['a', 'b', 'a', 'b'],
+             file_names=['train/a', 'train/b', 'test/a', 'exclude/a'],
+             image_ids=['1', '2', '3', '4'])
+    split = tmp_path / 'splits.json'
+    split.write_text(json.dumps({'groups': {'train': 'train', 'test': 'test', 'exclude': 'exclude'},
+        'images': {'train/a': 'train', 'train/b': 'train', 'test/a': 'test', 'exclude/a': 'exclude'}}))
+    args = identify_cli.build_parser().parse_args(['eval', '--npz', str(path), '--split-map', str(split),
+                                                  '--mode', 'holdout', '--split', 'test'])
+    result = identify_cli.run_eval(args)
+    assert result['n_samples'] == 1 and result['accuracy'] == 1

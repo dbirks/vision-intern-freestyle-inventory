@@ -14,6 +14,9 @@ def aggregate_counts(detections, thr=0.0, identity_thr=0.5, neighbour_vote='off'
     if neighbour_vote not in ('off', 'report', 'apply'):
         raise ValueError('neighbour_vote must be off, report, or apply')
     active = [(i, dict(d)) for i, d in enumerate(detections) if d['score'] >= thr]
+    for _, det in active:
+        if det.get('id_score', 0) < identity_thr or det.get('class') == 'cartridge':
+            det['class'] = 'unknown'
     flags = []
     for index, det in active:
         if neighbour_vote == 'off' or det.get('id_score', 0) >= identity_thr:
@@ -31,7 +34,8 @@ def aggregate_counts(detections, thr=0.0, identity_thr=0.5, neighbour_vote='off'
         if votes and len(classes) == 1 and all(d.get('id_score', 0) >= identity_thr for d in votes):
             suggestion = classes.pop()
             if suggestion != 'unknown':
-                flags.append({'type': 'neighbour_vote', 'detection': index, 'suggested_class': suggestion})
+                flags.append({'type': 'neighbour_vote', 'detection': index, 'suggested_class': suggestion,
+                              'suggested_score': min(d['id_score'] for d in votes)})
                 if neighbour_vote == 'apply':
                     det['class'] = suggestion
     counts = Counter(d.get('class', 'unknown') for _, d in active)

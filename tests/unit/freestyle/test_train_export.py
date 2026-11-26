@@ -29,3 +29,22 @@ def test_export_tiles(tmp_path):
                  tile=8, overlap=0, min_visible=0.8)
     strict = json.loads((tmp_path / "strict/train/_annotations.coco.json").read_text())
     assert len(strict["annotations"]) == 1
+
+
+def test_small_visible_piece_masked_in_validation(tmp_path):
+    pixels = np.full((10, 20, 3), 100, dtype=np.uint8)
+    pixels[2:8, 8:18] = 200
+    Image.fromarray(pixels).save(tmp_path / 'frame.png')
+    coco = {'images': [{'id': 1, 'file_name': 'frame.png', 'width': 20, 'height': 10}],
+            'categories': [{'id': 1, 'name': 'cola'}],
+            'annotations': [{'id': 5, 'image_id': 1, 'category_id': 1, 'bbox': [8, 2, 10, 6]}]}
+    (tmp_path / 'coco.json').write_text(json.dumps(coco))
+    (tmp_path / 'splits.json').write_text(json.dumps({'images': {'frame.png': 'val'}}))
+    out = tmp_path / 'out'
+    manifest = export_tiles(tmp_path / 'coco.json', tmp_path, out, tmp_path / 'splits.json',
+                            tile=10, overlap=0, min_visible=.6)
+    assert manifest[0]['masked_instances'][0]['annotation_id'] == 5
+    tile = np.asarray(Image.open(out / 'valid' / manifest[0]['file_name']))
+    assert not np.any(tile[2:8, 8:10] == 200)
+    ds = json.loads((out / 'valid/_annotations.coco.json').read_text())
+    assert len(ds['annotations']) == 1 and ds['annotations'][0]['bbox'] == [0, 2, 8, 6]

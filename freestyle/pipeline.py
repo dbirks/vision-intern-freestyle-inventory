@@ -29,6 +29,12 @@ class EmbeddingIdentifier:
         from freestyle.identify.embed import Embedder
 
         with np.load(gallery, allow_pickle=False) as data:
+            for key in ('image_ids', 'splits', 'groups'):
+                if key not in data or len(data[key]) != len(data['labels']) or any(not str(v) for v in data[key]):
+                    raise ValueError(f'Gallery requires complete {key} provenance')
+            if any(str(v) != 'train' for v in data['splits']):
+                raise ValueError('Gallery may contain train rows only')
+            self.gallery_groups = set(map(str, data['groups']))
             self.classifier = KNNClassifier(k=k).fit(data['embeddings'], data['labels'])
         self.embedder = Embedder(name=model, **kwargs)
 
@@ -97,8 +103,23 @@ class Pipeline:
             for d, identity in zip(detections, identities):
                 d.update(identity)
         for d in detections:
+            if self.identifier is None and not d.get('class') and 'category_id' in d:
+                names = getattr(getattr(self.localizer, 'backend', self.localizer), 'class_names', None)
+                idx = d['category_id']
+                if names is None:
+                    raise ValueError('Detector class names are required')
+                try:
+                    d['class'] = names[idx] if not isinstance(names, dict) else names.get(idx, names.get(str(idx)))
+                except (IndexError, KeyError):
+                    raise ValueError(f'Unknown detector class index: {idx}') from None
+                if not d['class']:
+                    raise ValueError(f'Unknown detector class index: {idx}')
+                d['id_score'] = d['score']
             d['class'] = d.get('class') or 'unknown'
             d['id_score'] = float(d.get('id_score', 0))
+            d['proposed_class'], d['proposed_score'] = d['class'], d['id_score']
+            if d['id_score'] < self.identity_thr or d['class'] == 'cartridge':
+                d['class'] = 'unknown'
         timings['identify'] = (time.perf_counter() - start) * 1000
         start = time.perf_counter()
         detections = assign_shelves(detections, self.max_rows)
@@ -114,6 +135,7 @@ class Pipeline:
         if self.neighbour_vote == 'apply':
             for flag in votes:
                 detections[flag['detection']]['class'] = flag['suggested_class']
+                detections[flag['detection']]['id_score'] = flag['suggested_score']
         timings['count'] = (time.perf_counter() - start) * 1000
         for d in detections:
             d['shelf'] = d.pop('shelf_idx')
@@ -141,7 +163,8 @@ def run_images(pipeline, images, out, categories):
                 raise ValueError(f"Missing COCO category ID for {d['class']!r}")
             predictions.append({'image_id': image_id, 'bbox': xyxy_to_xywh(d['box']).tolist(),
                                 'score': float(d['score']), 'category_id': categories[d['class']],
-                                'id_score': d['id_score']})
+                                'id_score': d['id_score'], 'proposed_class': d['proposed_class'],
+                                'proposed_score': d['proposed_score']})
             draw.rectangle(d['box'], outline='lime', width=2)
             draw.text((d['box'][0], d['box'][1]), f"{d['class'][:18]} S{d['shelf']}", fill='yellow')
         image.save(out / 'overlays' / f'{name}.png')

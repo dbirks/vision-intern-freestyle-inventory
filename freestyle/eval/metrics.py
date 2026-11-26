@@ -1,4 +1,8 @@
-"""Evaluation metrics and group bootstrap CIs for Freestyle recognition."""
+"""Evaluation metrics and group bootstrap CIs.
+
+Inventory vectors contain catalog classes and unknown; generic cartridge counts
+as unknown. Exact inventory requires every entry to match; total exact compares totals.
+"""
 
 from __future__ import annotations
 
@@ -56,11 +60,12 @@ def _match_split_group_from_name(image_name: str, split_groups: Mapping[str, Any
 def load_groups_map(
     gt_coco: Mapping[str, Any],
     groups_data: Mapping[str, Any] | None = None,
+    allow_image_groups: bool = False,
 ) -> dict[str, str]:
     """Build an ``image_key -> group_id`` mapping for all images in ``gt_coco``.
 
     Supports:
-    - ``None``: uses ``img["group_id"]`` if present, else each image is its own group.
+    - ``None``: uses embedded group IDs; missing IDs require explicit opt-in.
     - ``data/splits.json`` schema (``{"version": 1, "groups": {...}, "images": {...}}``):
       matches each image's ``file_name`` (or ``id``) against ``groups`` keys.
     - Explicit mapping JSON: ``{"image_to_group": {...}}`` or flat ``{image_id_or_file_name: group_id}``.
@@ -99,14 +104,18 @@ def load_groups_map(
                         group_id = matched
                         break
 
-        if group_id is None:
+        if not group_id:
             attrs = img.get("attributes") if isinstance(img.get("attributes"), Mapping) else {}
             if "group_id" in img and img["group_id"] is not None:
                 group_id = str(img["group_id"])
             elif "group_id" in attrs and attrs["group_id"] is not None:
                 group_id = str(attrs["group_id"])
             else:
+                if not allow_image_groups:
+                    raise ValueError(f"Missing group for image {key}")
                 group_id = key
+        if not group_id:
+            raise ValueError(f"Missing group for image {key}")
         out[key] = group_id
     return out
 
@@ -174,12 +183,7 @@ def _prepare_dataset(
         for cid, name in cat_id_to_name.items()
         if name.lower() not in SPECIAL_CLASS_NAMES and cid != -1
     )
-    if non_special:
-        catalog_cat_ids = non_special
-    else:
-        catalog_cat_ids = sorted(
-            cid for cid in cat_id_to_name if cid not in unknown_cat_ids and cid != -1
-        )
+    catalog_cat_ids = non_special
 
     gt_boxes_by_img = [
         np.asarray(b, dtype=np.float64).reshape(-1, 4) if b else np.zeros((0, 4), dtype=np.float64)
@@ -194,7 +198,7 @@ def _prepare_dataset(
         for s in pred_scores_raw
     ]
 
-    image_groups = load_groups_map(gt_coco, groups_data)
+    image_groups = load_groups_map(gt_coco, groups_data, allow_image_groups=True)
     return _PreparedDataset(
         image_keys=image_keys,
         image_groups=image_groups,
@@ -575,7 +579,7 @@ def _per_image_counting_records(
     score_thr: float,
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, list[int]]:
     """Compute per-image total counts and per-catalog-class count vectors."""
-    class_ids = prepared.catalog_cat_ids
+    class_ids = [*prepared.catalog_cat_ids, -1]
     cid_to_col = {cid: idx for idx, cid in enumerate(class_ids)}
     n_images = len(prepared.image_keys)
     n_classes = len(class_ids)
@@ -589,7 +593,7 @@ def _per_image_counting_records(
         gt_cats = prepared.gt_cats_by_img[img_idx]
         gt_totals[img_idx] = len(gt_cats)
         for cid in gt_cats:
-            col = cid_to_col.get(cid)
+            col = cid_to_col.get(cid, len(class_ids) - 1)
             if col is not None:
                 gt_counts[img_idx, col] += 1
 
@@ -598,7 +602,7 @@ def _per_image_counting_records(
         pred_totals[img_idx] = len(keep)
         pred_cats = prepared.pred_cats_by_img[img_idx]
         for pi in keep.tolist():
-            col = cid_to_col.get(pred_cats[pi])
+            col = cid_to_col.get(pred_cats[pi], len(class_ids) - 1)
             if col is not None:
                 pred_counts[img_idx, col] += 1
 
@@ -619,6 +623,7 @@ def _aggregate_counting(
     if len(sample_indices) == 0:
         out: dict[str, Any] = {
             "total_count_mae": None,
+            "total_count_exact_rate": None,
             "per_class_count_mae": None,
             "exact_inventory_rate": None,
         }
@@ -640,7 +645,7 @@ def _aggregate_counting(
         exact_inventory_rate = float(np.mean(np.all(abs_err == 0, axis=1)))
         per_class_mae = (
             {
-                prepared.cat_id_to_name.get(cid, str(cid)): float(val)
+                ("unknown" if cid == -1 else prepared.cat_id_to_name.get(cid, str(cid))): float(val)
                 for cid, val in zip(class_ids, np.mean(abs_err, axis=0).tolist())
             }
             if include_per_class
@@ -649,6 +654,7 @@ def _aggregate_counting(
 
     out = {
         "total_count_mae": total_count_mae,
+        "total_count_exact_rate": float(np.mean(total_abs_err == 0)),
         "per_class_count_mae": per_class_count_mae,
         "exact_inventory_rate": exact_inventory_rate,
     }
@@ -738,9 +744,12 @@ def evaluate_predictions(
     seed: int = 42,
     max_dets: int | None = None,
     include_best_f1: bool = True,
+    allow_image_groups: bool = False,
 ) -> dict[str, Any]:
     """Run the full Freestyle evaluation suite (localization, id, counting, group bootstrap)."""
+    groups = load_groups_map(gt_coco, groups_data, allow_image_groups=allow_image_groups)
     prepared = _prepare_dataset(gt_coco, predictions, groups_data=groups_data)
+    prepared.image_groups = groups
     all_indices = list(range(len(prepared.image_keys)))
 
     loc_records, n_gt_by_img = _per_image_localization_records(prepared, max_dets=max_dets)
@@ -804,6 +813,7 @@ def evaluate_predictions(
             "identification.top1_acc": b_id["top1_acc"],
             "identification.macro_f1": b_id["macro_f1"],
             "counting.total_count_mae": b_cnt["total_count_mae"],
+            "counting.total_count_exact_rate": b_cnt["total_count_exact_rate"],
             "counting.per_class_count_mae": b_cnt["per_class_count_mae"],
             "counting.exact_inventory_rate": b_cnt["exact_inventory_rate"],
         }
@@ -812,6 +822,7 @@ def evaluate_predictions(
         ordered_groups, _boot_step, n_bootstrap=n_bootstrap, seed=seed
     )
 
+    bootstrap["grouping"] = "ungrouped" if allow_image_groups else "grouped"
     return {
         "score_thr": applied_thr,
         "matching": matching,

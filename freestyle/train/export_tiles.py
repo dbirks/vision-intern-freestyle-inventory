@@ -5,7 +5,7 @@ import json
 from collections import defaultdict
 from pathlib import Path
 
-from PIL import Image
+from PIL import Image, ImageDraw, ImageStat
 
 from freestyle.geometry import make_tiles
 
@@ -53,13 +53,15 @@ def export_tiles(coco_file, images_root, out, split_map, tile=1024, overlap=0.25
                     sample = sample.resize((resolution, resolution), Image.Resampling.LANCZOS)
                 sx, sy = sample.width / (x1 - x0), sample.height / (y1 - y0)
                 name = f"{image_id:08d}.png"
-                sample.save(out / split / name, format="PNG")
+                mean = tuple(round(v) for v in ImageStat.Stat(sample.convert("RGB")).mean)
+                masked = []
                 ds = datasets[split]
                 ds["images"].append({"id": image_id, "file_name": name,
                                      "width": sample.width, "height": sample.height})
                 manifest.append({"image_id": image_id, "source_image_id": source["id"],
                                  "source_file_name": source["file_name"], "split": split,
-                                 "file_name": name, "tile": list(rect), "full_frame": full})
+                                 "file_name": name, "tile": list(rect), "full_frame": full,
+                                 "masked_instances": masked})
                 for ann in annotations[source["id"]]:
                     x, y, w, h = ann["bbox"]
                     if w <= 0 or h <= 0:
@@ -67,7 +69,16 @@ def export_tiles(coco_file, images_root, out, split_map, tile=1024, overlap=0.25
                     left, top = max(x, x0), max(y, y0)
                     right, bottom = min(x + w, x1), min(y + h, y1)
                     cw, ch = max(0, right - left), max(0, bottom - top)
-                    if not cw or not ch or cw * ch / (w * h) < min_visible:
+                    if not cw or not ch:
+                        continue
+                    if cw * ch / (w * h) < min_visible:
+                        import math
+                        box = [(left - x0) * sx, (top - y0) * sy,
+                               (right - x0) * sx, (bottom - y0) * sy]
+                        ImageDraw.Draw(sample).rectangle(
+                            (math.floor(box[0]), math.floor(box[1]),
+                             math.ceil(box[2]) - 1, math.ceil(box[3]) - 1), fill=mean)
+                        masked.append({"annotation_id": ann.get("id"), "box": box})
                         continue
                     box = [(left - x0) * sx, (top - y0) * sy, cw * sx, ch * sy]
                     ann_id += 1
@@ -75,6 +86,7 @@ def export_tiles(coco_file, images_root, out, split_map, tile=1024, overlap=0.25
                         "category_id": 1 if class_agnostic else ann["category_id"],
                         "bbox": box, "area": box[2] * box[3],
                         "iscrowd": ann.get("iscrowd", 0)})
+                sample.save(out / split / name, format="PNG")
     for split, dataset in datasets.items():
         (out / split / "_annotations.coco.json").write_text(json.dumps(dataset, indent=2))
     (out / "manifest.json").write_text(json.dumps(manifest, indent=2))

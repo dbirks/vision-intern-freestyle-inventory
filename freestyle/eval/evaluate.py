@@ -89,6 +89,9 @@ def build_parser() -> argparse.ArgumentParser:
         default=None,
         help="Optional data/splits.json or image->group JSON mapping for group bootstrap.",
     )
+    p.add_argument("--split-map", help="Split provenance for threshold selection.")
+    p.add_argument("--allow-train-selection", action="store_true")
+    p.add_argument("--allow-image-groups", action="store_true")
     thr_group = p.add_mutually_exclusive_group(required=True)
     thr_group.add_argument(
         "--score-thr",
@@ -126,20 +129,31 @@ def main(argv: Sequence[str] | None = None) -> int:
 
     gt_coco = _load_json(gt_path)
     predictions = _load_json(pred_path)
-    groups_data = _load_json(args.groups) if args.groups else None
+    groups_data = _load_json(args.groups or args.split_map) if (args.groups or args.split_map) else None
 
     if args.score_thr is not None:
         score_thr = float(args.score_thr)
         score_thr_source = "explicit"
     else:
         val_gt_path, val_pred_path = (Path(p) for p in args.select_thr_on)
-        if val_gt_path.resolve() == gt_path.resolve() and _looks_like_test_split(
-            gt_path, gt_coco, groups_data
-        ):
-            parser.error(
-                "--select-thr-on cannot use the test GT file; pass --score-thr or a val split."
-            )
+        if not args.split_map:
+            parser.error("--select-thr-on requires --split-map")
+        split_data = _load_json(args.split_map)
+        split_images = split_data.get("images", {})
         val_gt = _load_json(val_gt_path)
+        if not val_gt.get("images"):
+            parser.error("Threshold selection dataset must contain images")
+        allowed = {"val", "train"} if args.allow_train_selection else {"val"}
+        for image in val_gt.get("images", []):
+            if split_images.get(image.get("file_name")) not in allowed:
+                parser.error("Every threshold selection image must belong to val (or explicitly allowed train)")
+        from freestyle.eval.metrics import load_groups_map
+        selection_groups = set(load_groups_map(val_gt, split_data).values())
+        test_images = [image for image in gt_coco.get("images", [])
+                       if split_images.get(image.get("file_name")) == "test"]
+        test_groups = set(load_groups_map({"images": test_images}, split_data).values())
+        if selection_groups & test_groups:
+            parser.error("Threshold selection groups overlap test groups")
         val_pred = _load_json(val_pred_path)
         val_loc = compute_localization_metrics(val_gt, val_pred, score_thr=None, include_best_f1=True)
         score_thr = float(val_loc["best_f1_threshold"])
@@ -157,6 +171,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         n_bootstrap=args.n_bootstrap,
         seed=args.seed,
         include_best_f1=False,
+        allow_image_groups=args.allow_image_groups,
     )
     metrics["experiment"] = args.experiment or _infer_experiment_name(pred_path, out_path, meta)
     metrics["score_thr_source"] = score_thr_source

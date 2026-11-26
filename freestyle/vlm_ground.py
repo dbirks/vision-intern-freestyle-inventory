@@ -1,10 +1,7 @@
 """Direct VLM grounding in original pixels.
 
 Uses the bbox parser and 0–1000 convention from :mod:`tools.vlm_detect`.
-Auto coordinates use norm1 when all values are <= 1; values outside the
-sent image dimensions imply norm1000; otherwise ambiguous values are pixels,
-except on images at least 1000 pixels on both axes where norm1000 is assumed.
-Choose an explicit mode when the model's convention is known.
+Coordinate units must be specified; the bundled prompt uses norm1000.
 """
 from __future__ import annotations
 
@@ -40,14 +37,8 @@ def _convert(raw, size, mode):
     if len(values) != 4 or not all(math.isfinite(v) for v in values):
         return None
     w, h = size
-    if mode == 'auto':
-        if max(values) <= 1:
-            mode = 'norm1'
-        elif (max(values[::2]) > w or max(values[1::2]) > h
-              or (w >= 1000 and h >= 1000 and max(values) <= 1000)):
-            mode = 'norm1000'
-        else:
-            mode = 'pixel'
+    if mode not in ('norm1000', 'pixel', 'norm1'):
+        raise ValueError('Pass the coordinate mode measured by the probe')
     if mode == 'norm1000':
         box = denormalize_bbox(values, w, h)
     else:
@@ -58,11 +49,11 @@ def _convert(raw, size, mode):
 
 
 class VLMGrounder:
-    def __init__(self, model, coord_mode='auto', tile=0, overlap=0.25, max_side=None,
+    def __init__(self, model, coord_mode='norm1000', tile=0, overlap=0.25, max_side=None,
                  prompt_variant='per_shelf', with_identity=False, temperature=0,
                  n_samples=1, raw_jsonl=None):
-        if coord_mode not in ('auto', 'norm1000', 'pixel', 'norm1'):
-            raise ValueError('invalid coordinate mode')
+        if coord_mode not in ('norm1000', 'pixel', 'norm1'):
+            raise ValueError('Pass the coordinate mode measured by the probe')
         if prompt_variant not in ('per_shelf', 'all') or tile < 0 or not 0 <= overlap < 1 or n_samples < 1:
             raise ValueError('invalid grounding options')
         self.model, self.coord_mode, self.tile, self.overlap = model, coord_mode, tile, overlap

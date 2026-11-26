@@ -8,8 +8,8 @@ from freestyle import vlm_ground as ground
 def test_messy_and_coordinates():
     text = '```json\n[{"bbox_2d":[10,20,100,200],"label":"x"}, {"bbox_2d":[1,2'
     assert len(ground.parse_boxes(text)) == 1
-    assert ground._convert([100, 200, 900, 800], (200, 100), 'auto') == [20, 20, 180, 80]
-    assert ground._convert([10, 20, 100, 80], (200, 100), 'auto') == [10, 20, 100, 80]
+    assert ground._convert([100, 200, 900, 800], (200, 100), 'norm1000') == [20, 20, 180, 80]
+    assert ground._convert([10, 20, 100, 80], (200, 100), 'pixel') == [10, 20, 100, 80]
 
 
 def test_tiles_and_agreement(monkeypatch):
@@ -32,3 +32,10 @@ def test_coco(tmp_path, monkeypatch):
     assert coco['annotations'][0]['bbox'] == [1, 2, 4, 6]
     assert coco['annotations'][0]['attributes']['source'] == 'vlm:mock'
     assert coco['categories'][1]['name'] == 'cartridge'
+
+
+def test_ambiguous_coordinates_require_explicit_mode():
+    import pytest
+    assert ground._convert([100, 100, 500, 500], (800, 800), 'norm1000') == [80, 80, 400, 400]
+    with pytest.raises(ValueError, match='probe'):
+        ground.VLMGrounder('mock', coord_mode='auto')

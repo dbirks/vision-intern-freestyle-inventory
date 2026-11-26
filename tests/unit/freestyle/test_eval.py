@@ -99,7 +99,7 @@ def test_perfect_prediction_metrics():
         {"image_id": 1, "bbox": [150, 10, 100, 100], "score": 0.90, "category_id": 2, "id_score": 0.98},
         {"image_id": 2, "bbox": [20, 20, 100, 100], "score": 0.85, "category_id": 1, "id_score": 0.97},
     ]
-    res = evaluate_predictions(gt, preds, score_thr=0.5, n_bootstrap=50, seed=7)
+    res = evaluate_predictions(gt, preds, score_thr=0.5, n_bootstrap=50, seed=7, allow_image_groups=True)
     loc = res["localization"]
     ident = res["identification"]
     cnt = res["counting"]
@@ -123,7 +123,7 @@ def test_shifted_boxes_partial_and_miss():
         annotations=[{"id": 1, "image_id": 1, "category_id": 1, "bbox": [0, 0, 100, 100]}],
     )
     moderate_shift = [{"image_id": 1, "bbox": [15, 0, 100, 100], "score": 0.9, "category_id": 1}]
-    res_mod = evaluate_predictions(gt, moderate_shift, score_thr=0.5, n_bootstrap=20, seed=1)
+    res_mod = evaluate_predictions(gt, moderate_shift, score_thr=0.5, n_bootstrap=20, seed=1, allow_image_groups=True)
     assert res_mod["localization"]["ap50"] == pytest.approx(1.0)
     # IoU 0.7391 passes 0.50, 0.55, 0.60, 0.65, 0.70 (5 of 10 thresholds) -> AP50:95 == 0.5
     assert res_mod["localization"]["ap50_95"] == pytest.approx(0.5)
@@ -131,7 +131,7 @@ def test_shifted_boxes_partial_and_miss():
 
     # Shift by x=40 -> inter=60*100=6000, union=14000 -> IoU=0.4286 < 0.5
     large_shift = [{"image_id": 1, "bbox": [40, 0, 100, 100], "score": 0.9, "category_id": 1}]
-    res_bad = evaluate_predictions(gt, large_shift, score_thr=0.5, n_bootstrap=20, seed=1)
+    res_bad = evaluate_predictions(gt, large_shift, score_thr=0.5, n_bootstrap=20, seed=1, allow_image_groups=True)
     assert res_bad["localization"]["ap50"] == pytest.approx(0.0)
     assert res_bad["localization"]["recall"] == pytest.approx(0.0)
     assert res_bad["identification"]["n_matched_known_gt"] == 0
@@ -161,7 +161,7 @@ def test_missing_and_extra_boxes_and_best_f1():
     cnt = compute_counting_metrics(gt, preds, score_thr=0.2)
     assert cnt["total_count_mae"] == pytest.approx((1 + 1) / 2.0)
     # Per-class counts: img1 cat1=2 vs 1 (err 1), cat2=1 vs 1 (err 0); img2 cat1=0 vs 1 (err 1), cat2=0 vs 0 (err 0)
-    assert cnt["per_class_count_mae"] == pytest.approx(2.0 / 4.0)
+    assert cnt["per_class_count_mae"] == pytest.approx(2.0 / 6.0)
     assert cnt["exact_inventory_rate"] == pytest.approx(0.0)
 
 
@@ -173,7 +173,7 @@ def test_wrong_identity_keeps_localization_perfect():
         {"image_id": 1, "bbox": [150, 10, 100, 100], "score": 0.90, "category_id": 1},
         {"image_id": 2, "bbox": [20, 20, 100, 100], "score": 0.85, "category_id": 1},
     ]
-    res = evaluate_predictions(gt, preds, score_thr=0.5, n_bootstrap=20, seed=1)
+    res = evaluate_predictions(gt, preds, score_thr=0.5, n_bootstrap=20, seed=1, allow_image_groups=True)
     assert res["localization"]["ap50"] == pytest.approx(1.0)
     assert res["identification"]["top1_acc"] == pytest.approx(1.0 / 3.0)
     # cat1: tp=1, fp=1, fn=1 -> f1=0.5; cat2: tp=0, fp=1, fn=1 -> f1=0.0 => macro_f1=0.25
@@ -184,7 +184,7 @@ def test_wrong_identity_keeps_localization_perfect():
 
     # Now predict cat 2 on image 2 as well -> class counts are wrong on image 2
     preds[2]["category_id"] = 2
-    res2 = evaluate_predictions(gt, preds, score_thr=0.5, n_bootstrap=20, seed=1)
+    res2 = evaluate_predictions(gt, preds, score_thr=0.5, n_bootstrap=20, seed=1, allow_image_groups=True)
     assert res2["counting"]["total_count_mae"] == pytest.approx(0.0)
     assert res2["counting"]["per_class_count_mae"] > 0.0
     assert res2["counting"]["exact_inventory_rate"] == pytest.approx(0.5)
@@ -203,7 +203,7 @@ def test_unknown_class_gt_handling():
         {"image_id": 1, "bbox": [10, 10, 80, 80], "score": 0.9, "category_id": 1},
         {"image_id": 1, "bbox": [120, 10, 80, 80], "score": 0.8, "category_id": 2},
     ]
-    res = evaluate_predictions(gt, preds, score_thr=0.5, n_bootstrap=10, seed=0)
+    res = evaluate_predictions(gt, preds, score_thr=0.5, n_bootstrap=10, seed=0, allow_image_groups=True)
     assert res["localization"]["ap50"] == pytest.approx(1.0)
     assert res["identification"]["n_matched_known_gt"] == 1
     assert res["identification"]["n_matched_unknown_gt"] == 1
@@ -214,7 +214,7 @@ def test_unknown_class_gt_handling():
 
     # Missing the unknown GT box hurts localization & total count, not identification accuracy
     preds_miss_unk = [preds[0]]
-    res_miss = evaluate_predictions(gt, preds_miss_unk, score_thr=0.5, n_bootstrap=10, seed=0)
+    res_miss = evaluate_predictions(gt, preds_miss_unk, score_thr=0.5, n_bootstrap=10, seed=0, allow_image_groups=True)
     assert res_miss["localization"]["recall"] == pytest.approx(0.5)
     assert res_miss["identification"]["top1_acc"] == pytest.approx(1.0)
     assert res_miss["counting"]["total_count_mae"] == pytest.approx(1.0)
@@ -237,7 +237,7 @@ def test_empty_images_and_all_empty_dataset():
     preds_clean = [
         {"image_id": 1, "bbox": [10, 10, 80, 80], "score": 0.95, "category_id": 1},
     ]
-    res_clean = evaluate_predictions(gt, preds_clean, score_thr=0.5, n_bootstrap=20, seed=3)
+    res_clean = evaluate_predictions(gt, preds_clean, score_thr=0.5, n_bootstrap=20, seed=3, allow_image_groups=True)
     assert res_clean["localization"]["ap50"] == pytest.approx(1.0)
     assert res_clean["counting"]["exact_inventory_rate"] == pytest.approx(1.0)
     assert res_clean["counting"]["total_count_mae"] == pytest.approx(0.0)
@@ -246,7 +246,7 @@ def test_empty_images_and_all_empty_dataset():
     preds_fp = preds_clean + [
         {"image_id": 2, "bbox": [20, 20, 50, 50], "score": 0.99, "category_id": 1},
     ]
-    res_fp = evaluate_predictions(gt, preds_fp, score_thr=0.5, n_bootstrap=20, seed=3)
+    res_fp = evaluate_predictions(gt, preds_fp, score_thr=0.5, n_bootstrap=20, seed=3, allow_image_groups=True)
     assert res_fp["localization"]["ap50"] < 0.6
     assert res_fp["localization"]["precision"] == pytest.approx(0.5)
     assert res_fp["counting"]["total_count_mae"] == pytest.approx(0.5)
@@ -254,7 +254,7 @@ def test_empty_images_and_all_empty_dataset():
 
     # All-empty dataset should not crash
     gt_empty = _make_coco(images=[{"id": 1, "width": 100, "height": 100}], annotations=[])
-    res_empty = evaluate_predictions(gt_empty, [], score_thr=0.5, n_bootstrap=10, seed=0)
+    res_empty = evaluate_predictions(gt_empty, [], score_thr=0.5, n_bootstrap=10, seed=0, allow_image_groups=True)
     assert res_empty["localization"]["ap50"] is None
     assert res_empty["counting"]["exact_inventory_rate"] == pytest.approx(1.0)
 
@@ -390,6 +390,8 @@ def test_cli_evaluate_and_report(tmp_path: Path, capsys):
         {"image_id": 2, "bbox": [250, 250, 50, 50], "score": 0.25, "category_id": 1},
     ]
     test_gt = _baseline_gt()
+    for image in test_gt["images"]:
+        image["file_name"] = "test/" + image["file_name"]
     test_preds = [
         {"image_id": 1, "bbox": [10, 10, 100, 100], "score": 0.92, "category_id": 1},
         {"image_id": 1, "bbox": [150, 10, 100, 100], "score": 0.80, "category_id": 2},
@@ -405,6 +407,11 @@ def test_cli_evaluate_and_report(tmp_path: Path, capsys):
     out_p = run_dir / "metrics.json"
     meta_p = run_dir / "meta.json"
 
+    split_path = tmp_path / "splits.json"
+    split_path.write_text(json.dumps({"groups": {"srv/evt-a": "val", "srv/evt-b": "val",
+        "test/srv/evt-a": "test", "test/srv/evt-b": "test"},
+        "images": {**{i["file_name"]: "val" for i in val_gt["images"]},
+                   **{i["file_name"]: "test" for i in test_gt["images"]}}}))
     val_gt_p.write_text(json.dumps(val_gt), encoding="utf-8")
     val_pred_p.write_text(json.dumps(val_preds), encoding="utf-8")
     test_gt_p.write_text(json.dumps(test_gt), encoding="utf-8")
@@ -429,6 +436,14 @@ def test_cli_evaluate_and_report(tmp_path: Path, capsys):
             ]
         )
 
+    # A copied test dataset is rejected by membership, regardless of its filename.
+    copied = tmp_path / "copied.json"
+    copied.write_text(json.dumps(test_gt))
+    with pytest.raises(SystemExit):
+        evaluate_main(["--gt", str(val_gt_p), "--pred", str(val_pred_p),
+                       "--select-thr-on", str(copied), str(test_pred_p),
+                       "--split-map", str(split_path)])
+
     # Selecting threshold on val and evaluating on test succeeds
     rc = evaluate_main(
         [
@@ -439,6 +454,8 @@ def test_cli_evaluate_and_report(tmp_path: Path, capsys):
             "--select-thr-on",
             str(val_gt_p),
             str(val_pred_p),
+            "--split-map", str(split_path),
+            "--groups", str(split_path),
             "--n-bootstrap",
             "25",
             "--seed",
@@ -466,3 +483,15 @@ def test_cli_evaluate_and_report(tmp_path: Path, capsys):
 
     empty_md = build_results_markdown([])
     assert "No experiment" in empty_md
+
+
+def test_unknown_inventory_and_required_groups():
+    gt = _make_coco(images=[{'id': 1}], annotations=[])
+    pred = [{'image_id': 1, 'bbox': [0, 0, 1, 1], 'score': 1, 'category_id': 3}]
+    count = compute_counting_metrics(gt, pred, score_thr=0)
+    assert count['exact_inventory_rate'] == 0
+    assert count['total_count_exact_rate'] == 0
+    with pytest.raises(ValueError, match='Missing group'):
+        evaluate_predictions(gt, pred, score_thr=0)
+    result = evaluate_predictions(gt, pred, score_thr=0, allow_image_groups=True, n_bootstrap=1)
+    assert result['bootstrap_ci95']['grouping'] == 'ungrouped'

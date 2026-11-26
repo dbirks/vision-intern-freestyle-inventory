@@ -13,6 +13,7 @@ from PIL import Image
 
 from freestyle.identify.classify import (
     KNNClassifier,
+    _compute_classification_metrics,
     LinearProbe,
     PrototypeClassifier,
     leave_one_group_out_eval,
@@ -137,11 +138,12 @@ def _resolve_groups_and_splits(
                         split = str(split_images[cand])
                         break
 
-        if grp is None:
-            if npz_groups is not None:
-                grp = str(npz_groups[idx])
-            else:
-                grp = fname or img_id
+        if split_images is not None:
+            image_split = split_images.get(fname, split_images.get(img_id))
+            if image_split is None or split is None or image_split != split:
+                raise ValueError(f"Missing or inconsistent split/group for {fname}")
+        if not grp or split not in ("train", "val", "test", "exclude"):
+            raise ValueError(f"Missing split/group provenance for {fname}")
         resolved_groups.append(grp)
         resolved_splits.append(split)
 
@@ -205,6 +207,7 @@ def run_embed(args: argparse.Namespace) -> dict[str, Any]:
             bboxes.append([x, y, w, h])
             used_quad.append(is_quad)
 
+    groups, splits = _resolve_groups_and_splits(file_names, image_ids, _load_json(args.split_map))
     embedder = Embedder(
         args.model,
         device=args.device,
@@ -221,6 +224,8 @@ def run_embed(args: argparse.Namespace) -> dict[str, Any]:
         labels=np.asarray(labels, dtype=str),
         category_ids=np.asarray(category_ids, dtype=np.int64),
         image_ids=np.asarray(image_ids, dtype=str),
+        groups=np.asarray(groups, dtype=str),
+        splits=np.asarray(splits, dtype=str),
         file_names=np.asarray(file_names, dtype=str),
         annotation_ids=np.asarray(annotation_ids, dtype=str),
         bboxes=np.asarray(bboxes, dtype=np.float32) if bboxes else np.empty((0, 4), dtype=np.float32),
@@ -264,7 +269,9 @@ def run_eval(args: argparse.Namespace) -> dict[str, Any]:
         npz_groups = data["groups"].tolist() if "groups" in data else None
         model_name = str(data["model"][0]) if "model" in data and len(data["model"]) else None
 
-    groups_data = _load_json(args.groups) if args.groups else None
+    groups_data = _load_json(args.split_map)
+    if not isinstance(groups_data.get("images"), Mapping) or not isinstance(groups_data.get("groups"), Mapping):
+        raise ValueError("split map must contain images and groups")
     groups_list, splits_list = _resolve_groups_and_splits(
         file_names=file_names,
         image_ids=image_ids,
@@ -272,29 +279,30 @@ def run_eval(args: argparse.Namespace) -> dict[str, Any]:
         npz_groups=npz_groups,
     )
 
-    keep_mask = np.ones((n,), dtype=bool)
-    if args.split:
-        allowed_splits = {s.strip() for s in args.split.split(",") if s.strip()}
-        keep_mask &= np.asarray([sp in allowed_splits for sp in splits_list], dtype=bool)
-
-    gt_unknown_mask = np.asarray(
-        [lbl in EXCLUDED_GT_LABELS for lbl in labels.tolist()], dtype=bool
-    )
-    n_excluded_unknown = int(np.sum(keep_mask & gt_unknown_mask))
-    eval_mask = keep_mask & ~gt_unknown_mask
-
-    X_eval = embeddings[eval_mask]
-    y_eval = labels[eval_mask]
-    groups_eval = np.asarray(groups_list, dtype=str)[eval_mask]
-
+    splits = np.asarray(splits_list)
+    group_array = np.asarray(groups_list, dtype=str)
+    valid = ~np.isin(labels, list(EXCLUDED_GT_LABELS))
+    n_excluded_unknown = int(np.sum(~valid))
     clf_factory = _make_clf_factory(args.clf, k=args.k)
-    logo = leave_one_group_out_eval(
-        X_eval,
-        y_eval,
-        groups_eval,
-        clf_factory,
-        unknown_thr=args.unknown_thr,
-    )
+    if args.mode == "logo":
+        allowed = ["train", "val"] if args.include_val else ["train"]
+        mask = np.isin(splits, allowed) & valid
+        logo = leave_one_group_out_eval(embeddings[mask], labels[mask], group_array[mask],
+                                       clf_factory, unknown_thr=args.unknown_thr)
+    else:
+        if args.split not in ("val", "test"):
+            raise ValueError("holdout requires --split val or test")
+        train = (splits == "train") & valid
+        query = (splits == args.split) & valid
+        if not train.any() or not query.any():
+            raise ValueError("holdout requires nonempty train and query sets")
+        if not set(group_array[train]).isdisjoint(set(group_array[query])):
+            raise ValueError("Gallery and query groups overlap")
+        clf = clf_factory().fit(embeddings[train], labels[train])
+        pred, scores = clf.predict_with_scores(embeddings[query], unknown_thr=args.unknown_thr)
+        logo = _compute_classification_metrics(labels[query], pred, unknown_label="unknown")
+        logo.update(n_groups=len(set(group_array[query])), y_true=labels[query].tolist(),
+                    y_pred=pred.tolist(), scores=scores.tolist(), per_group_accuracy={})
 
     result: dict[str, Any] = {
         "npz": str(args.npz),
@@ -343,6 +351,7 @@ def build_parser() -> argparse.ArgumentParser:
     sub = parser.add_subparsers(dest="command", required=True)
 
     p_embed = sub.add_parser("embed", help="Crop COCO annotations and extract embeddings to .npz.")
+    p_embed.add_argument("--split-map", required=True)
     p_embed.add_argument("--coco", required=True, help="Input COCO JSON file.")
     p_embed.add_argument("--images-root", required=True, help="Root directory for image files.")
     p_embed.add_argument("--out", required=True, help="Output .npz archive path.")
@@ -356,7 +365,9 @@ def build_parser() -> argparse.ArgumentParser:
 
     p_eval = sub.add_parser("eval", help="Run Leave-One-Group-Out evaluation on crop embeddings.")
     p_eval.add_argument("--npz", required=True, help="Input .npz archive from embed subcommand.")
-    p_eval.add_argument("--groups", default=None, help="Optional data/splits.json or image->group JSON.")
+    p_eval.add_argument("--split-map", required=True)
+    p_eval.add_argument("--mode", choices=("logo", "holdout"), default="logo")
+    p_eval.add_argument("--include-val", action="store_true")
     p_eval.add_argument(
         "--clf",
         choices=("proto", "knn", "linear"),
@@ -371,7 +382,7 @@ def build_parser() -> argparse.ArgumentParser:
         default=None,
         help="Optional target coverage in (0, 1] to calibrate unknown threshold on OOF scores.",
     )
-    p_eval.add_argument("--split", default=None, help="Optional comma-separated split filter (e.g. train,val).")
+    p_eval.add_argument("--split", choices=("val", "test"), default=None)
     p_eval.add_argument("--out", default=None, help="Optional output JSON metrics file.")
 
     return parser
