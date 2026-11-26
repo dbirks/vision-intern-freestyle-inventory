@@ -1,0 +1,16 @@
+# Run: python -m freestyle.train.train_detector --config CONFIG --out RUN_DIR
+experiment: detector-example # Name recorded in metadata.
+backend: rfdetr # rfdetr or yolo; YOLO requires a YOLO-format data.yaml.
+model: RFDETRSmall # RFDETRNano, RFDETRSmall, RFDETRMedium, RFDETRLarge, RFDETRBase; or YOLO weights.
+dataset_dir: /mnt/dataset # RF-DETR exported COCO directory, or YOLO data.yaml.
+resolution: 512 # Model input resolution; RF-DETR has model-specific divisibility constraints.
+epochs: 100 # Maximum epochs.
+batch_size: 4 # Per-device training batch size.
+grad_accum_steps: 1 # RF-DETR gradient accumulation; YOLO requires 1.
+lr: 0.0001 # Learning rate (YOLO uses lr0).
+multi_scale: false # RF-DETR multi-scale resizing.
+aug_config: null # RF-DETR augmentation config; null uses package defaults.
+early_stopping: true # Stop on stalled validation.
+early_stopping_patience: 10 # Epochs without improvement; YOLO uses 0 when disabled.
+seed: 42 # Random seed.
+yolo_augment: {} # Optional Ultralytics augmentation keyword arguments.
