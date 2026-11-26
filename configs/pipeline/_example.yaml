@@ -1,0 +1,24 @@
+# Paths are relative to the working directory. The COCO manifest supplies numeric image IDs.
+images_root: .
+manifest: path/to/coco.json
+split_map: path/to/splits.json  # needed only for --images train|val|test|exclude
+# Map every output class, including unknown, to its COCO category ID.
+categories:
+  unknown: 1
+  cartridge: 2
+localizer:
+  type: proposals  # proposals | tiled_detector | vlm
+  path: path/to/predictions.json  # COCO results for proposals
+  # tiled_detector instead: checkpoint, backend, tile, overlap, score_thr,
+  # merge, containment_threshold, iou (see TiledDetector constructor).
+  # vlm: keyword arguments accepted by freestyle.vlm_ground.Localizer.
+identifier:
+  type: none  # none | embedding_knn | vlm_crop
+  # embedding_knn: gallery: path/to/gallery.npz (arrays embeddings and labels)
+  # model: facebook/dinov2-base; k: 5; plus Embedder constructor options.
+  # vlm_crop: keyword arguments accepted by freestyle.vlm_ground.CropIdentifier.
+counting:
+  score_thr: 0.3
+  identity_thr: 0.5
+  neighbour_vote: "off"  # off | report | apply (quote "off" for YAML 1.1 parsers)
+  max_rows: 4
