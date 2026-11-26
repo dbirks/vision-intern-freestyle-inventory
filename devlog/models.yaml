@@ -1,0 +1,388 @@
+models:
+  - id: qwen3-8-flash-next
+    name: Qwen 3.8 Flash Next
+    family: VLM (MoE)
+    params: unknown — local deployment
+    release_date: 2026-08-26
+    org: Qwen / Alibaba Cloud (local Collective)
+    licence: Check local checkpoint (Qwen / Apache-2.0 lineage)
+    input_res: Dynamic high-res (we pass native PNG, max_side=None)
+    role: Primary VLM labeller, crop judge, and scene auditor on the LLM Collective
+    status: active
+    why: High-throughput multimodal model with native 0-1000 spatial grounding, 256K+ context, and fast prefix reuse on our RTX PRO 6000 Pennyroyal/SGLang stack.
+    caveats: Served locally from the RadixArk checkpoint (~137 GB weights, 48 GB NVMe-PLE, 4 concurrent Mamba-capped slots); `pennyroyal-flashnext/SKILL.md` does not state parameter count (public specs report ~125B total / ~6B active MoE). Still prone to truncation on dense frames without explicit max_tokens and tiling.
+    links:
+      repo: https://github.com/jpezzulli/sglang-rtxpro6000
+      hf: https://huggingface.co/Qwen
+
+  - id: inkling-2-mini
+    name: Inkling 2 Mini
+    family: VLM (Looped MoE)
+    params: 26.4B total / 3.4B active
+    release_date: 2026-11-20
+    org: Thinking Machines Lab (local Collective)
+    licence: Apache-2.0
+    input_res: Dynamic vision (we pass native PNG, max_side=None)
+    role: Primary VLM labeller (tiled & full-frame) and crop identifier on the LLM Collective
+    status: active
+    why: Tiny 3.4B active footprint on the RTX 5090 eGPU via the Basalt C++ engine (2 x 286K context slots, ~150-330 tok/s) with fast vision + reasoning and bundled DSpark speculative decoding.
+    caveats: Tool-call / JSON formatting can still trip at temp=1.0 (~80% valid), so bootstrap runs at temperature=0 with retries and response caching. Needs separate judge family when acting as primary labeller.
+    links:
+      repo: https://github.com/jesdga95/basalt
+      hf: https://huggingface.co/thinkingmachines
+
+  - id: rf-detr-nano
+    name: RF-DETR Nano
+    family: Real-time DETR
+    params: ~30.5M
+    release_date: 2025-07
+    org: Roboflow
+    licence: Apache-2.0
+    input_res: 384x384 (configurable multiple of 56/32)
+    role: Lightweight edge/latency baseline for class-agnostic cartridge localization
+    status: comparison
+    why: Fastest RF-DETR variant with DINOv2 weight-sharing NAS backbone; good lower-bound latency reference.
+    caveats: 384x384 default resolution is too coarse for full 2048x1536 cabinet frames unless paired with shelf tiling.
+    links:
+      paper: https://arxiv.org/abs/2511.09554
+      repo: https://github.com/roboflow/rf-detr
+      hf: https://huggingface.co/Roboflow
+
+  - id: rf-detr-small
+    name: RF-DETR Small
+    family: Real-time DETR
+    params: ~28.5M-30M
+    release_date: 2025-07
+    org: Roboflow
+    licence: Apache-2.0
+    input_res: 512x512 (default; tiled 1024->512 in Freestyle)
+    role: Workhorse trained detector in Families C, D, E, and F (class-agnostic & 18-class)
+    status: active
+    why: Strong accuracy-per-millisecond balance (53.0 COCO AP / 60.2 RF100-VL AP) with 300 decoder queries (ample for 30-40 cartridges per frame) and clean Apache-2.0 weights.
+    caveats: Upstream workflows/train_rfdetr.py locks resolution to processor defaults and strips zero-box negatives, so we train via the rfdetr package directly on exported shelf tiles.
+    links:
+      paper: https://arxiv.org/abs/2511.09554
+      repo: https://github.com/roboflow/rf-detr
+      hf: https://huggingface.co/Roboflow
+
+  - id: rf-detr-medium
+    name: RF-DETR Medium
+    family: Real-time DETR
+    params: ~33M-35M
+    release_date: 2025-07
+    org: Roboflow
+    licence: Apache-2.0
+    input_res: 576x576
+    role: Higher-resolution tiled detector comparison in Family C2
+    status: planned
+    why: Steps up to 576x576 input (54.7 COCO AP, 61.2 RF100-VL AP) for tighter boundaries on slanted bottom-shelf cartridges.
+    caveats: Batch size drops (4 -> 2) under 12 GB HAMi VRAM constraints when trained on tiles.
+    links:
+      paper: https://arxiv.org/abs/2511.09554
+      repo: https://github.com/roboflow/rf-detr
+      hf: https://huggingface.co/Roboflow
+
+  - id: rf-detr-large
+    name: RF-DETR Large
+    family: Real-time DETR
+    params: ~35M+ (Large NAS tier)
+    release_date: 2025-03
+    org: Roboflow
+    licence: Apache-2.0
+    input_res: 704x704
+    role: Vision Intern default detector baseline (Roboflow/rf-detr-large)
+    status: comparison
+    why: Highest accuracy Apache-2.0 RF-DETR tier (56.5 COCO AP, 62.2 RF100-VL AP); note XL/2XL move to Roboflow Platform Model License.
+    caveats: Still squeezes a 2048x1536 full frame to 704x704 if run un-tiled, hiding small Part 1/2 spine text.
+    links:
+      paper: https://arxiv.org/abs/2511.09554
+      repo: https://github.com/roboflow/rf-detr
+      hf: https://huggingface.co/Roboflow/rf-detr-large
+
+  - id: d-fine
+    name: D-FINE (L / DEIM-X)
+    family: Real-time DETR
+    params: 31M (L) / 62M (X)
+    release_date: 2024-10-18
+    org: USTC (Peterande/D-FINE)
+    licence: Apache-2.0 (COCO weights; Obj365 weights restricted)
+    input_res: 640x640
+    role: Supervised DETR comparison against RF-DETR in Family C
+    status: comparison
+    why: Fine-grained Distribution Refinement (FDR) delivers sharp box regression (54.0-55.8 COCO AP) and fast convergence with DEIM dense one-to-one matching.
+    caveats: Requires its own pinned repo environment; Objects365-pretrained checkpoints carry non-commercial dataset restrictions.
+    links:
+      paper: https://arxiv.org/abs/2410.13842
+      repo: https://github.com/Peterande/D-FINE
+      hf: https://huggingface.co/ustc-community/dfine-large-coco
+
+  - id: yolo11
+    name: YOLO11 (Small)
+    family: CNN One-Stage Detector
+    params: 9.4M (11s; 2.6M-56.9M across n-x)
+    release_date: 2024-09-27
+    org: Ultralytics
+    licence: AGPL-3.0 / Ultralytics Enterprise
+    input_res: 640x640
+    role: Classic CNN detector comparison in Family D (end-to-end 18-class)
+    status: comparison
+    why: Mature, fast CNN baseline (44.4 COCO AP for 11s) with low memory footprint and quick training convergence on small datasets.
+    caveats: AGPL-3.0 licence requires care for commercial deployment; NMS thresholds can suppress overlapping slanted fisheye cartridges.
+    links:
+      repo: https://github.com/ultralytics/ultralytics
+      hf: https://huggingface.co/Ultralytics/YOLO11
+
+  - id: yolo26
+    name: YOLO26 (Small)
+    family: NMS-free CNN Detector
+    params: ~9.5M-10M (26s class; n-x family)
+    release_date: 2026-01-14
+    org: Ultralytics
+    licence: AGPL-3.0 / Ultralytics Enterprise
+    input_res: 640x640
+    role: Modern NMS-free CNN detector comparison in Family D
+    status: planned
+    why: Removes DFL and runs native NMS-free end-to-end inference (47.7 COCO AP, 2.6 ms in Roboflow's benchmark), which avoids NMS dropping touching cartridge neighbors.
+    caveats: AGPL-3.0 licence; score calibration and small-text retention at 640x640 still require tiled validation.
+    links:
+      paper: https://arxiv.org/abs/2509.25164
+      repo: https://github.com/ultralytics/ultralytics
+      hf: https://huggingface.co/Ultralytics/YOLO26
+
+  - id: owlv2-base
+    name: OWLv2 Base
+    family: Open-Vocab Detector
+    params: ~150M-200M (ViT-B/16)
+    release_date: 2023-06-16
+    org: Google DeepMind
+    licence: Apache-2.0
+    input_res: 960x960 (ensemble processor) / 768x768
+    role: Zero-shot text & visual-exemplar proposal backend (B1)
+    status: active
+    why: Supports both text prompts ("cartridge box") and image-guided one-shot exemplars without fine-tuning, with Apache-2.0 weights in transformers.
+    caveats: Square padding/resizing at 960px blurs small faces unless fed overlapping shelf tiles; visual exemplars match generic box shape rather than Part 1 vs Part 2.
+    links:
+      paper: https://arxiv.org/abs/2306.09683
+      repo: https://github.com/google-research/scenic/tree/main/scenic/projects/owl_vit
+      hf: https://huggingface.co/google/owlv2-base-patch16-ensemble
+
+  - id: owlv2-large
+    name: OWLv2 Large
+    family: Open-Vocab Detector
+    params: ~400M (ViT-L/14)
+    release_date: 2023-06-16
+    org: Google DeepMind
+    licence: Apache-2.0
+    input_res: 1008x1008 / 960x960
+    role: Higher-capacity open-vocab proposal option in freestyle/propose
+    status: planned
+    why: Finer patch-14 grid and larger ViT-L backbone improve recall on crowded shelf objects (44.6 rare LVIS AP in paper).
+    caveats: Noticeably slower and heavier VRAM than Base when run over multiple overlapping tiles.
+    links:
+      paper: https://arxiv.org/abs/2306.09683
+      repo: https://github.com/google-research/scenic/tree/main/scenic/projects/owl_vit
+      hf: https://huggingface.co/google/owlv2-large-patch14-ensemble
+
+  - id: grounding-dino-base
+    name: Grounding DINO Base
+    family: Open-Vocab Detector
+    params: ~233M (Swin-B + BERT-base)
+    release_date: 2023-03-09
+    org: IDEA Research
+    licence: Apache-2.0
+    input_res: Dynamic (typically 800 min / 1333 max side)
+    role: Open-vocab text-prompted proposal backend (B3)
+    status: active
+    why: Strong phrase-to-box grounding with aspect-ratio-preserving preprocessing directly supported in Hugging Face transformers.
+    caveats: Text prompts alone struggle to distinguish 18 fine-grained SKU names, so we pair it with class-agnostic prompts + kNN crop identification.
+    links:
+      paper: https://arxiv.org/abs/2303.05499
+      repo: https://github.com/IDEA-Research/GroundingDINO
+      hf: https://huggingface.co/IDEA-Research/grounding-dino-base
+
+  - id: mm-grounding-dino
+    name: MM-Grounding-DINO
+    family: Open-Vocab Detector
+    params: ~172M (Tiny) / ~233M (Base)
+    release_date: 2024-01-04
+    org: OpenMMLab
+    licence: Apache-2.0
+    input_res: Dynamic (800x1333)
+    role: Vision Intern built-in grounded_detect tool baseline
+    status: comparison
+    why: Improved open-source reproduction and pretraining mix (Objects365 + GoldG + V3Det, 52.5 zero-shot COCO AP for Base) already wired in tools/grounded_detect.py.
+    caveats: Upstream tool runs in float32 and does not expose num_select (query cap) or tiling natively; MMDetection/MMCV compiled deps add container friction.
+    links:
+      paper: https://arxiv.org/abs/2401.02361
+      repo: https://github.com/open-mmlab/mmdetection/tree/main/configs/mm_grounding_dino
+      hf: https://huggingface.co/openmmlab-community/mm_grounding_dino_base_all
+
+  - id: florence-2-base
+    name: Florence-2 Base
+    family: Unified Vision-Language
+    params: 0.23B (232M)
+    release_date: 2023-11 (HF weights 2024-06)
+    org: Microsoft
+    licence: MIT
+    input_res: 768x768
+    role: Lightweight promptable detection + OCR comparison backend
+    status: comparison
+    why: Tiny 232M multitask VLM with MIT weights capable of <OD>, phrase grounding, and <OCR_WITH_REGION> in a single forward pass.
+    caveats: Microsoft's original remote modeling code breaks on transformers 5.x, requiring florence-community/Florence-2-base native checkpoints; prone to sequence truncation in dense shelves.
+    links:
+      paper: https://arxiv.org/abs/2311.06242
+      repo: https://github.com/huggingface/transformers
+      hf: https://huggingface.co/florence-community/Florence-2-base
+
+  - id: florence-2-large
+    name: Florence-2 Large
+    family: Unified Vision-Language
+    params: 0.77B (771M)
+    release_date: 2023-11 (HF weights 2024-06)
+    org: Microsoft
+    licence: MIT
+    input_res: 768x768
+    role: Promptable proposal & region-OCR backend in freestyle/propose
+    status: planned
+    why: 3.3x capacity over Base with stronger dense object detection and small-text reading while staying under 1B params and MIT-licensed.
+    caveats: Same transformers 5.x port requirement (florence-community/Florence-2-large); 768x768 resize requires tiled inputs for 2048px cabinet frames.
+    links:
+      paper: https://arxiv.org/abs/2311.06242
+      repo: https://github.com/huggingface/transformers
+      hf: https://huggingface.co/florence-community/Florence-2-large
+
+  - id: sam-3
+    name: SAM 3
+    family: Promptable Concept Segmentation
+    params: 848M
+    release_date: 2025-11-19
+    org: Meta AI
+    licence: SAM License (gated weights)
+    input_res: 1008x1008
+    role: Concept & exemplar segmentation proposal backend (B2) and future quad/mask extraction
+    status: active
+    why: Segment Anything with Concepts prompts all matching instances from a short phrase ("cartridge box") or visual exemplar, yielding tight masks on slanted fisheye faces.
+    caveats: Gated weights requiring HF_TOKEN and Meta's custom SAM License; touching adjacent cartridges can merge into a single mask if prompts are too broad.
+    links:
+      paper: https://arxiv.org/abs/2511.16719
+      repo: https://github.com/facebookresearch/sam3
+      hf: https://huggingface.co/facebook/sam3
+
+  - id: dinov2-base
+    name: DINOv2 Base
+    family: Self-Supervised ViT Encoder
+    params: 86M (ViT-B/14)
+    release_date: 2023-04-14 (Apache-2.0 Aug 2023)
+    org: Meta AI
+    licence: Apache-2.0
+    input_res: 224x224 (or 518x518, multiples of 14)
+    role: Default frozen crop embedding backbone for kNN/prototype ID (B1, B3, C1, E1)
+    status: active
+    why: Clean, fast, ungated Apache-2.0 visual features that separate box layout, colour blocking, and fine graphics reliably with just 1-5 gallery examples per class.
+    caveats: Self-supervised without text alignment, so visually identical Part 1 vs Part 2 packages can still cluster together when spine text is blurred.
+    links:
+      paper: https://arxiv.org/abs/2304.07193
+      repo: https://github.com/facebookresearch/dinov2
+      hf: https://huggingface.co/facebook/dinov2-base
+
+  - id: dinov2-large
+    name: DINOv2 Large
+    family: Self-Supervised ViT Encoder
+    params: 304M (ViT-L/14)
+    release_date: 2023-04-14 (Apache-2.0 Aug 2023)
+    org: Meta AI
+    licence: Apache-2.0
+    input_res: 224x224 (or 518x518, multiples of 14)
+    role: Higher-capacity frozen crop embedding comparison
+    status: comparison
+    why: Richer 1024-d representation than Base for subtle graphic differences across similar Coca-Cola/Sprite/Fanta SKUs.
+    caveats: ~3.5x slower embedding throughput per crop with minimal help if blur has already destroyed the distinguishing print.
+    links:
+      paper: https://arxiv.org/abs/2304.07193
+      repo: https://github.com/facebookresearch/dinov2
+      hf: https://huggingface.co/facebook/dinov2-large
+
+  - id: dinov3-vitb
+    name: DINOv3 ViT-B
+    family: Self-Supervised ViT Encoder
+    params: ~86M (ViT-B/16)
+    release_date: 2025-08-13
+    org: Meta AI
+    licence: DINOv3 License (gated)
+    input_res: 224x224 (flexible, patch 16)
+    role: Next-gen self-supervised crop encoder upgrade over DINOv2 Base
+    status: planned
+    why: Distilled from a 7B teacher trained on 1.7B images (LVD-1689M), giving sharper dense local features than DINOv2 at the same 86M cost.
+    caveats: Gated under the custom DINOv3 License (requires HF token + Meta approval, unlike Apache-2.0 DINOv2).
+    links:
+      paper: https://arxiv.org/abs/2508.10104
+      repo: https://github.com/facebookresearch/dinov3
+      hf: https://huggingface.co/facebook/dinov3-vitb16-pretrain-lvd1689m
+
+  - id: dinov3-vitl
+    name: DINOv3 ViT-L
+    family: Self-Supervised ViT Encoder
+    params: ~300M+ (ViT-L/16)
+    release_date: 2025-08-13
+    org: Meta AI
+    licence: DINOv3 License (gated)
+    input_res: 224x224 (flexible, patch 16)
+    role: High-capacity next-gen crop encoder comparison
+    status: comparison
+    why: Strongest frozen mid-size ViT features in the DINOv3 family for fine-grained product retrieval.
+    caveats: Gated custom licence and higher VRAM/compute than ViT-B for small marginal gains on 40-object frames.
+    links:
+      paper: https://arxiv.org/abs/2508.10104
+      repo: https://github.com/facebookresearch/dinov3
+      hf: https://huggingface.co/facebook/dinov3-vitl16-pretrain-lvd1689m
+
+  - id: siglip2-base
+    name: SigLIP 2 Base
+    family: Vision-Language Encoder
+    params: ~86M (vision) / ~200M+ total
+    release_date: 2025-02-20
+    org: Google
+    licence: Apache-2.0
+    input_res: 224x224 or 512x512 (patch16) / NaFlex
+    role: Text-aware crop embedding encoder for kNN & zero-shot class matching (B2, C2)
+    status: active
+    why: Combines captioning/OCR-aware pretraining with sigmoid contrastive loss, making its crop embeddings much more sensitive to printed text ("Part 1", "NNS", "AA") than pure SSL ViTs.
+    caveats: Fixed 224/512 square inputs distort tall/narrow cartridge crops unless letterboxed or switched to NaFlex variants.
+    links:
+      paper: https://arxiv.org/abs/2502.14786
+      repo: https://github.com/google-research/big_vision
+      hf: https://huggingface.co/google/siglip2-base-patch16-512
+
+  - id: siglip2-so400m
+    name: SigLIP 2 SO400M
+    family: Vision-Language Encoder
+    params: ~400M (vision) / ~1.1B total
+    release_date: 2025-02-20
+    org: Google
+    licence: Apache-2.0
+    input_res: 384x384 (patch14) or 512x512 (patch16) / NaFlex
+    role: High-accuracy text-aware crop embedding comparison
+    status: planned
+    why: Shape-optimized 400M vision backbone excels at fine text and subtle brand cues in product retrieval while keeping Apache-2.0 licensing.
+    caveats: ~4.5x larger than Base; watch crop batch memory on the 12 GB HAMi slice.
+    links:
+      paper: https://arxiv.org/abs/2502.14786
+      repo: https://github.com/google-research/big_vision
+      hf: https://huggingface.co/google/siglip2-so400m-patch16-512
+
+  - id: pp-ocrv5
+    name: PaddleOCR PP-OCRv5
+    family: OCR Pipeline
+    params: ~5M (mobile) / server tier larger
+    release_date: 2025-05 (report 2025-07)
+    org: Baidu / PaddlePaddle
+    licence: Apache-2.0
+    input_res: Dynamic det (max side 960-1280) / rec height 48 px
+    role: Optional spine-text tie-breaker for Part 1/2 and AA/BB/CC disambiguation
+    status: planned
+    why: Lightweight, Apache-2.0 production OCR specifically tuned for rotated, curved, and low-contrast printed packaging text (0.8679 printed-English accuracy on PP-OCRv5_server_rec).
+    caveats: Requires compatible PaddlePaddle 3.x GPU wheels (PyPI paddlepaddle-gpu 2.6.2 lags paddleocr 3.7.0); cannot recover characters already erased by severe motion blur.
+    links:
+      paper: https://arxiv.org/abs/2507.05595
+      repo: https://github.com/PaddlePaddle/PaddleOCR
+      hf: https://huggingface.co/PaddlePaddle/PP-OCRv5_server_rec

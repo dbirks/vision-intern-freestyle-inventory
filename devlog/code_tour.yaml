@@ -1,0 +1,101 @@
+title: Freestyle Vision Code Tour
+subtitle: Key Python functions extracted directly from the repository at build time via AST.
+stops:
+  - id: make-tiles
+    title: Overlapping Shelf Tiling
+    file: freestyle/geometry.py
+    symbol: make_tiles
+    explanation: >
+      Slices 1600x1200 or 2048x1536 cabinet frames into overlapping square tiles without padding,
+      shifting edge tiles inward so every tile keeps full spatial resolution. This prevents VLM
+      and detector preprocessors from downscaling small ~60px cartridge faces into unreadable blobs.
+
+  - id: merge-tiled
+    title: Cross-Tile Detection Merge
+    file: freestyle/geometry.py
+    symbol: merge_tiled
+    explanation: >
+      Reconciles detections projected back from overlapping tiles into original image coordinates.
+      Supports optional containment-based fragment suppression, class-aware NMS or weighted box
+      fusion, and a class-agnostic pass that records alternative class votes on overlapping boxes.
+
+  - id: label-dataset
+    title: Vision Intern VLM Labeller
+    file: workflows/vlm_label.py
+    symbol: label_dataset
+    explanation: >
+      Upstream Vision Intern's pseudo-labelling entry point, extended with dense-scene controls
+      (native PNG, tiling, token budgets, multi-sample self-consistency, and label aliases).
+      Produces COCO JSON in local mode while preserving source-relative paths and truncation flags.
+
+  - id: judge-labels
+    title: Vision Intern VLM-as-Judge
+    file: workflows/vlm_judge.py
+    symbol: judge_labels
+    explanation: >
+      Verifies proposed boxes using a second model family via numbered full-frame overlays or
+      batched 16-up crop sheets, recording per-box verdicts and scores without silently dropping
+      unreached detections (marked as unjudged).
+
+  - id: bootstrap-labels
+    title: Resumable Proposal Bootstrap
+    file: freestyle/bootstrap_labels.py
+    symbol: bootstrap
+    explanation: >
+      Orchestrates multi-model proposal generation for human review: runs class-agnostic VLM
+      detection across full-frame and tiled passes, fuses runs with WBF, verifies boxes with a
+      different judge family, identifies crops at full resolution, and caches every call atomically.
+
+  - id: knn-classifier
+    title: Cosine kNN Crop Identifier
+    file: freestyle/identify/classify.py
+    symbol: KNNClassifier
+    explanation: >
+      Classifies L2-normalized crop embeddings from DINOv2, DINOv3, or SigLIP 2 against a
+      train-only gallery using cosine similarity. Confidence combines similarity magnitude with
+      top-k consensus so ambiguous or blurry crops fall back to unknown below threshold.
+
+  - id: eval-localization
+    title: Localization AP & Operating Point
+    file: freestyle/eval/metrics.py
+    symbol: compute_localization_metrics
+    explanation: >
+      Computes class-agnostic localization AP50, AP50:95, and operating-point precision/recall/F1
+      across original-pixel COCO ground truth and predictions, finding the best-F1 score threshold
+      on validation splits before freezing evaluation on test.
+
+  - id: eval-counting
+    title: Inventory & Per-Class Counting Metrics
+    file: freestyle/eval/metrics.py
+    symbol: compute_counting_metrics
+    explanation: >
+      Scores what actually matters to the business: per-image total count MAE, per-class count MAE
+      across all 18 active catalog SKUs plus unknown, and exact-inventory match rate where every
+      single SKU count in the cabinet must match ground truth simultaneously.
+
+  - id: pipeline-run
+    title: Composable Inference Pipeline
+    file: freestyle/pipeline.py
+    symbol: Pipeline.run
+    explanation: >
+      Executes the three-stage inference flow on a single image: class-agnostic or multiclass
+      localization, optional crop embedding or VLM identification with gallery-leakage checks,
+      and shelf-row assignment plus gap/overlap/neighbour-vote counting flags.
+
+  - id: export-tiles
+    title: Masked Tile Dataset Export
+    file: freestyle/train/export_tiles.py
+    symbol: export_tiles
+    explanation: >
+      Cuts split-safe COCO annotations into training tiles and masks out cut-off edge cartridges
+      whose visible area falls below min_visible by filling them with local tile mean colour,
+      stopping the detector from learning to treat truncated boundary fragments as background.
+
+  - id: experiment-launch
+    title: Reproducible Experiment Launcher
+    file: freestyle/experiments/launch.py
+    symbol: main
+    explanation: >
+      Resolves YAML experiment configs, stamps git SHA and dirty-diff hashes onto run directories,
+      submits GPU jobs to the home Kubernetes cluster (or runs local VLM experiments), collects
+      /out artifacts back to runs/, and triggers evaluation plus RESULTS.md regeneration.
