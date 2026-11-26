@@ -1,0 +1,72 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Freestyle review</title>
+<link rel="stylesheet" href="/static/app.css">
+</head>
+<body>
+<div id="app">
+  <aside id="left">
+    <div class="panel-head">
+      <h1>Review</h1>
+      <a id="audit-link" href="?mode=grid" class="btn small">audit</a>
+    </div>
+    <div class="left-meta" id="left-meta">…</div>
+    <nav id="image-list" aria-label="images"></nav>
+    <div id="left-foot" class="panel-foot"></div>
+  </aside>
+
+  <main id="center">
+    <div id="toolbar">
+      <span id="cur-title">—</span>
+      <span class="spacer"></span>
+      <button id="btn-verify" class="btn" title="v — mark verified">verified</button>
+      <button id="btn-new" class="btn small" title="n — new box">+ new</button>
+    </div>
+    <div id="canvas-wrap" tabindex="0" aria-label="annotation canvas">
+      <img id="img" alt="full-resolution source image" draggable="false">
+      <svg id="overlay" xmlns="http://www.w3.org/2000/svg"></svg>
+      <div id="grid-view" class="hidden"></div>
+      <div id="draw-hint" class="hidden">drag to draw a new box · Esc to cancel</div>
+    </div>
+    <div id="bottom-bar"><span class="bb-label">counts</span><div id="counts"></div></div>
+  </main>
+
+  <aside id="right">
+    <div class="panel-head"><h2>Box</h2></div>
+    <div id="no-selection" class="muted">Click a box to inspect.<br><small>n — drag to draw · Tab cycles · Delete removes</small></div>
+    <div id="inspector" class="hidden">
+      <canvas id="crop" width="360" height="240" aria-label="zoomed crop preview"></canvas>
+      <div class="field-row"><label>box</label><span id="box-size" class="mono">—</span></div>
+      <div class="field-row"><label>category</label>
+        <select id="sel-class"></select>
+      </div>
+      <div id="class-grid"></div>
+      <div class="flags" id="flags">
+        <label class="flag"><input type="checkbox" id="flag-trunc"> truncated</label>
+        <label class="flag"><input type="checkbox" id="flag-occ"> occluded</label>
+        <label class="flag"><input type="checkbox" id="flag-iv"> identity_visible</label>
+      </div>
+      <div id="image-meta">
+        <div class="field-row"><label>scene</label>
+          <select id="sel-scene">
+            <option value="">— none —</option>
+            <option value="cabinet">cabinet</option>
+            <option value="no_cabinet">no_cabinet</option>
+          </select>
+        </div>
+        <div class="field-row"><label>verified</label>
+          <label class="flag"><input type="checkbox" id="sel-verified"></label>
+        </div>
+        <div class="field-row"><label>note</label>
+          <textarea id="sel-note" rows="2" placeholder="reviewer note…"></textarea>
+        </div>
+      </div>
+    </div>
+  </aside>
+</div>
+<script src="/static/app.js"></script>
+</body>
+</html>
