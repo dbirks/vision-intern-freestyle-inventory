@@ -4,7 +4,7 @@ date: 2026-11-26T16:25:00-05:00
 tags: [bootstrap, vision-intern, findings]
 ---
 
-![bootstrap overlay on the best frame](../runs/bootstrap_v1/viz/local__downloads__frame.jpg.png)
+![bootstrap overlay on the best frame](runs/bootstrap_v1/viz/local__downloads__frame.jpg.png)
 
 The label bootstrap now runs Vision Intern end to end:
 1. `label_dataset` (dense mode, Inkling 2 Mini, full frame + 2×2 tiles)
