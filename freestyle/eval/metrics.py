@@ -124,6 +124,7 @@ def _prepare_dataset(
     gt_coco: Mapping[str, Any],
     predictions: Sequence[Mapping[str, Any]],
     groups_data: Mapping[str, Any] | None = None,
+    allow_unknown_images: bool = False,
 ) -> _PreparedDataset:
     images = gt_coco.get("images", [])
     categories = gt_coco.get("categories", [])
@@ -143,6 +144,8 @@ def _prepare_dataset(
         raw_id = img["id"]
         id_to_idx[raw_id] = idx
         str_id_to_idx.setdefault(str(raw_id), idx)
+        if img.get("file_name"):
+            str_id_to_idx.setdefault(str(img["file_name"]), idx)
         image_keys.append(_resolve_image_key(img))
 
     n_images = len(images)
@@ -176,6 +179,9 @@ def _prepare_dataset(
         pred_cats_raw[img_idx].append(cid)
         if cid != -1:
             cat_id_to_name.setdefault(cid, str(cid))
+
+    if n_ignored and not allow_unknown_images:
+        raise ValueError(f"{n_ignored} predictions reference unknown images")
 
     # Catalog classes exclude special classes ('unknown', 'cartridge') unless none remain.
     non_special = sorted(
@@ -475,13 +481,13 @@ def _per_image_identification_records(
         n_matched_unknown = 0
         for pi, gj, _ in res.matches:
             gt_cid = gt_cats[gj]
-            if gt_cid in prepared.unknown_cat_ids:
+            if gt_cid in prepared.unknown_cat_ids | prepared.cartridge_cat_ids:
                 n_matched_unknown += 1
                 continue
             y_true.append(gt_cid)
             y_pred.append(kept_cats[pi])
         n_unmatched_known = sum(
-            1 for gj in res.unmatched_gts if gt_cats[gj] not in prepared.unknown_cat_ids
+            1 for gj in res.unmatched_gts if gt_cats[gj] not in prepared.unknown_cat_ids | prepared.cartridge_cat_ids
         )
         per_img.append((y_true, y_pred, n_matched_unknown, n_unmatched_known))
     return per_img
@@ -745,10 +751,12 @@ def evaluate_predictions(
     max_dets: int | None = None,
     include_best_f1: bool = True,
     allow_image_groups: bool = False,
+    allow_unknown_images: bool = False,
 ) -> dict[str, Any]:
     """Run the full Freestyle evaluation suite (localization, id, counting, group bootstrap)."""
     groups = load_groups_map(gt_coco, groups_data, allow_image_groups=allow_image_groups)
-    prepared = _prepare_dataset(gt_coco, predictions, groups_data=groups_data)
+    prepared = _prepare_dataset(gt_coco, predictions, groups_data=groups_data,
+                                allow_unknown_images=allow_unknown_images)
     prepared.image_groups = groups
     all_indices = list(range(len(prepared.image_keys)))
 

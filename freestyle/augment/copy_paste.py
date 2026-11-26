@@ -13,7 +13,7 @@ from typing import Any
 import numpy as np
 from PIL import Image, ImageDraw, ImageFilter
 
-from freestyle.augment.photometric import compose as compose_photometric
+from freestyle.augment.photometric import DEFAULT_PIPELINE, compose as compose_photometric
 from freestyle.count.shelves import assign_shelves
 from freestyle.geometry import crop_quad
 
@@ -792,7 +792,13 @@ def run_cli(
         anns_by_img[ann["image_id"]].append(ann)
 
     gen = np.random.default_rng(seed)
-    photo_fn = compose_photometric() if apply_photometric else None
+    photo_fn = compose_photometric({k: v for k, v in DEFAULT_PIPELINE.items() if k != "fisheye_warp"}) if apply_photometric else None
+    from freestyle.eval.metrics import load_groups_map
+    split_data = _load_json(split_map_path)
+    source_images = [im for im in coco.get("images", []) if splits.get(im["file_name"]) == "train"]
+    parent_groups = load_groups_map({"images": source_images}, split_data)
+    group_by_image = {im["id"]: parent_groups[im["file_name"]] for im in source_images}
+    synth_groups = {}
 
     out_images: list[dict[str, Any]] = []
     out_annotations: list[dict[str, Any]] = []
@@ -833,13 +839,15 @@ def run_cli(
             dst_path = out / rel_name
             synth_img.save(dst_path, format="PNG")
             synth_splits[rel_name] = "train"
+            group = "synthetic:" + group_by_image[src_img["id"]]
+            synth_groups[group] = "train"
             out_images.append(
                 {
                     "id": next_img_id,
                     "file_name": rel_name,
                     "width": synth_img.width,
                     "height": synth_img.height,
-                    "attributes": {"source": "synthetic:copy_paste", "parent": src_img["file_name"]},
+                    "attributes": {"source": "synthetic:copy_paste", "parent": src_img["file_name"], "group_id": group},
                 }
             )
             frame_anns: list[dict[str, Any]] = []
@@ -861,7 +869,7 @@ def run_cli(
     }
     (out / "annotations.json").write_text(json.dumps(out_coco, indent=2))
     (out / "splits.json").write_text(
-        json.dumps({"version": 1, "groups": {}, "images": synth_splits}, indent=2)
+        json.dumps({"version": 1, "groups": synth_groups, "images": synth_splits}, indent=2)
     )
     make_contact_sheet(sheet_records, out / "contact_sheet.png")
     return out_coco

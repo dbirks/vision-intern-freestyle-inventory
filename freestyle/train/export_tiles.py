@@ -48,13 +48,16 @@ def export_tiles(coco_file, images_root, out, split_map, tile=1024, overlap=0.25
             for rect, full in samples:
                 image_id += 1
                 x0, y0, x1, y1 = rect
-                sample = img.crop(rect)
+                sample = img.crop(rect).convert("RGB")
                 if full:
                     sample = sample.resize((resolution, resolution), Image.Resampling.LANCZOS)
                 sx, sy = sample.width / (x1 - x0), sample.height / (y1 - y0)
                 name = f"{image_id:08d}.png"
                 mean = tuple(round(v) for v in ImageStat.Stat(sample.convert("RGB")).mean)
                 masked = []
+                original = sample.copy()
+                mask = Image.new("L", sample.size, 0)
+                protected = Image.new("L", sample.size, 0)
                 ds = datasets[split]
                 ds["images"].append({"id": image_id, "file_name": name,
                                      "width": sample.width, "height": sample.height})
@@ -75,17 +78,24 @@ def export_tiles(coco_file, images_root, out, split_map, tile=1024, overlap=0.25
                         import math
                         box = [(left - x0) * sx, (top - y0) * sy,
                                (right - x0) * sx, (bottom - y0) * sy]
-                        ImageDraw.Draw(sample).rectangle(
+                        ImageDraw.Draw(mask).rectangle(
                             (math.floor(box[0]), math.floor(box[1]),
-                             math.ceil(box[2]) - 1, math.ceil(box[3]) - 1), fill=mean)
+                             math.ceil(box[2]) - 1, math.ceil(box[3]) - 1), fill=255)
                         masked.append({"annotation_id": ann.get("id"), "box": box})
                         continue
                     box = [(left - x0) * sx, (top - y0) * sy, cw * sx, ch * sy]
+                    import math
+                    ImageDraw.Draw(protected).rectangle(
+                        (math.floor(box[0]), math.floor(box[1]),
+                         math.ceil(box[0] + box[2]) - 1, math.ceil(box[1] + box[3]) - 1), fill=255)
                     ann_id += 1
                     ds["annotations"].append({"id": ann_id, "image_id": image_id,
                         "category_id": 1 if class_agnostic else ann["category_id"],
                         "bbox": box, "area": box[2] * box[3],
                         "iscrowd": ann.get("iscrowd", 0)})
+                from PIL import ImageChops
+                mask = ImageChops.subtract(mask, protected)
+                sample = Image.composite(Image.new("RGB", sample.size, mean), original, mask)
                 sample.save(out / split / name, format="PNG")
     for split, dataset in datasets.items():
         (out / split / "_annotations.coco.json").write_text(json.dumps(dataset, indent=2))

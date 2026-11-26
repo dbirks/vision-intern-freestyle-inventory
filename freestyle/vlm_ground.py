@@ -139,8 +139,8 @@ def label_coco(images, out_coco, model, **kwargs):
 class Localizer(VLMGrounder):
     def predict(self, image):
         return [{'box': d['xyxy'], 'score': d['score'],
-                 'class': d['label'] if self.with_identity else None,
-                 'id_score': d['score'] if self.with_identity else 0.0}
+                 'class': (d['label'] if d['label'] in catalog.class_names() else 'unknown') if self.with_identity else None,
+                 'id_score': d['score'] if self.with_identity and d['label'] in catalog.class_names() else 0.0}
                 for d in self.detect(image)]
 
 

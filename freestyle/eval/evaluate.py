@@ -92,6 +92,7 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--split-map", help="Split provenance for threshold selection.")
     p.add_argument("--allow-train-selection", action="store_true")
     p.add_argument("--allow-image-groups", action="store_true")
+    p.add_argument("--allow-unknown-images", action="store_true")
     thr_group = p.add_mutually_exclusive_group(required=True)
     thr_group.add_argument(
         "--score-thr",
@@ -149,6 +150,8 @@ def main(argv: Sequence[str] | None = None) -> int:
                 parser.error("Every threshold selection image must belong to val (or explicitly allowed train)")
         from freestyle.eval.metrics import load_groups_map
         selection_groups = set(load_groups_map(val_gt, split_data).values())
+        if any(image.get("file_name") not in split_images for image in gt_coco.get("images", [])):
+            parser.error("Every evaluation image must be present in split map")
         test_images = [image for image in gt_coco.get("images", [])
                        if split_images.get(image.get("file_name")) == "test"]
         test_groups = set(load_groups_map({"images": test_images}, split_data).values())
@@ -172,6 +175,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         seed=args.seed,
         include_best_f1=False,
         allow_image_groups=args.allow_image_groups,
+        allow_unknown_images=args.allow_unknown_images,
     )
     metrics["experiment"] = args.experiment or _infer_experiment_name(pred_path, out_path, meta)
     metrics["score_thr_source"] = score_thr_source

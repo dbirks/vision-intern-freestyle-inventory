@@ -67,7 +67,7 @@ def _move_inputs(inputs: Any, device: Any, pixel_dtype: Any = None) -> dict[str,
     moved: dict[str, Any] = {}
     for key, val in dict(inputs).items():
         if hasattr(val, "to"):
-            if key == "pixel_values" and pixel_dtype is not None:
+            if key in ("pixel_values", "input_boxes") and pixel_dtype is not None:
                 val = val.to(device=device, dtype=pixel_dtype)
             else:
                 val = val.to(device=device)
@@ -233,16 +233,20 @@ class Owlv2Backend(ProposalBackend):
             self._record_processed_dims(inputs)
             with torch.inference_mode():
                 outputs = model.image_guided_detection(**inputs)
-            res = processor.post_process_image_guided_detection(
-                outputs=outputs,
-                threshold=self.score_thr,
-                nms_threshold=self.exemplar_nms_thr,
-                target_sizes=target_sizes,
-            )[0]
-            for box, score in zip(res["boxes"], res["scores"], strict=True):
-                clipped = _clip_xyxy(box.tolist(), image.width, image.height)
+            # Transformers uses sigmoid(max(logits)) before its display-alpha scaling.
+            scores = outputs.logits[0].max(dim=-1).values.sigmoid().float().cpu().numpy()
+            boxes = outputs.target_pred_boxes[0].float().cpu().numpy()
+            from freestyle.geometry import nms
+            xyxy = [[(cx - w / 2) * image.width, (cy - h / 2) * image.height,
+                     (cx + w / 2) * image.width, (cy + h / 2) * image.height]
+                    for cx, cy, w, h in boxes]
+            selected = [i for i in nms(xyxy, scores, self.exemplar_nms_thr)
+                        if scores[i] >= self.score_thr]
+            for i in selected:
+                clipped = _clip_xyxy(xyxy[i], image.width, image.height)
                 if clipped is not None:
-                    detections.append((clipped, float(score.item()), f"exemplar:{idx}"))
+                    detections.append((clipped, float(scores[i]), f"exemplar:{idx}"))
+            continue
 
         return detections
 
@@ -528,10 +532,9 @@ class Sam3Backend(ProposalBackend):
             self._record_processed_dims(inputs)
             with torch.inference_mode():
                 outputs = model(**inputs)
-            res = processor.post_process_instance_segmentation(
+            res = processor.post_process_object_detection(
                 outputs,
                 threshold=self.score_thr,
-                mask_threshold=self.mask_threshold,
                 target_sizes=target_sizes,
             )[0]
             for box, score in zip(res["boxes"], res["scores"], strict=True):
@@ -551,10 +554,9 @@ class Sam3Backend(ProposalBackend):
             self._record_processed_dims(inputs)
             with torch.inference_mode():
                 outputs = model(**inputs)
-            res = processor.post_process_instance_segmentation(
+            res = processor.post_process_object_detection(
                 outputs,
                 threshold=self.score_thr,
-                mask_threshold=self.mask_threshold,
                 target_sizes=target_sizes,
             )[0]
             for box, score in zip(res["boxes"], res["scores"], strict=True):

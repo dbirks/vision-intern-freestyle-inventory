@@ -327,6 +327,8 @@ def _analyze_with_context(
         raw_id = img["id"]
         id_to_idx[raw_id] = idx
         str_id_to_idx.setdefault(str(raw_id), idx)
+        if img.get("file_name"):
+            str_id_to_idx.setdefault(str(img["file_name"]), idx)
 
     gt_by_img: list[list[Mapping[str, Any]]] = [[] for _ in images]
     for ann in annotations:
@@ -340,11 +342,13 @@ def _analyze_with_context(
 
     preds_by_img: list[list[Mapping[str, Any]]] = [[] for _ in images]
     for pred in preds:
-        if float(pred["score"]) < score_thr:
-            continue
         idx = id_to_idx.get(pred["image_id"])
         if idx is None:
             idx = str_id_to_idx.get(str(pred["image_id"]))
+        if idx is None:
+            raise ValueError(f"Prediction references unknown image: {pred['image_id']}")
+        if float(pred["score"]) < score_thr:
+            continue
         if idx is not None:
             preds_by_img[idx].append(pred)
             cid = int(pred.get("category_id", -1))

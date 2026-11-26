@@ -338,6 +338,9 @@ class Embedder:
             proc_kwargs["do_resize"] = False
         if accepts_kwargs or "do_center_crop" in params:
             proc_kwargs["do_center_crop"] = False
+        if "Siglip2ImageProcessor" in type(self._processor).__name__:
+            patch = int(getattr(self._processor, "patch_size", 16))
+            proc_kwargs["max_num_patches"] = (self.input_size[0] // patch) * (self.input_size[1] // patch)
         self._proc_kwargs = proc_kwargs
 
     def preprocess(self, image: Image.Image) -> Image.Image:

@@ -42,11 +42,9 @@ class EmbeddingIdentifier:
         embeddings = self.embedder.embed([crop(image, d['box']) for d in detections])
         if not len(detections):
             return []
-        # The maximum class probability is the confidence used for rejection.
-        probs = self.classifier.predict_proba(embeddings)
-        indices = probs.argmax(axis=1)
-        return [{'class': str(self.classifier.classes_[i]), 'id_score': float(p[i])}
-                for i, p in zip(indices, probs)]
+        labels, scores = self.classifier.predict_with_scores(embeddings, unknown_thr=None)
+        return [{'class': str(label), 'id_score': float(score)}
+                for label, score in zip(labels, scores)]
 
 
 class Pipeline:
@@ -86,7 +84,13 @@ class Pipeline:
             raise ValueError(f'unknown identifier: {kind}')
         return cls(localizer, identifier, **config.get('counting', {}))
 
-    def run(self, pil_image, image_id):
+    def run(self, pil_image, image_id, group=None):
+        gallery = getattr(self.identifier, "gallery_groups", None)
+        if gallery is not None:
+            if group is None:
+                raise ValueError("Query group provenance is required")
+            if str(group) in gallery:
+                raise ValueError("Query group overlaps gallery groups")
         timings = {}
         start = time.perf_counter()
         if isinstance(self.localizer, ProposalLocalizer):
@@ -150,10 +154,12 @@ def run_images(pipeline, images, out, categories):
     (out / 'images').mkdir(parents=True, exist_ok=True)
     (out / 'overlays').mkdir(parents=True, exist_ok=True)
     predictions, counts = [], {}
-    for image_id, path in images:
+    for entry in images:
+        image_id, path = entry[:2]
+        group = entry[2] if len(entry) > 2 else None
         with Image.open(path) as source:
             image = source.convert('RGB')
-        result = pipeline.run(image, image_id)
+        result = pipeline.run(image, image_id, group=group) if group is not None else pipeline.run(image, image_id)
         name = str(image_id).replace('/', '_').replace('\\', '_')
         (out / 'images' / f'{name}.json').write_text(json.dumps(result, indent=2))
         counts[str(image_id)] = {'counts': result['counts'], 'unknown': result['unknown']}
@@ -194,7 +200,15 @@ def main(argv=None):
         raise ValueError('every image must be present in manifest')
     if not manifest:
         raise ValueError('manifest is required for COCO image IDs')
-    run_images(Pipeline.from_config(args.config), [(ids[p], root / p) for p in paths],
+    pipeline = Pipeline.from_config(args.config)
+    if getattr(pipeline.identifier, 'gallery_groups', None) is not None:
+        from freestyle.identify.cli import _resolve_groups_and_splits
+        split_data = json.loads(Path(config['split_map']).read_text())
+        groups, _ = _resolve_groups_and_splits(paths, [str(ids[p]) for p in paths], split_data)
+        entries = [(ids[p], root / p, group) for p, group in zip(paths, groups)]
+    else:
+        entries = [(ids[p], root / p) for p in paths]
+    run_images(pipeline, entries,
                args.out, config['categories'])
     return 0
 

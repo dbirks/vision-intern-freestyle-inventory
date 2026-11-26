@@ -42,7 +42,7 @@ class YoloPredictor:
 
 class TiledDetector:
     def __init__(self, checkpoint, backend="rfdetr", tile=1024, overlap=0.25,
-                 score_thr=0.3, merge="nms", containment_threshold=None, iou=0.5):
+                 score_thr=0.3, merge="nms", containment_threshold=None, iou=0.5, class_agnostic_iou=None):
         if merge not in ("nms", "wbf") or not 0 <= score_thr <= 1 or not 0 <= iou <= 1:
             raise ValueError("Invalid merge mode, score threshold, or IoU")
         self.checkpoint, self.backend_name = str(checkpoint), (backend if isinstance(backend, str) else type(backend).__name__)
@@ -51,6 +51,7 @@ class TiledDetector:
             if backend not in factories:
                 raise ValueError(f"Unknown backend: {backend}")
             backend = factories[backend](checkpoint)
+        self.class_agnostic_iou = class_agnostic_iou
         self.backend, self.tile, self.overlap = backend, tile, overlap
         self.score_thr, self.merge, self.containment_threshold, self.iou = (
             score_thr, merge, containment_threshold, iou)
@@ -66,7 +67,8 @@ class TiledDetector:
                     continue
                 detections.append({**det, "box": box})
         return merge_tiled(detections, iou=self.iou, mode=self.merge,
-                           containment_threshold=self.containment_threshold)
+                           containment_threshold=self.containment_threshold,
+                           class_agnostic_iou=self.class_agnostic_iou)
 
 
 def predict_coco(detector, coco, images_root, out, class_agnostic=False, split_map=None,

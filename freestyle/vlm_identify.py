@@ -107,7 +107,7 @@ class VLMCropIdentifier:
             im = im.resize((max(1, round(im.width * self.upscale)),
                             max(1, round(im.height * self.upscale))), Image.Resampling.LANCZOS)
             sheet.paste(im.convert('RGB'), (i * width, 24))
-        response = _json(self._ask(sheet, self._prompt() + '\nFor each numbered crop return a JSON array of objects with index and class.'))
+        response = _json(self._ask(sheet, self._prompt() + '\nFor each numbered crop return a JSON array of objects with index, class, and confidence (0 to 1).'))
         results = [self._result(None) for _ in crops]
         if isinstance(response, list):
             for obj in response:

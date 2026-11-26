@@ -140,10 +140,14 @@ def _resolve_groups_and_splits(
 
         if split_images is not None:
             image_split = split_images.get(fname, split_images.get(img_id))
+            if image_split == "exclude" and split is not None:
+                split = "exclude"
             if image_split is None or split is None or image_split != split:
                 raise ValueError(f"Missing or inconsistent split/group for {fname}")
         if not grp or split not in ("train", "val", "test", "exclude"):
             raise ValueError(f"Missing split/group provenance for {fname}")
+        if npz_groups is not None and str(npz_groups[idx]) != grp:
+            raise ValueError(f"Inconsistent stored group for {fname}")
         resolved_groups.append(grp)
         resolved_splits.append(split)
 
@@ -282,7 +286,8 @@ def run_eval(args: argparse.Namespace) -> dict[str, Any]:
     splits = np.asarray(splits_list)
     group_array = np.asarray(groups_list, dtype=str)
     valid = ~np.isin(labels, list(EXCLUDED_GT_LABELS))
-    n_excluded_unknown = int(np.sum(~valid))
+    selected_splits = (["train", "val"] if args.include_val else ["train"]) if args.mode == "logo" else [args.split]
+    n_excluded_unknown = int(np.sum(~valid & np.isin(splits, selected_splits)))
     clf_factory = _make_clf_factory(args.clf, k=args.k)
     if args.mode == "logo":
         allowed = ["train", "val"] if args.include_val else ["train"]

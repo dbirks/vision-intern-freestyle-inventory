@@ -121,7 +121,7 @@ def _make_shelf_fixture(tmp_path: Path):
 
     coco = {
         "images": [
-            {"id": 1, "file_name": "train_01.png", "width": w, "height": h},
+            {"id": 1, "file_name": "train_01.png", "width": w, "height": h, "group_id": "g1"},
             {"id": 2, "file_name": "val_01.png", "width": w, "height": h},
             {"id": 3, "file_name": "test_01.png", "width": w, "height": h},
         ],

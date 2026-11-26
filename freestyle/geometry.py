@@ -188,7 +188,7 @@ def weighted_box_fusion(list_of_box_sets, iou=0.55):
     return result
 
 
-def merge_tiled(dets, iou=0.5, mode="nms", containment_threshold=None):
+def merge_tiled(dets, iou=0.5, mode="nms", containment_threshold=None, class_agnostic_iou=None):
     """Merge image-coordinate detection dictionaries, optionally suppress fragments.
 
     Fragment suppression removes a lower-scored, no-larger box mostly contained
@@ -213,7 +213,19 @@ def merge_tiled(dets, iou=0.5, mode="nms", containment_threshold=None):
         raise ValueError("mode must be 'nms' or 'wbf'")
     indices = class_aware_nms([d["box"] for d in dets], [d["score"] for d in dets],
                               [d.get("category_id") for d in dets], iou)
-    return [dets[i] for i in indices]
+    result = [dets[i] for i in indices]
+    if class_agnostic_iou is not None:
+        if not 0 <= class_agnostic_iou <= 1:
+            raise ValueError("class-agnostic IoU must be in [0, 1]")
+        kept = []
+        for det in result:
+            duplicate = next((d for d in kept if iou_matrix([d["box"]], [det["box"]])[0, 0] > class_agnostic_iou), None)
+            if duplicate is None:
+                kept.append(det)
+            elif duplicate.get("category_id") != det.get("category_id"):
+                duplicate.setdefault("alt_class", det.get("category_id"))
+        result = kept
+    return result
 
 
 def crop(image_PIL, box_xyxy, pad=0.08, min_size=None):
