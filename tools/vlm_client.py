@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import base64
 import io
+import json
 import os
 import threading
 from typing import Any
@@ -29,9 +30,10 @@ from .model_options import structured_output_template_kwargs
 class VLMResponse(str):
     """String response carrying the provider finish reason when available."""
 
-    def __new__(cls, text: str, finish_reason: str | None = None):
+    def __new__(cls, text: str, finish_reason: str | None = None, usage: Any = None):
         obj = super().__new__(cls, text)
         obj.finish_reason = finish_reason
+        obj.usage = usage
         return obj
 
 
@@ -115,6 +117,8 @@ def _run_openai(
     max_dimension: int | None = 1280,
     image_format: str | None = None,
     jpeg_quality: int = 85,
+    temperature: float = 0, top_p: float = 1, seed: int | None = None,
+    extra_body: dict | None = None,
 ) -> str:
     import time
 
@@ -124,8 +128,12 @@ def _run_openai(
 
     data_url = _pil_to_data_url(image, max_dimension, image_format, jpeg_quality)
     template_kwargs = structured_output_template_kwargs(model_id)
-    request_kwargs = ({"extra_body": {"chat_template_kwargs": template_kwargs}}
-                      if template_kwargs else {})
+    body = dict(extra_body or {})
+    if template_kwargs:
+        body["chat_template_kwargs"] = {**template_kwargs, **body.get("chat_template_kwargs", {})}
+    request_kwargs = {"extra_body": body} if body else {}
+    if seed is not None:
+        request_kwargs["seed"] = seed
 
     last_err: Exception | None = None
     for attempt in range(3):
@@ -140,11 +148,15 @@ def _run_openai(
                     ],
                 }],
                 max_tokens=max_tokens,
-                temperature=0,
+                temperature=temperature,
+                top_p=top_p,
                 **request_kwargs,
             )
             choice = response.choices[0]
-            return VLMResponse(choice.message.content or "", getattr(choice, "finish_reason", None))
+            usage = getattr(response, "usage", None)
+            if hasattr(usage, "model_dump"):
+                usage = usage.model_dump()
+            return VLMResponse(choice.message.content or "", getattr(choice, "finish_reason", None), usage)
         except Exception as e:
             last_err = e
             if attempt < 2:
@@ -176,6 +188,7 @@ def _run_transformers_batch(
     prompts: list[str],
     model_id: str,
     max_tokens: int,
+    temperature: float = 0, top_p: float = 1, seed: int | None = None,
 ) -> list[str]:
     """Generate for a *batch* of (image, prompt) pairs in one forward pass.
 
@@ -214,10 +227,13 @@ def _run_transformers_batch(
         **structured_output_template_kwargs(model_id),
     ).to(model.device)
 
+    generation_kwargs = {"do_sample": temperature > 0}
+    if temperature > 0:
+        generation_kwargs.update(temperature=temperature, top_p=top_p)
+    if seed is not None:
+        torch.manual_seed(seed)
     with torch.inference_mode():
-        out = model.generate(
-            **inputs, max_new_tokens=max_tokens, do_sample=False,
-        )
+        out = model.generate(**inputs, max_new_tokens=max_tokens, **generation_kwargs)
 
     gen = out[:, inputs["input_ids"].shape[1]:]
     return processor.batch_decode(gen, skip_special_tokens=True)
@@ -228,8 +244,11 @@ def _run_transformers(
     prompt: str,
     model_id: str,
     max_tokens: int,
+    temperature: float = 0, top_p: float = 1, seed: int | None = None,
 ) -> str:
-    return _run_transformers_batch([image], [prompt], model_id, max_tokens)[0]
+    return _run_transformers_batch(
+        [image], [prompt], model_id, max_tokens, temperature, top_p, seed,
+    )[0]
 
 
 # ------------------------------------------------------------------
@@ -247,6 +266,8 @@ def run_vlm(
     max_dimension: int | None = 1280,
     image_format: str | None = None,
     jpeg_quality: int = 85,
+    temperature: float = 0, top_p: float = 1, seed: int | None = None,
+    extra_body: dict | None = None, raw_response_log: str | os.PathLike | None = None,
 ) -> str:
     """Send *image* + *prompt* to a VLM and return the response text.
 
@@ -274,19 +295,38 @@ def run_vlm(
     max_tokens : int
         Maximum tokens to generate.
 
+    temperature, top_p, seed
+        Generation sampling controls. Seed is omitted from OpenAI requests when unset.
+    extra_body : dict, optional
+        Additional OpenAI-compatible request fields. Chat template kwargs are merged
+        with model defaults, with the caller taking precedence.
+    raw_response_log : str or Path, optional
+        Append response text, finish reason, and usage as one JSON object per call.
+
     Returns
     -------
     str
         The model's response text.
     """
+    if temperature < 0 or not 0 < top_p <= 1:
+        raise ValueError("temperature must be nonnegative and top_p in (0, 1]")
     if backend == "openai":
-        return _run_openai(image, prompt, model_id, base_url, api_key, max_tokens,
-                           max_dimension, image_format, jpeg_quality)
-    if backend == "transformers":
-        return _run_transformers(image, prompt, model_id, max_tokens)
-    raise ValueError(
-        f"Unknown backend {backend!r}. Use 'openai' or 'transformers'."
-    )
+        response = _run_openai(image, prompt, model_id, base_url, api_key, max_tokens,
+                               max_dimension, image_format, jpeg_quality, temperature,
+                               top_p, seed, extra_body)
+    elif backend == "transformers":
+        if extra_body:
+            raise ValueError("extra_body is only supported by the openai backend")
+        response = _run_transformers(image, prompt, model_id, max_tokens,
+                                     temperature, top_p, seed)
+    else:
+        raise ValueError(f"Unknown backend {backend!r}. Use 'openai' or 'transformers'.")
+    if raw_response_log is not None:
+        record = {"response": str(response), "finish_reason": getattr(response, "finish_reason", None),
+                  "usage": getattr(response, "usage", None)}
+        with open(raw_response_log, "a", encoding="utf-8") as log:
+            log.write(json.dumps(record) + "\n")
+    return response
 
 
 def run_vlm_batch(

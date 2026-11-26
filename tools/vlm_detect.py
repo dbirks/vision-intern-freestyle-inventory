@@ -139,6 +139,8 @@ def vlm_detect(
     max_dimension: int | None = 1280, image_format: str | None = None,
     jpeg_quality: int = 85, max_tokens: int = 4096,
     tile: int | None = None, tile_overlap: float = 0.2, n_samples: int = 1,
+    temperature: float = 0, top_p: float = 1, seed: int | None = None,
+    extra_body: dict | None = None, raw_response_log: str | None = None,
 ) -> list[dict]:
     """Detect objects in *image* using a VLM with a free-form prompt.
 
@@ -165,15 +167,28 @@ def vlm_detect(
         disambiguate look-alike categories (e.g. chart vs table) and curb
         common failure modes.  Ignored when an explicit *prompt* is given.
 
+    temperature, top_p, seed
+        Sampling controls. Sample i uses seed + i when a seed is supplied.
+        Multiple samples require a nonzero temperature.
+    extra_body : dict, optional
+        Additional OpenAI-compatible request fields.
+    raw_response_log : str or Path, optional
+        Append each response and its finish reason and usage as JSONL.
+
     Returns
     -------
     list[dict]
         Each dict contains ``bbox`` ([x1,y1,x2,y2] in pixels),
         ``label`` (str), and ``sub_label`` (str).
     """
+    if n_samples > 1 and temperature == 0:
+        raise ValueError("n_samples > 1 requires nonzero temperature for meaningful self-consistency")
+
     from .d1 import d1_detect, is_d1
 
     if is_d1(model_id):
+        if n_samples != 1 or temperature != 0 or top_p != 1 or seed is not None or extra_body or raw_response_log:
+            raise ValueError("d1 does not support VLM sampling options or raw response logging")
         if backend != "transformers":
             raise ValueError("d1 requires backend='transformers' and its System One API")
         if prompt is not None:
@@ -222,13 +237,15 @@ def vlm_detect(
     class DetectionList(list):
         truncated = False
 
-    def detect_region(region: tuple[int, int, int, int], retry: bool) -> DetectionList:
+    def detect_region(region: tuple[int, int, int, int], retry: bool,
+                      sample_seed: int | None) -> DetectionList:
         x, y, right, bottom = region
         crop = image.crop(region)
         response = run_vlm(
             crop, prompt, model_id, backend=backend, base_url=base_url, api_key=api_key,
             max_tokens=max_tokens, max_dimension=max_dimension, image_format=image_format,
-            jpeg_quality=jpeg_quality,
+            jpeg_quality=jpeg_quality, temperature=temperature, top_p=top_p,
+            seed=sample_seed, extra_body=extra_body, raw_response_log=raw_response_log,
         )
         truncated = getattr(response, "finish_reason", None) == "length"
         if truncated and retry and right - x > 1 and bottom - y > 1:
@@ -236,7 +253,7 @@ def vlm_detect(
             result = DetectionList()
             for box in ((x, y, mx, my), (mx, y, right, my),
                         (x, my, mx, bottom), (mx, my, right, bottom)):
-                part = detect_region(box, False)
+                part = detect_region(box, False, sample_seed)
                 result.extend(part)
                 result.truncated |= part.truncated
             return result
@@ -263,12 +280,13 @@ def vlm_detect(
 
     samples = []
     truncated = False
-    for _ in range(n_samples):
+    for sample_index in range(n_samples):
         detections = []
         for y in starts(h):
             for x in starts(w):
                 part = detect_region((x, y, min(w, x + (tile or w)),
-                                      min(h, y + (tile or h))), tile is not None)
+                                      min(h, y + (tile or h))), tile is not None,
+                                     None if seed is None else seed + sample_index)
                 truncated |= part.truncated
                 detections.extend(part)
         samples.append(nms(detections) if tile is not None else detections)

@@ -34,7 +34,7 @@ def test_tiles_retry_truncation_and_consensus(monkeypatch):
             return VLMResponse("[]", "length")
         return VLMResponse('[{"label":"box","bbox_2d":[0,0,500,500]}]', "stop")
     monkeypatch.setattr("tools.vlm_detect.run_vlm", worker)
-    result = vlm_detect(Image.new("RGB", (100, 100)), tile=100, n_samples=2)
+    result = vlm_detect(Image.new("RGB", (100, 100)), tile=100, n_samples=2, temperature=0.7)
     assert len(calls) == 6
     assert all("score" in d for d in result)
     assert not result.truncated
@@ -47,7 +47,7 @@ def test_truncated_empty_and_label_paths(tmp_path, monkeypatch):
         '[{"label":"Coke Zero!","bbox_2d":[0,0,500,500]}]', "length"))
     with pytest.warns(RuntimeWarning):
         coco = label_dataset(tmp_path, ["coke-zero"], tmp_path / "out.json",
-                             recursive=True, n_samples=2)
+                             recursive=True, n_samples=2, temperature=0.7)
     assert coco["images"][0]["file_name"] == "sub/a.png"
     assert coco["images"][0]["truncated"]
     assert coco["annotations"][0]["score"] == 1
@@ -77,3 +77,38 @@ def test_judge_chunks_crops_and_unjudged(monkeypatch):
     assert len(seen) == 3 and seen[0][1]["max_tokens"] == 3000
     assert [v["detection_idx"] for v in verdicts] == list(range(5))
     assert verdicts[1]["verdict"] == "unjudged"
+
+
+def test_sampling_options_and_raw_log(tmp_path, monkeypatch):
+    from types import SimpleNamespace
+
+    from tools import vlm_client
+
+    calls = []
+    def create(**kwargs):
+        calls.append(kwargs)
+        return SimpleNamespace(
+            choices=[SimpleNamespace(message=SimpleNamespace(content="[]"), finish_reason="stop")],
+            usage=SimpleNamespace(model_dump=lambda: {"total_tokens": 42}),
+        )
+    client = SimpleNamespace(chat=SimpleNamespace(completions=SimpleNamespace(create=create)))
+    monkeypatch.setattr(vlm_client, "_get_client", lambda *args: client)
+    Image.new("RGB", (10, 10)).save(tmp_path / "a.png")
+    log = tmp_path / "responses.jsonl"
+    label_dataset(tmp_path, ["box"], tmp_path / "out.json", backend="openai",
+                  n_samples=2, temperature=0.8, top_p=0.9, seed=17,
+                  extra_body={"chat_template_kwargs": {"enable_thinking": False}},
+                  raw_response_log=log)
+    assert [c["seed"] for c in calls] == [17, 18]
+    assert all(c["temperature"] == 0.8 and c["top_p"] == 0.9 for c in calls)
+    assert all(c["extra_body"]["chat_template_kwargs"]["enable_thinking"] is False for c in calls)
+    assert [json.loads(line) for line in log.read_text().splitlines()] == [
+        {"response": "[]", "finish_reason": "stop", "usage": {"total_tokens": 42}},
+    ] * 2
+
+
+def test_consensus_requires_sampling(tmp_path):
+    with pytest.raises(ValueError, match="nonzero temperature"):
+        vlm_detect(Image.new("RGB", (10, 10)), n_samples=2)
+    with pytest.raises(ValueError, match="nonzero temperature"):
+        label_dataset(tmp_path, ["box"], tmp_path / "out.json", n_samples=2)

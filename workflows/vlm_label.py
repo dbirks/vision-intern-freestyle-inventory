@@ -256,6 +256,8 @@ def label_dataset(
     max_dimension: int | None = 1280, image_format: str | None = None,
     jpeg_quality: int = 85, max_tokens: int = 4096, tile: int | None = None,
     tile_overlap: float = 0.2, n_samples: int = 1,
+    temperature: float = 0, top_p: float = 1, seed: int | None = None,
+    extra_body: dict | None = None, raw_response_log: str | Path | None = None,
     label_aliases: dict[str, str] | None = None, keep_unmatched: bool = False,
     recursive: bool = False, image_paths: list[str] | None = None,
 ) -> dict | Any:
@@ -294,16 +296,28 @@ def label_dataset(
         Column(s) identifying the same image for *dedupe* (e.g. ``["docId"]``).
         When omitted, dedupes by image content hash.
 
+    temperature, top_p, seed
+        Sampling controls; multiple samples require a nonzero temperature.
+        When supplied, seed is incremented for each sample.
+    extra_body : dict, optional
+        Additional OpenAI-compatible request fields.
+    raw_response_log : str or Path, optional
+        Append each response with finish reason and usage as JSONL.
+
     Returns
     -------
     dict or datasets.Dataset
         COCO dict (local mode) or HF Dataset with ``detections``
         column (Hub mode).
     """
+    if n_samples > 1 and temperature == 0:
+        raise ValueError("n_samples > 1 requires nonzero temperature for meaningful self-consistency")
     classes_lower = [c.lower() for c in classes]
     detect_options = dict(max_dimension=max_dimension, image_format=image_format,
                           jpeg_quality=jpeg_quality, max_tokens=max_tokens, tile=tile,
-                          tile_overlap=tile_overlap, n_samples=n_samples)
+                          tile_overlap=tile_overlap, n_samples=n_samples,
+                          temperature=temperature, top_p=top_p, seed=seed,
+                          extra_body=extra_body, raw_response_log=raw_response_log)
 
     if _is_local_dir(source):
         return _label_local(
