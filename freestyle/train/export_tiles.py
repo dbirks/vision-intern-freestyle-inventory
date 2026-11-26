@@ -2,12 +2,45 @@
 
 import argparse
 import json
+import math
 from collections import defaultdict
 from pathlib import Path
 
-from PIL import Image, ImageDraw, ImageStat
+from PIL import Image, ImageChops, ImageDraw, ImageStat
 
 from freestyle.geometry import make_tiles
+
+
+def _instance_mask(ann, image_size, rect, size):
+    """Rasterize available instance geometry; boxes are the fallback for box-only GT."""
+    segmentation = ann.get("segmentation")
+    quad = ann.get("quad")
+    mask = Image.new("L", image_size, 0)
+    if isinstance(segmentation, dict):
+        try:
+            from pycocotools import mask as coco_mask
+        except ImportError as exc:
+            raise ValueError("RLE segmentation requires pycocotools") from exc
+        import numpy as np
+        rle = segmentation
+        if isinstance(rle.get("counts"), list):
+            rle = coco_mask.frPyObjects(rle, image_size[1], image_size[0])
+        pixels = coco_mask.decode(rle)
+        if pixels.ndim == 3:
+            pixels = pixels.any(axis=2)
+        mask = Image.fromarray(np.asarray(pixels, dtype=np.uint8) * 255)
+    elif segmentation or quad:
+        polygons = segmentation if segmentation else [[v for point in quad for v in point]]
+        draw = ImageDraw.Draw(mask)
+        for polygon in polygons:
+            if len(polygon) < 6 or len(polygon) % 2:
+                raise ValueError("Invalid instance polygon")
+            draw.polygon(list(zip(polygon[::2], polygon[1::2])), fill=255)
+    else:
+        x, y, w, h = ann["bbox"]
+        ImageDraw.Draw(mask).rectangle((math.floor(x), math.floor(y),
+                                        math.ceil(x + w) - 1, math.ceil(y + h) - 1), fill=255)
+    return mask.crop(rect).resize(size, Image.Resampling.NEAREST)
 
 
 def export_tiles(coco_file, images_root, out, split_map, tile=1024, overlap=0.25,
@@ -75,25 +108,19 @@ def export_tiles(coco_file, images_root, out, split_map, tile=1024, overlap=0.25
                     if not cw or not ch:
                         continue
                     if cw * ch / (w * h) < min_visible:
-                        import math
                         box = [(left - x0) * sx, (top - y0) * sy,
                                (right - x0) * sx, (bottom - y0) * sy]
-                        ImageDraw.Draw(mask).rectangle(
-                            (math.floor(box[0]), math.floor(box[1]),
-                             math.ceil(box[2]) - 1, math.ceil(box[3]) - 1), fill=255)
+                        mask = ImageChops.lighter(mask, _instance_mask(ann, img.size, rect, sample.size))
                         masked.append({"annotation_id": ann.get("id"), "box": box})
                         continue
                     box = [(left - x0) * sx, (top - y0) * sy, cw * sx, ch * sy]
-                    import math
-                    ImageDraw.Draw(protected).rectangle(
-                        (math.floor(box[0]), math.floor(box[1]),
-                         math.ceil(box[0] + box[2]) - 1, math.ceil(box[1] + box[3]) - 1), fill=255)
+                    protected = ImageChops.lighter(
+                        protected, _instance_mask(ann, img.size, rect, sample.size))
                     ann_id += 1
                     ds["annotations"].append({"id": ann_id, "image_id": image_id,
                         "category_id": 1 if class_agnostic else ann["category_id"],
                         "bbox": box, "area": box[2] * box[3],
                         "iscrowd": ann.get("iscrowd", 0)})
-                from PIL import ImageChops
                 mask = ImageChops.subtract(mask, protected)
                 sample = Image.composite(Image.new("RGB", sample.size, mean), original, mask)
                 sample.save(out / split / name, format="PNG")

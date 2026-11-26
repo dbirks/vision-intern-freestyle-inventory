@@ -312,6 +312,7 @@ def _analyze_with_context(
     images_root: str | Path | None = None,
     matching: MatchMethod = "greedy",
     loc_iou: float = LOC_DEFAULT_IOU,
+    allow_unknown_images: bool = False,
 ) -> tuple[list[FailureCase], list[dict[str, Any]]]:
     """Run failure classification and return ``(failure_cases, per_image_contexts)``."""
     images = gt_coco.get("images", [])
@@ -346,6 +347,8 @@ def _analyze_with_context(
         if idx is None:
             idx = str_id_to_idx.get(str(pred["image_id"]))
         if idx is None:
+            if allow_unknown_images:
+                continue
             raise ValueError(f"Prediction references unknown image: {pred['image_id']}")
         if float(pred["score"]) < score_thr:
             continue
@@ -657,6 +660,7 @@ def analyze(
     images_root: str | Path | None = None,
     matching: MatchMethod = "greedy",
     loc_iou: float = LOC_DEFAULT_IOU,
+    allow_unknown_images: bool = False,
 ) -> list[FailureCase]:
     """Classify every detection/identification failure on *gt_coco* vs *preds*."""
     cases, _ = _analyze_with_context(
@@ -667,6 +671,7 @@ def analyze(
         images_root=images_root,
         matching=matching,
         loc_iou=loc_iou,
+        allow_unknown_images=allow_unknown_images,
     )
     return cases
 
@@ -1167,6 +1172,7 @@ def run_failure_analysis(
     out_dir: str | Path,
     matching: MatchMethod = "greedy",
     max_gallery_crops: int = 64,
+    allow_unknown_images: bool = False,
 ) -> dict[str, Any]:
     """Run full failure analysis and write overlays, galleries, JSON, and HTML to *out_dir*."""
     out = Path(out_dir)
@@ -1182,6 +1188,7 @@ def run_failure_analysis(
         iou=iou,
         images_root=images_root,
         matching=matching,
+        allow_unknown_images=allow_unknown_images,
     )
 
     used_stems: set[str] = set()
@@ -1273,6 +1280,7 @@ def build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(
         description="Analyze Freestyle cartridge failure modes and render visual diagnostics."
     )
+    p.add_argument("--allow-unknown-images", action="store_true")
     p.add_argument("--gt", required=True, help="Ground-truth COCO JSON file.")
     p.add_argument("--pred", required=True, help="Predictions COCO results JSON list.")
     p.add_argument(
@@ -1316,6 +1324,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         out_dir=args.out,
         matching=args.matching,
         max_gallery_crops=args.max_gallery_crops,
+        allow_unknown_images=args.allow_unknown_images,
     )
     s = report["summary"]
     print(

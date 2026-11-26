@@ -116,7 +116,8 @@ def predict_coco(detector, coco, images_root, out, class_agnostic=False, split_m
                 category = category_map[str(category)]
             predictions.append({"image_id": item["id"], "bbox": [x1, y1, x2-x1, y2-y1],
                                 "score": float(det["score"]), "category_id": int(category),
-                                "id_score": float(det.get("id_score", det["score"]))})
+                                "id_score": float(det.get("id_score", det["score"])),
+                                **({"alt_class": det["alt_class"]} if "alt_class" in det else {})})
     if torch is not None and torch.cuda.is_available():
         torch.cuda.synchronize()
     elapsed = time.perf_counter() - start
@@ -129,7 +130,8 @@ def predict_coco(detector, coco, images_root, out, class_agnostic=False, split_m
                 "tile": detector.tile,
                 "overlap": detector.overlap, "score_thr": detector.score_thr,
                 "merge": detector.merge, "iou": detector.iou,
-                "containment_threshold": detector.containment_threshold},
+                "containment_threshold": detector.containment_threshold,
+                "class_agnostic_iou": detector.class_agnostic_iou},
                 seconds_per_image=elapsed / count if count else None, image_count=count)
     (out.parent / "meta.json").write_text(json.dumps(meta, indent=2))
     return predictions
@@ -152,9 +154,11 @@ def main():
     p.add_argument("--merge", choices=("nms", "wbf"), default="nms")
     p.add_argument("--iou", type=float, default=0.5)
     p.add_argument("--containment-threshold", type=float)
+    p.add_argument("--class-agnostic-iou", type=float,
+                   help="Suppress cross-class duplicates above this IoU")
     a = p.parse_args()
     detector = TiledDetector(a.checkpoint, a.backend, a.tile, a.overlap, a.score_thr,
-                             a.merge, a.containment_threshold, a.iou)
+                             a.merge, a.containment_threshold, a.iou, a.class_agnostic_iou)
     mapping = json.loads(Path(a.category_map).read_text()) if a.category_map else None
     predict_coco(detector, a.images, a.images_root, a.out, a.class_agnostic,
                  a.split_map, a.split, mapping)

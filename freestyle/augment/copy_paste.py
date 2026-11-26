@@ -799,6 +799,7 @@ def run_cli(
     parent_groups = load_groups_map({"images": source_images}, split_data)
     group_by_image = {im["id"]: parent_groups[im["file_name"]] for im in source_images}
     synth_groups = {}
+    synth_image_groups = {}
 
     out_images: list[dict[str, Any]] = []
     out_annotations: list[dict[str, Any]] = []
@@ -841,6 +842,7 @@ def run_cli(
             synth_splits[rel_name] = "train"
             group = "synthetic:" + group_by_image[src_img["id"]]
             synth_groups[group] = "train"
+            synth_image_groups[rel_name] = group
             out_images.append(
                 {
                     "id": next_img_id,
@@ -869,7 +871,7 @@ def run_cli(
     }
     (out / "annotations.json").write_text(json.dumps(out_coco, indent=2))
     (out / "splits.json").write_text(
-        json.dumps({"version": 1, "groups": synth_groups, "images": synth_splits}, indent=2)
+        json.dumps({"version": 1, "groups": synth_groups, "images": synth_splits, "image_to_group": synth_image_groups}, indent=2)
     )
     make_contact_sheet(sheet_records, out / "contact_sheet.png")
     return out_coco

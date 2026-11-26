@@ -208,18 +208,19 @@ def merge_tiled(dets, iou=0.5, mode="nms", containment_threshold=None, class_agn
                 kept.append(det)
         dets = kept
     if mode == "wbf":
-        return weighted_box_fusion([dets], iou)
-    if mode != "nms":
+        result = weighted_box_fusion([dets], iou)
+    elif mode == "nms":
+        indices = class_aware_nms([d["box"] for d in dets], [d["score"] for d in dets],
+                                  [d.get("category_id") for d in dets], iou)
+        result = [dets[i] for i in indices]
+    else:
         raise ValueError("mode must be 'nms' or 'wbf'")
-    indices = class_aware_nms([d["box"] for d in dets], [d["score"] for d in dets],
-                              [d.get("category_id") for d in dets], iou)
-    result = [dets[i] for i in indices]
     if class_agnostic_iou is not None:
         if not 0 <= class_agnostic_iou <= 1:
             raise ValueError("class-agnostic IoU must be in [0, 1]")
         kept = []
         for det in result:
-            duplicate = next((d for d in kept if iou_matrix([d["box"]], [det["box"]])[0, 0] > class_agnostic_iou), None)
+            duplicate = next((d for d in kept if iou_matrix([d["box"]], [det["box"]])[0, 0] >= class_agnostic_iou), None)
             if duplicate is None:
                 kept.append(det)
             elif duplicate.get("category_id") != det.get("category_id"):

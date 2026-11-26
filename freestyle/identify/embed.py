@@ -204,6 +204,26 @@ def _is_gated_error(exc: Exception) -> bool:
     )
 
 
+def _processor_options(processor: Any, input_size: tuple[int, int]) -> dict[str, Any]:
+    proc_fn = getattr(processor, "preprocess", processor)
+    try:
+        params = inspect.signature(proc_fn).parameters
+        accepts_kwargs = any(p.kind == inspect.Parameter.VAR_KEYWORD for p in params.values())
+    except (TypeError, ValueError):
+        params = {}
+        accepts_kwargs = False
+    options: dict[str, Any] = {}
+    for name in ("do_resize", "do_center_crop"):
+        if accepts_kwargs or name in params:
+            options[name] = False
+    if "Siglip2ImageProcessor" in type(processor).__name__:
+        patch = int(getattr(processor, "patch_size", 16))
+        if any(side % patch for side in input_size):
+            raise ValueError("SigLIP2 input dimensions must be divisible by patch size")
+        options["max_num_patches"] = (input_size[0] // patch) * (input_size[1] // patch)
+    return options
+
+
 class Embedder:
     """Aspect-preserving crop embedder backed by HF transformers or a deterministic stub.
 
@@ -324,24 +344,7 @@ class Embedder:
             self.input_size = _infer_processor_size(self._processor, self._model, fallback_size)
         self.dim = _infer_embedding_dim(self._model)
 
-        proc_fn = getattr(self._processor, "preprocess", self._processor)
-        try:
-            sig = inspect.signature(proc_fn)
-            params = sig.parameters
-            accepts_kwargs = any(p.kind == inspect.Parameter.VAR_KEYWORD for p in params.values())
-        except (TypeError, ValueError):
-            params = {}
-            accepts_kwargs = False
-
-        proc_kwargs: dict[str, Any] = {}
-        if accepts_kwargs or "do_resize" in params:
-            proc_kwargs["do_resize"] = False
-        if accepts_kwargs or "do_center_crop" in params:
-            proc_kwargs["do_center_crop"] = False
-        if "Siglip2ImageProcessor" in type(self._processor).__name__:
-            patch = int(getattr(self._processor, "patch_size", 16))
-            proc_kwargs["max_num_patches"] = (self.input_size[0] // patch) * (self.input_size[1] // patch)
-        self._proc_kwargs = proc_kwargs
+        self._proc_kwargs = _processor_options(self._processor, self.input_size)
 
     def preprocess(self, image: Image.Image) -> Image.Image:
         """Apply aspect-preserving neutral-grey letterbox to ``self.input_size``."""

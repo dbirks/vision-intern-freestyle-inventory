@@ -434,9 +434,10 @@ def compute_localization_metrics(
     score_thr: float | None = None,
     max_dets: int | None = None,
     include_best_f1: bool = True,
+    allow_unknown_images: bool = False,
 ) -> dict[str, Any]:
     """Compute class-agnostic localization AP50, AP50:95, and operating-point P/R/F1."""
-    prepared = _prepare_dataset(gt_coco, predictions)
+    prepared = _prepare_dataset(gt_coco, predictions, allow_unknown_images=allow_unknown_images)
     records_by_img, n_gt_by_img = _per_image_localization_records(prepared, max_dets=max_dets)
     return _aggregate_localization(
         list(range(len(prepared.image_keys))),
@@ -569,9 +570,10 @@ def compute_identification_metrics(
     score_thr: float = 0.0,
     iou_thr: float = 0.5,
     matching: MatchMethod = "greedy",
+    allow_unknown_images: bool = False,
 ) -> dict[str, Any]:
     """Compute top-1 accuracy and macro-F1 over matched non-unknown GT boxes."""
-    prepared = _prepare_dataset(gt_coco, predictions)
+    prepared = _prepare_dataset(gt_coco, predictions, allow_unknown_images=allow_unknown_images)
     per_img = _per_image_identification_records(
         prepared, score_thr=score_thr, iou_thr=iou_thr, matching=matching
     )
@@ -674,9 +676,10 @@ def compute_counting_metrics(
     predictions: Sequence[Mapping[str, Any]],
     *,
     score_thr: float = 0.0,
+    allow_unknown_images: bool = False,
 ) -> dict[str, Any]:
     """Compute total-count MAE, per-class count MAE, and exact-inventory rate."""
-    prepared = _prepare_dataset(gt_coco, predictions)
+    prepared = _prepare_dataset(gt_coco, predictions, allow_unknown_images=allow_unknown_images)
     gt_totals, pred_totals, gt_counts, pred_counts, class_ids = _per_image_counting_records(
         prepared, score_thr=score_thr
     )

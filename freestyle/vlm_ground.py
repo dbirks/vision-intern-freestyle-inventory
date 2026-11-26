@@ -51,7 +51,7 @@ def _convert(raw, size, mode):
 class VLMGrounder:
     def __init__(self, model, coord_mode='norm1000', tile=0, overlap=0.25, max_side=None,
                  prompt_variant='per_shelf', with_identity=False, temperature=0,
-                 n_samples=1, raw_jsonl=None):
+                 n_samples=1, raw_jsonl=None, class_agnostic_iou=None):
         if coord_mode not in ('norm1000', 'pixel', 'norm1'):
             raise ValueError('Pass the coordinate mode measured by the probe')
         if prompt_variant not in ('per_shelf', 'all') or tile < 0 or not 0 <= overlap < 1 or n_samples < 1:
@@ -59,6 +59,7 @@ class VLMGrounder:
         self.model, self.coord_mode, self.tile, self.overlap = model, coord_mode, tile, overlap
         self.max_side, self.prompt_variant, self.with_identity = max_side, prompt_variant, with_identity
         self.temperature, self.n_samples, self.raw_jsonl = temperature, n_samples, raw_jsonl
+        self.class_agnostic_iou = class_agnostic_iou
 
     def _prompt(self):
         labels = ', '.join(catalog.class_names()) if self.with_identity else 'cartridge'
@@ -89,7 +90,7 @@ class VLMGrounder:
                            box[2] * image.width / size[0] + rect[0], box[3] * image.height / size[1] + rect[1]]
                     label = str(obj.get('label', 'unknown')) if self.with_identity else 'cartridge'
                     detections.append({'box': box, 'score': 1.0, 'category_id': label})
-            samples.append(merge_tiled(detections))
+            samples.append(merge_tiled(detections, class_agnostic_iou=self.class_agnostic_iou))
         fused = weighted_box_fusion(samples) if self.n_samples > 1 else samples[0]
         result = []
         for det in fused:
@@ -97,7 +98,7 @@ class VLMGrounder:
                                 iou_matrix([d['box']], [det['box']])[0, 0] > 0.55
                                 for d in group) for group in samples)
             result.append({'xyxy': det['box'], 'score': agreement / self.n_samples,
-                           'label': det['category_id']})
+                           'label': det['category_id'], **({'alt_class': det['alt_class']} if 'alt_class' in det else {})})
         return result
 
     def label_coco(self, images, out_coco):
@@ -140,7 +141,8 @@ class Localizer(VLMGrounder):
     def predict(self, image):
         return [{'box': d['xyxy'], 'score': d['score'],
                  'class': (d['label'] if d['label'] in catalog.class_names() else 'unknown') if self.with_identity else None,
-                 'id_score': d['score'] if self.with_identity and d['label'] in catalog.class_names() else 0.0}
+                 'id_score': d['score'] if self.with_identity and d['label'] in catalog.class_names() else 0.0,
+                 **({'alt_class': d['alt_class']} if 'alt_class' in d else {})}
                 for d in self.detect(image)]
 
 

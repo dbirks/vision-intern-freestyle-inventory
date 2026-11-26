@@ -347,6 +347,13 @@ def test_cli_generates_exportable_dataset(tmp_path):
     assert (out_dir / "splits.json").exists()
     assert (out_dir / "contact_sheet.png").exists()
 
+    from freestyle.identify.cli import _resolve_groups_and_splits
+    synth_map = json.loads((out_dir / "splits.json").read_text())
+    assert synth_map["groups"] == {"synthetic:g1": "train"}
+    names = list(synth_map["images"])
+    groups, split_names = _resolve_groups_and_splits(names, [str(i) for i in range(len(names))], synth_map)
+    assert groups == ["synthetic:g1"] * len(names)
+    assert split_names == ["train"] * len(names)
     synth_coco = json.loads((out_dir / "annotations.json").read_text())
     assert len(synth_coco["images"]) == 3
     assert len(synth_coco["annotations"]) == 3 * 7
@@ -390,3 +397,20 @@ def test_cli_generates_exportable_dataset(tmp_path):
     ]
     bad_proc = subprocess.run(bad_cmd, capture_output=True, text=True)
     assert bad_proc.returncode != 0
+
+
+def test_copy_paste_photometric_excludes_geometry(tmp_path, monkeypatch):
+    from freestyle.augment import copy_paste
+    coco, splits, _, _ = _make_shelf_fixture(tmp_path)
+    (tmp_path / "coco.json").write_text(json.dumps(coco))
+    (tmp_path / "splits.json").write_text(json.dumps(splits))
+    observed = {}
+    def compose(cfg):
+        observed.update(cfg)
+        return lambda image, rng: image
+    monkeypatch.setattr(copy_paste, "compose_photometric", compose)
+    copy_paste.run_cli(coco_path=tmp_path / "coco.json", split_map_path=tmp_path / "splits.json",
+                       split="train", images_root=tmp_path, out_dir=tmp_path / "synth",
+                       n_per_image=1, apply_photometric=True)
+    assert "fisheye_warp" not in observed
+    assert "motion_blur" in observed

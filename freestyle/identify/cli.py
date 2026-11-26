@@ -103,13 +103,14 @@ def _resolve_groups_and_splits(
     split_images: Mapping[str, Any] | None = None
 
     if groups_data is not None:
-        if "image_to_group" in groups_data and isinstance(groups_data["image_to_group"], Mapping):
+        if "groups" in groups_data and "images" in groups_data:
+            split_groups = groups_data["groups"]
+            split_images = groups_data["images"]
+            explicit_map = groups_data.get("image_to_group", groups_data.get("image_groups"))
+        elif "image_to_group" in groups_data and isinstance(groups_data["image_to_group"], Mapping):
             explicit_map = groups_data["image_to_group"]
         elif "image_groups" in groups_data and isinstance(groups_data["image_groups"], Mapping):
             explicit_map = groups_data["image_groups"]
-        elif "groups" in groups_data and "images" in groups_data:
-            split_groups = groups_data["groups"]
-            split_images = groups_data["images"]
         else:
             explicit_map = groups_data
 
@@ -123,8 +124,12 @@ def _resolve_groups_and_splits(
             for cand in (fname, img_id):
                 if cand and cand in explicit_map:
                     grp = str(explicit_map[cand])
+                    if split_groups is not None:
+                        if grp not in split_groups:
+                            raise ValueError(f"Unknown group for {fname}")
+                        split = str(split_groups[grp])
                     break
-        elif split_groups is not None:
+        if grp is None and split_groups is not None:
             for cand in (fname, img_id):
                 if cand:
                     matched = _match_split_group(cand, split_groups)

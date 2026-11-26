@@ -170,7 +170,8 @@ def run_images(pipeline, images, out, categories):
             predictions.append({'image_id': image_id, 'bbox': xyxy_to_xywh(d['box']).tolist(),
                                 'score': float(d['score']), 'category_id': categories[d['class']],
                                 'id_score': d['id_score'], 'proposed_class': d['proposed_class'],
-                                'proposed_score': d['proposed_score']})
+                                'proposed_score': d['proposed_score'],
+                                **({'alt_class': d['alt_class']} if 'alt_class' in d else {})})
             draw.rectangle(d['box'], outline='lime', width=2)
             draw.text((d['box'][0], d['box'][1]), f"{d['class'][:18]} S{d['shelf']}", fill='yellow')
         image.save(out / 'overlays' / f'{name}.png')

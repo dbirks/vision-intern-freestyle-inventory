@@ -131,6 +131,11 @@ def main(argv: Sequence[str] | None = None) -> int:
     gt_coco = _load_json(gt_path)
     predictions = _load_json(pred_path)
     groups_data = _load_json(args.groups or args.split_map) if (args.groups or args.split_map) else None
+    split_data = _load_json(args.split_map) if args.split_map else None
+    if split_data is not None and any(
+        image.get("file_name") not in split_data.get("images", {}) for image in gt_coco.get("images", [])
+    ):
+        parser.error("Every evaluation image must be present in split map")
 
     if args.score_thr is not None:
         score_thr = float(args.score_thr)
@@ -139,7 +144,6 @@ def main(argv: Sequence[str] | None = None) -> int:
         val_gt_path, val_pred_path = (Path(p) for p in args.select_thr_on)
         if not args.split_map:
             parser.error("--select-thr-on requires --split-map")
-        split_data = _load_json(args.split_map)
         split_images = split_data.get("images", {})
         val_gt = _load_json(val_gt_path)
         if not val_gt.get("images"):
@@ -150,15 +154,14 @@ def main(argv: Sequence[str] | None = None) -> int:
                 parser.error("Every threshold selection image must belong to val (or explicitly allowed train)")
         from freestyle.eval.metrics import load_groups_map
         selection_groups = set(load_groups_map(val_gt, split_data).values())
-        if any(image.get("file_name") not in split_images for image in gt_coco.get("images", [])):
-            parser.error("Every evaluation image must be present in split map")
         test_images = [image for image in gt_coco.get("images", [])
-                       if split_images.get(image.get("file_name")) == "test"]
+                       if split_images.get(image.get("file_name")) != "val"]
         test_groups = set(load_groups_map({"images": test_images}, split_data).values())
         if selection_groups & test_groups:
             parser.error("Threshold selection groups overlap test groups")
         val_pred = _load_json(val_pred_path)
-        val_loc = compute_localization_metrics(val_gt, val_pred, score_thr=None, include_best_f1=True)
+        val_loc = compute_localization_metrics(val_gt, val_pred, score_thr=None, include_best_f1=True,
+                                               allow_unknown_images=args.allow_unknown_images)
         score_thr = float(val_loc["best_f1_threshold"])
         score_thr_source = f"selected_on:{val_gt_path}"
 
