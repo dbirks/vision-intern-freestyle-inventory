@@ -20,3 +20,8 @@ viz_test_predictions/
 
 # Stray local images
 cat.jpg
+
+# Private Freestyle data and run outputs (never commit)
+data/
+runs/
+artifacts/
