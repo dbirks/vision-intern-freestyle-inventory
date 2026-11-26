@@ -21,8 +21,9 @@ from __future__ import annotations
 
 import argparse
 import json
-import warnings
+import math
 import re
+import warnings
 from pathlib import Path
 from typing import Any
 
@@ -238,19 +239,56 @@ def _build_judge_prompt_coco(
     )
 
 
+def _safe_float(value: Any, default: float = 0.0) -> float:
+    if value is None:
+        return default
+    try:
+        v = float(value)
+        return v if math.isfinite(v) else default
+    except (TypeError, ValueError):
+        return default
+
+
 def _parse_verdicts(text: str) -> dict[int, dict]:
     # LFM3 reasons before answering; only the final answer contains verdicts.
     if "</think>" in text:
         text = text.rsplit("</think>", 1)[1]
     elif "<think>" in text:
         return {}  # Generation ended before a final answer.
-    match = re.search(r"\[.*\]", text, re.DOTALL)
-    if not match:
+
+    decoder = json.JSONDecoder()
+    raw: list | None = None
+    fallback_empty = False
+    pos = 0
+    while (idx := text.find("[", pos)) != -1:
+        try:
+            obj, end = decoder.raw_decode(text, idx)
+            if isinstance(obj, list):
+                if any(isinstance(x, dict) and "id" in x for x in obj):
+                    raw = obj
+                    break
+                if not obj:
+                    fallback_empty = True
+            pos = end
+        except json.JSONDecodeError:
+            pos = idx + 1
+
+    if raw is None and fallback_empty:
         return {}
-    try:
-        raw = json.loads(match.group())
-    except json.JSONDecodeError:
-        return {}
+
+    if raw is None:
+        # Salvage complete verdict objects from truncated or noisy outputs.
+        raw = []
+        pos = 0
+        while (idx := text.find("{", pos)) != -1:
+            try:
+                obj, end = decoder.raw_decode(text, idx)
+                if isinstance(obj, dict):
+                    raw.append(obj)
+                pos = end
+            except json.JSONDecodeError:
+                pos = idx + 1
+
     out: dict[int, dict] = {}
     for item in raw:
         if not isinstance(item, dict):
@@ -270,14 +308,44 @@ def _parse_verdicts(text: str) -> dict[int, dict]:
         except (TypeError, ValueError):
             continue
         out[idx] = {
-            "verdict": item.get("verdict", "unjudged"),
-            "score": float(item.get("score", 0.0)),
-            "reason": item.get("reason", ""),
+            "verdict": str(item.get("verdict") or "unjudged"),
+            "score": _safe_float(item.get("score"), 0.0),
+            "reason": str(item.get("reason") or ""),
         }
     return out
 
 
+# Missing verdicts default to "unjudged" (score 0.0) so downstream callers can
+# distinguish unparsed/skipped items from explicit model rejections.
 _NO_VERDICT = {"verdict": "unjudged", "score": 0.0, "reason": "no verdict"}
+_INVALID_BOX_VERDICT = {
+    "verdict": "invalid_box",
+    "score": 0.0,
+    "reason": "invalid or out-of-bounds box",
+}
+
+
+def _sanitize_bbox(
+    bbox: Any, width: int, height: int,
+) -> tuple[float, float, float, float] | None:
+    """Validate and clamp an xyxy bbox to image bounds; return None if invalid/OOB."""
+    if not isinstance(bbox, (list, tuple)) or len(bbox) < 4:
+        return None
+    try:
+        x1, y1, x2, y2 = (float(v) for v in bbox[:4])
+    except (TypeError, ValueError):
+        return None
+    if not all(math.isfinite(v) for v in (x1, y1, x2, y2)):
+        return None
+    if x2 <= x1 or y2 <= y1:
+        return None
+    cx1 = max(0.0, min(float(width), x1))
+    cy1 = max(0.0, min(float(height), y1))
+    cx2 = max(0.0, min(float(width), x2))
+    cy2 = max(0.0, min(float(height), y2))
+    if cx2 <= cx1 or cy2 <= cy1:
+        return None
+    return (cx1, cy1, cx2, cy2)
 
 
 # ------------------------------------------------------------------
@@ -286,27 +354,73 @@ _NO_VERDICT = {"verdict": "unjudged", "score": 0.0, "reason": "no verdict"}
 # ------------------------------------------------------------------
 
 def _crop_sheet(image: Image.Image, detections: list[dict]) -> Image.Image:
-    """Make numbered, padded crops from the original pixels."""
-    import math
+    """Make numbered, padded crops with drawn box outlines from the original pixels."""
     from PIL import ImageDraw
 
-    crops = []
+    from tools.bbox_viz import COLORS, FALLBACK_COLOR
+
+    crops: list[tuple[Image.Image, str]] = []
     for det in detections:
-        x1, y1, x2, y2 = det["bbox"]
-        pad_x, pad_y = (x2 - x1) * 0.15, (y2 - y1) * 0.15
-        box = (max(0, int(x1 - pad_x)), max(0, int(y1 - pad_y)),
-               min(image.width, math.ceil(x2 + pad_x)), min(image.height, math.ceil(y2 + pad_y)))
-        crop = image.crop(box).convert("RGB")
+        label = str(det.get("label") or "?")
+        clamped = _sanitize_bbox(det.get("bbox"), image.width, image.height)
+        if clamped is None:
+            placeholder = Image.new("RGB", (256, 256), "#E5E7EB")
+            pdraw = ImageDraw.Draw(placeholder)
+            pdraw.text((12, 120), "invalid_box", fill="black")
+            crops.append((placeholder, label))
+            continue
+        cx1, cy1, cx2, cy2 = clamped
+        pad_x, pad_y = (cx2 - cx1) * 0.15, (cy2 - cy1) * 0.15
+        bx1 = max(0, math.floor(cx1 - pad_x))
+        by1 = max(0, math.floor(cy1 - pad_y))
+        bx2 = min(image.width, math.ceil(cx2 + pad_x))
+        by2 = min(image.height, math.ceil(cy2 + pad_y))
+        crop = image.crop((bx1, by1, bx2, by2)).convert("RGB")
+        cw, ch = crop.size
         crop.thumbnail((256, 256))
-        crops.append(crop)
-    cols = math.ceil(math.sqrt(len(crops)))
-    sheet = Image.new("RGB", (cols * 276, math.ceil(len(crops) / cols) * 286), "white")
+        sx = crop.width / cw if cw else 1.0
+        sy = crop.height / ch if ch else 1.0
+        rx1 = max(0.0, (cx1 - bx1) * sx)
+        ry1 = max(0.0, (cy1 - by1) * sy)
+        rx2 = min(float(crop.width - 1), (cx2 - bx1) * sx)
+        ry2 = min(float(crop.height - 1), (cy2 - by1) * sy)
+        cdraw = ImageDraw.Draw(crop)
+        color = COLORS.get(label, FALLBACK_COLOR)
+        if rx2 >= rx1 and ry2 >= ry1:
+            cdraw.rectangle([rx1, ry1, rx2, ry2], outline=color, width=3)
+        crops.append((crop, label))
+    cols = max(1, math.ceil(math.sqrt(len(crops))))
+    rows = max(1, math.ceil(len(crops) / cols))
+    sheet = Image.new("RGB", (cols * 276, rows * 286), "white")
     draw = ImageDraw.Draw(sheet)
-    for i, crop in enumerate(crops):
+    for i, (crop, label) in enumerate(crops):
         x, y = (i % cols) * 276, (i // cols) * 286
-        draw.text((x + 5, y + 2), f"#{i}", fill="black")
+        draw.text((x + 5, y + 2), f"#{i} {label}"[:34], fill="black")
         sheet.paste(crop, (x + 10, y + 20))
     return sheet
+
+
+def _prepare_crop_chunks(
+    img: Image.Image,
+    detections: list[dict],
+    chunk_size: int,
+) -> tuple[list[tuple[list[int], Image.Image, list[dict]]], list[dict]]:
+    """Sanitize boxes for crop mode, returning (valid_chunks, invalid_verdicts)."""
+    valid: list[tuple[int, dict]] = []
+    invalid: list[dict] = []
+    for orig_idx, det in enumerate(detections):
+        clamped = _sanitize_bbox(det.get("bbox"), img.width, img.height)
+        if clamped is None:
+            invalid.append({"detection_idx": orig_idx, **_INVALID_BOX_VERDICT})
+        else:
+            valid.append((orig_idx, {**det, "bbox": list(clamped)}))
+    chunks: list[tuple[list[int], Image.Image, list[dict]]] = []
+    for start in range(0, len(valid), chunk_size):
+        slice_items = valid[start:start + chunk_size]
+        orig_indices = [idx for idx, _ in slice_items]
+        chunk_dets = [det for _, det in slice_items]
+        chunks.append((orig_indices, _crop_sheet(img, chunk_dets), chunk_dets))
+    return chunks, invalid
 
 
 def score_detections(
@@ -340,15 +454,31 @@ def score_detections(
         raise ValueError("judge_mode must be overlay or crops")
     if judge_batch_size is not None and judge_batch_size <= 0:
         raise ValueError("judge_batch_size must be positive")
-    if judge_batch_size is not None or judge_mode == "crops":
-        size = judge_batch_size or len(detections)
+    if judge_mode == "crops":
+        size = judge_batch_size or 16
+        chunks, invalid = _prepare_crop_chunks(img, detections, size)
+        results: list[dict] = list(invalid)
+        for orig_indices, sheet, chunk_dets in chunks:
+            verdicts = score_detections(
+                img, chunk_dets, model_id, backend=backend, base_url=base_url, api_key=api_key,
+                overlay_img=sheet, class_descriptions=class_descriptions,
+                max_tokens=max_tokens, max_dimension=max_dimension,
+                image_format=image_format, jpeg_quality=jpeg_quality,
+            )
+            results.extend(
+                {**v, "detection_idx": orig_indices[v["detection_idx"]]}
+                for v in verdicts
+            )
+        results.sort(key=lambda v: v["detection_idx"])
+        return results
+    if judge_batch_size is not None:
+        size = judge_batch_size
         results = []
         for start in range(0, len(detections), size):
             chunk = detections[start:start + size]
-            sheet = _crop_sheet(img, chunk) if judge_mode == "crops" else None
             verdicts = score_detections(
                 img, chunk, model_id, backend=backend, base_url=base_url, api_key=api_key,
-                overlay_img=sheet, class_descriptions=class_descriptions,
+                overlay_img=None, class_descriptions=class_descriptions,
                 max_tokens=max_tokens, max_dimension=max_dimension,
                 image_format=image_format, jpeg_quality=jpeg_quality,
             )
@@ -398,6 +528,15 @@ def score_detections_batch(
     api_key: str | None,
     class_descriptions: dict[str, str] | None = None,
     batch_size: int = 8,
+    judge_batch_size: int | None = None,
+    judge_mode: str = "overlay",
+    max_tokens: int | None = None,
+    max_dimension: int | None = 1280,
+    image_format: str | None = None,
+    jpeg_quality: int = 85,
+    temperature: float = 0,
+    top_p: float = 1,
+    seed: int | None = None,
 ) -> list[list[dict]]:
     """Run a single judge over many images, batched on the GPU.
 
@@ -412,48 +551,82 @@ def score_detections_batch(
     judge so the small judge models run many images per ``generate`` call
     instead of one at a time.
     """
+    if judge_mode not in ("overlay", "crops"):
+        raise ValueError("judge_mode must be overlay or crops")
+    if judge_batch_size is not None and judge_batch_size <= 0:
+        raise ValueError("judge_batch_size must be positive")
     from tools.d1 import is_d1
     if is_d1(model_id):
         return [score_detections(img, dets, model_id, backend=backend,
                                 base_url=base_url, api_key=api_key,
-                                overlay_img=overlay, class_descriptions=class_descriptions)
+                                overlay_img=overlay, class_descriptions=class_descriptions,
+                                judge_batch_size=judge_batch_size, judge_mode=judge_mode,
+                                max_tokens=max_tokens, max_dimension=max_dimension,
+                                image_format=image_format, jpeg_quality=jpeg_quality)
                 for img, dets, overlay in items]
 
-    results: list[list[dict] | None] = [None] * len(items)
+    per_item_verdicts: list[list[dict]] = [[] for _ in items]
 
-    # Collect the images that actually have boxes to score; render overlays.
-    pending: list[tuple[int, Image.Image, list[dict]]] = []
+    # Collect chunks that need model evaluation.
+    pending: list[tuple[int, list[int], Image.Image, list[dict]]] = []
     for idx, (img, dets, overlay) in enumerate(items):
         if not dets:
-            results[idx] = []
             continue
-        if overlay is None:
+        if judge_mode == "crops":
+            size = judge_batch_size or 16
+            chunks, invalid = _prepare_crop_chunks(img, dets, size)
+            per_item_verdicts[idx].extend(invalid)
+            for orig_indices, sheet, chunk_dets in chunks:
+                pending.append((idx, orig_indices, sheet, chunk_dets))
+        elif judge_batch_size is not None:
             from tools.bbox_viz import draw_detections
-            overlay = draw_detections(img, dets, show_index=True)
-        elif not isinstance(overlay, Image.Image):
-            overlay = load_image(overlay)
-        pending.append((idx, overlay, dets))
+            for start in range(0, len(dets), judge_batch_size):
+                chunk_dets = dets[start:start + judge_batch_size]
+                orig_indices = list(range(start, start + len(chunk_dets)))
+                pending.append((
+                    idx, orig_indices,
+                    draw_detections(img, chunk_dets, show_index=True),
+                    chunk_dets,
+                ))
+        else:
+            if overlay is None:
+                from tools.bbox_viz import draw_detections
+                overlay = draw_detections(img, dets, show_index=True)
+            elif not isinstance(overlay, Image.Image):
+                overlay = load_image(overlay)
+            pending.append((idx, list(range(len(dets))), overlay, dets))
 
+    effective_max_tokens = max_tokens or (16384 if "lfm3-vl" in model_id.lower() else 1024)
     for start in range(0, len(pending), batch_size):
         chunk = pending[start:start + batch_size]
-        imgs = [overlay for _, overlay, _ in chunk]
+        imgs = [sheet for _, _, sheet, _ in chunk]
         prompts = [
-            _build_judge_prompt_overlay(dets, class_descriptions)
-            for _, _, dets in chunk
+            _build_judge_prompt_overlay(chunk_dets, class_descriptions)
+            for _, _, _, chunk_dets in chunk
         ]
         try:
             responses = run_vlm_batch(
                 imgs, prompts, model_id,
                 backend=backend, base_url=base_url, api_key=api_key,
-                max_tokens=16384 if "lfm3-vl" in model_id.lower() else 1024,
+                max_tokens=effective_max_tokens,
+                max_dimension=max_dimension, image_format=image_format,
+                jpeg_quality=jpeg_quality, temperature=temperature,
+                top_p=top_p, seed=seed,
             )
         except Exception as e:  # noqa: BLE001 — a dead judge must not abort the run
             print(f"\n  [warn] judge {model_id} batch failed: {e}")
             responses = ["[]"] * len(chunk)
-        for (idx, _, dets), response in zip(chunk, responses):
-            results[idx] = _verdicts_for(dets, response)
+        for (idx, orig_indices, _, chunk_dets), response in zip(chunk, responses):
+            if getattr(response, "finish_reason", None) == "length":
+                warnings.warn("VLM judge response was truncated", RuntimeWarning, stacklevel=2)
+            for v in _verdicts_for(chunk_dets, response):
+                per_item_verdicts[idx].append({
+                    **v, "detection_idx": orig_indices[v["detection_idx"]],
+                })
 
-    return [r if r is not None else [] for r in results]
+    for row in per_item_verdicts:
+        row.sort(key=lambda v: v["detection_idx"])
+    return per_item_verdicts
 
 
 def ensemble_row(
@@ -479,7 +652,7 @@ def ensemble_row(
             v = vmap.get(i, _NO_VERDICT)
             per_judge[label] = {
                 "verdict": v.get("verdict", "unjudged"),
-                "score": float(v.get("score", 0.0)),
+                "score": _safe_float(v.get("score", 0.0), 0.0),
                 "reason": v.get("reason", ""),
             }
             scores.append(per_judge[label]["score"])

@@ -29,7 +29,9 @@ from __future__ import annotations
 import argparse
 import json
 import math
+import re
 from collections import Counter, defaultdict
+from typing import Any
 BBOX_FORMATS = ("coco_xywh", "xyxy", "voc", "yolo", "tfod", "label_studio")
 
 
@@ -110,6 +112,18 @@ def convert_annotations(
     return out
 
 
+def bbox_iou(a: list[float], b: list[float]) -> float:
+    """Intersection over union for two xyxy boxes."""
+    inter = max(0, min(a[2], b[2]) - max(a[0], b[0])) * max(
+        0, min(a[3], b[3]) - max(a[1], b[1]))
+    union = (
+        max(0, a[2] - a[0]) * max(0, a[3] - a[1])
+        + max(0, b[2] - b[0]) * max(0, b[3] - b[1])
+        - inter
+    )
+    return inter / union if union > 0 else 0.0
+
+
 def containment(a: list[float], b: list[float]) -> float:
     """Intersection divided by the smaller box area, for xyxy boxes."""
     intersection = max(0, min(a[2], b[2]) - max(a[0], b[0])) * max(
@@ -119,22 +133,111 @@ def containment(a: list[float], b: list[float]) -> float:
     return intersection / min(area_a, area_b) if min(area_a, area_b) else 0.0
 
 
+def _bbox_area(det: dict) -> float:
+    a = det["bbox"]
+    return max(0.0, a[2] - a[0]) * max(0.0, a[3] - a[1])
+
+
+def normalize_label_key(value: Any) -> str:
+    """Canonical punctuation/underscore-stripped casefolded key for a label."""
+    return re.sub(r"[^\w]+|_", "", str(value or "").casefold())
+
+
+def build_label_resolver(
+    classes: list[str] | None = None,
+    aliases: dict[str, str] | None = None,
+):
+    """Build a label resolver handling exact matches, stripped keys, and chained aliases."""
+    exact_classes: dict[str, str] = {}
+    stripped_classes: dict[str, str] = {}
+    if classes is not None:
+        dedup = list(dict.fromkeys(classes))
+        counts = Counter(normalize_label_key(c) for c in dedup)
+        for c in dedup:
+            exact_classes.setdefault(c.casefold(), c)
+            k = normalize_label_key(c)
+            if counts[k] == 1:
+                stripped_classes[k] = c
+
+    def _match_class(name: str) -> str | None:
+        cf = name.casefold()
+        if cf in exact_classes:
+            return exact_classes[cf]
+        return stripped_classes.get(normalize_label_key(name))
+
+    alias_raw: dict[str, str] = {}
+    alias_stripped: dict[str, str] = {}
+    for alias, target in (aliases or {}).items():
+        alias_s, target_s = str(alias), str(target)
+        alias_raw[alias_s.casefold()] = target_s
+        alias_stripped.setdefault(normalize_label_key(alias_s), target_s)
+
+    def _lookup_alias(name: str) -> str | None:
+        cf = name.casefold()
+        if cf in alias_raw:
+            return alias_raw[cf]
+        return alias_stripped.get(normalize_label_key(name))
+
+    resolved_alias_exact: dict[str, str] = {}
+    resolved_alias_stripped: dict[str, str] = {}
+    for alias in (aliases or {}):
+        alias_s = str(alias)
+        cur = alias_s
+        visited: set[str] = set()
+        while True:
+            visited.add(cur.casefold())
+            target = _lookup_alias(cur)
+            if target is None:
+                raise ValueError(f"Alias target {cur!r} is not a class")
+            cls_match = _match_class(target) if classes is not None else None
+            if cls_match is not None:
+                resolved = cls_match
+                break
+            next_alias = _lookup_alias(target)
+            if next_alias is not None:
+                if target.casefold() in visited:
+                    raise ValueError(f"Cyclic alias involving {target!r}")
+                cur = target
+                continue
+            if classes is not None:
+                raise ValueError(f"Alias target {target!r} is not a class")
+            resolved = target
+            break
+        resolved_alias_exact[alias_s.casefold()] = resolved
+        resolved_alias_stripped.setdefault(normalize_label_key(alias_s), resolved)
+
+    def resolve(label: Any) -> str | None:
+        raw = str(label or "")
+        if classes is not None:
+            cls_match = _match_class(raw)
+            if cls_match is not None:
+                return cls_match
+        cf = raw.casefold()
+        if cf in resolved_alias_exact:
+            return resolved_alias_exact[cf]
+        return resolved_alias_stripped.get(normalize_label_key(raw))
+
+    return resolve
+
+
 def nms(detections: list[dict], iou_threshold: float = 0.5,
         containment_threshold: float = 0.9) -> list[dict]:
-    """Suppress same-label duplicate xyxy detections, preferring higher scores."""
-    ordered = sorted(detections, key=lambda d: d.get("score", 1.0), reverse=True)
+    """Suppress same-label duplicate xyxy detections, preferring higher scores and larger boxes."""
+    ordered = sorted(
+        detections,
+        key=lambda d: (d.get("score", 1.0), _bbox_area(d)),
+        reverse=True,
+    )
     kept = []
     for det in ordered:
         a = det["bbox"]
+        det_label = str(det.get("label") or "").casefold()
         duplicate = False
         for other in kept:
-            if det.get("label", "").casefold() != other.get("label", "").casefold():
+            if det_label != str(other.get("label") or "").casefold():
                 continue
             b = other["bbox"]
-            inter = max(0, min(a[2], b[2]) - max(a[0], b[0])) * max(
-                0, min(a[3], b[3]) - max(a[1], b[1]))
-            union = ((a[2]-a[0])*(a[3]-a[1]) + (b[2]-b[0])*(b[3]-b[1]) - inter)
-            if (union > 0 and inter / union >= iou_threshold) or (
+            if bbox_iou(a, b) >= iou_threshold or (
                 containment(a, b) >= containment_threshold
             ):
                 duplicate = True

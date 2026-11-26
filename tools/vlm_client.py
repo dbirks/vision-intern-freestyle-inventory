@@ -21,6 +21,7 @@ import io
 import json
 import os
 import threading
+from pathlib import Path
 from typing import Any
 
 from PIL import Image
@@ -40,6 +41,7 @@ class VLMResponse(str):
 # Cached OpenAI clients keyed by (base_url, api_key).
 _openai_clients: dict[tuple[str, str], Any] = {}
 _client_lock = threading.Lock()
+_log_lock = threading.Lock()
 
 HF_INFERENCE_URL = "https://router.huggingface.co/v1"
 
@@ -183,13 +185,55 @@ def _load_vlm(model_id: str) -> tuple[Any, Any]:
     return model, processor
 
 
+def _extract_eos_ids(model: Any, processor: Any) -> set[int]:
+    """Collect EOS token IDs from generation config or tokenizer when available."""
+    raw = getattr(getattr(model, "generation_config", None), "eos_token_id", None)
+    if raw is None:
+        raw = getattr(getattr(processor, "tokenizer", None), "eos_token_id", None)
+    if raw is None:
+        raw = getattr(processor, "eos_token_id", None)
+    if raw is None:
+        return set()
+    if isinstance(raw, (list, tuple, set)):
+        return {int(x) for x in raw if x is not None}
+    return {int(raw)}
+
+
+def _extract_pad_id(model: Any, processor: Any) -> int | None:
+    """Return pad token ID from generation config or tokenizer when available."""
+    pad = getattr(getattr(model, "generation_config", None), "pad_token_id", None)
+    if pad is None:
+        pad = getattr(getattr(processor, "tokenizer", None), "pad_token_id", None)
+    if pad is None:
+        pad = getattr(processor, "pad_token_id", None)
+    return int(pad) if pad is not None else None
+
+
+def _derive_finish_reason(
+    seq: Any, max_tokens: int, eos_ids: set[int], pad_id: int | None,
+) -> str | None:
+    """Derive OpenAI-style finish_reason ('length' or 'stop') for a generated sequence."""
+    try:
+        tokens = seq.tolist() if hasattr(seq, "tolist") else list(seq)
+    except TypeError:
+        return None
+    if pad_id is not None and pad_id not in eos_ids:
+        while tokens and tokens[-1] == pad_id:
+            tokens.pop()
+    if any(t in eos_ids for t in tokens):
+        return "stop"
+    if len(tokens) >= max_tokens:
+        return "length"
+    return "stop"
+
+
 def _run_transformers_batch(
     images: list[Image.Image],
     prompts: list[str],
     model_id: str,
     max_tokens: int,
     temperature: float = 0, top_p: float = 1, seed: int | None = None,
-) -> list[str]:
+) -> list[VLMResponse]:
     """Generate for a *batch* of (image, prompt) pairs in one forward pass.
 
     This is the throughput path for the GPU judge jobs: the small judge models
@@ -235,8 +279,15 @@ def _run_transformers_batch(
     with torch.inference_mode():
         out = model.generate(**inputs, max_new_tokens=max_tokens, **generation_kwargs)
 
-    gen = out[:, inputs["input_ids"].shape[1]:]
-    return processor.batch_decode(gen, skip_special_tokens=True)
+    sequences = getattr(out, "sequences", out)
+    gen = sequences[:, inputs["input_ids"].shape[1]:]
+    texts = processor.batch_decode(gen, skip_special_tokens=True)
+    eos_ids = _extract_eos_ids(model, processor)
+    pad_id = _extract_pad_id(model, processor)
+    return [
+        VLMResponse(text, _derive_finish_reason(seq, max_tokens, eos_ids, pad_id))
+        for text, seq in zip(texts, gen)
+    ]
 
 
 def _run_transformers(
@@ -245,10 +296,24 @@ def _run_transformers(
     model_id: str,
     max_tokens: int,
     temperature: float = 0, top_p: float = 1, seed: int | None = None,
-) -> str:
+) -> VLMResponse:
     return _run_transformers_batch(
         [image], [prompt], model_id, max_tokens, temperature, top_p, seed,
     )[0]
+
+
+def _append_raw_log(raw_response_log: str | os.PathLike, response: Any) -> None:
+    record = {
+        "response": str(response),
+        "finish_reason": getattr(response, "finish_reason", None),
+        "usage": getattr(response, "usage", None),
+    }
+    line = json.dumps(record) + "\n"
+    path = Path(raw_response_log)
+    with _log_lock:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        with open(path, "a", encoding="utf-8") as log:
+            log.write(line)
 
 
 # ------------------------------------------------------------------
@@ -322,10 +387,7 @@ def run_vlm(
     else:
         raise ValueError(f"Unknown backend {backend!r}. Use 'openai' or 'transformers'.")
     if raw_response_log is not None:
-        record = {"response": str(response), "finish_reason": getattr(response, "finish_reason", None),
-                  "usage": getattr(response, "usage", None)}
-        with open(raw_response_log, "a", encoding="utf-8") as log:
-            log.write(json.dumps(record) + "\n")
+        _append_raw_log(raw_response_log, response)
     return response
 
 
@@ -337,6 +399,14 @@ def run_vlm_batch(
     base_url: str | None = None,
     api_key: str | None = None,
     max_tokens: int = 4096,
+    max_dimension: int | None = 1280,
+    image_format: str | None = None,
+    jpeg_quality: int = 85,
+    temperature: float = 0,
+    top_p: float = 1,
+    seed: int | None = None,
+    extra_body: dict | None = None,
+    raw_response_log: str | os.PathLike | None = None,
 ) -> list[str]:
     """Run a VLM over a *batch* of (image, prompt) pairs; one response each.
 
@@ -348,6 +418,8 @@ def run_vlm_batch(
     *images* and *prompts* must be the same length; the returned list is aligned
     with them.
     """
+    if temperature < 0 or not 0 < top_p <= 1:
+        raise ValueError("temperature must be nonnegative and top_p in (0, 1]")
     if len(images) != len(prompts):
         raise ValueError(
             f"images ({len(images)}) and prompts ({len(prompts)}) must match",
@@ -355,12 +427,25 @@ def run_vlm_batch(
     if not images:
         return []
     if backend == "transformers":
-        return _run_transformers_batch(images, prompts, model_id, max_tokens)
-    if backend == "openai":
-        return [
-            _run_openai(img, prompt, model_id, base_url, api_key, max_tokens)
+        if extra_body:
+            raise ValueError("extra_body is only supported by the openai backend")
+        responses = _run_transformers_batch(
+            images, prompts, model_id, max_tokens, temperature, top_p, seed,
+        )
+    elif backend == "openai":
+        responses = [
+            _run_openai(
+                img, prompt, model_id, base_url, api_key, max_tokens,
+                max_dimension, image_format, jpeg_quality,
+                temperature, top_p, seed, extra_body,
+            )
             for img, prompt in zip(images, prompts)
         ]
-    raise ValueError(
-        f"Unknown backend {backend!r}. Use 'openai' or 'transformers'."
-    )
+    else:
+        raise ValueError(
+            f"Unknown backend {backend!r}. Use 'openai' or 'transformers'."
+        )
+    if raw_response_log is not None:
+        for resp in responses:
+            _append_raw_log(raw_response_log, resp)
+    return responses

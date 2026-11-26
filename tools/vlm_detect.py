@@ -123,6 +123,44 @@ def denormalize_bbox(
     ]
 
 
+def _is_edge_truncated(
+    bbox: list[int],
+    region: tuple[int, int, int, int],
+    img_rect: tuple[int, int, int, int],
+    margin: int = 4,
+) -> bool:
+    """Return True if *bbox* touches an internal edge of *region*."""
+    x1, y1, x2, y2 = bbox
+    rx1, ry1, rx2, ry2 = region
+    ix1, iy1, ix2, iy2 = img_rect
+    mx = min(margin, max(0, (rx2 - rx1) // 4))
+    my = min(margin, max(0, (ry2 - ry1) // 4))
+    return (
+        (rx1 > ix1 and x1 <= rx1 + mx)
+        or (ry1 > iy1 and y1 <= ry1 + my)
+        or (rx2 < ix2 and x2 >= rx2 - mx)
+        or (ry2 < iy2 and y2 >= ry2 - my)
+    )
+
+
+def _quadrants(
+    region: tuple[int, int, int, int],
+    tile_overlap: float,
+) -> tuple[tuple[int, int, int, int], ...]:
+    """Split *region* into four quadrants overlapping by *tile_overlap*."""
+    x, y, right, bottom = region
+    mx, my = (x + right) // 2, (y + bottom) // 2
+    rw, rh = right - x, bottom - y
+    pad_x = min(round(rw * tile_overlap / 2), max(0, right - mx - 1), max(0, mx - x - 1))
+    pad_y = min(round(rh * tile_overlap / 2), max(0, bottom - my - 1), max(0, my - y - 1))
+    return (
+        (x, y, mx + pad_x, my + pad_y),
+        (mx - pad_x, y, right, my + pad_y),
+        (x, my - pad_y, mx + pad_x, bottom),
+        (mx - pad_x, my - pad_y, right, bottom),
+    )
+
+
 # ------------------------------------------------------------------
 # Public API
 # ------------------------------------------------------------------
@@ -141,6 +179,7 @@ def vlm_detect(
     tile: int | None = None, tile_overlap: float = 0.2, n_samples: int = 1,
     temperature: float = 0, top_p: float = 1, seed: int | None = None,
     extra_body: dict | None = None, raw_response_log: str | None = None,
+    label_aliases: dict[str, str] | None = None,
 ) -> list[dict]:
     """Detect objects in *image* using a VLM with a free-form prompt.
 
@@ -174,6 +213,9 @@ def vlm_detect(
         Additional OpenAI-compatible request fields.
     raw_response_log : str or Path, optional
         Append each response and its finish reason and usage as JSONL.
+    label_aliases : dict[str, str], optional
+        Optional alias-to-class mapping normalized prior to cross-tile NMS
+        and multi-sample consensus.
 
     Returns
     -------
@@ -232,10 +274,33 @@ def vlm_detect(
         raise ValueError("tile must be positive")
     if not 0 <= tile_overlap < 1 or n_samples < 1:
         raise ValueError("tile_overlap must be in [0, 1) and n_samples positive")
-    from .bbox_utils import containment, nms
+    from .bbox_utils import (
+        bbox_iou,
+        build_label_resolver,
+        nms,
+        normalize_label_key,
+    )
+
+    label_resolver = (
+        build_label_resolver(classes, label_aliases)
+        if (classes is not None or label_aliases is not None)
+        else None
+    )
+    img_rect = (0, 0, w, h)
+    seen_surface: dict[str, str] = {}
 
     class DetectionList(list):
         truncated = False
+        did_split = False
+
+    def _canonicalize_label(raw_label: str, unify_unmatched: bool) -> str:
+        if label_resolver is not None:
+            resolved = label_resolver(raw_label)
+            if resolved is not None:
+                return resolved
+        if unify_unmatched:
+            return seen_surface.setdefault(normalize_label_key(raw_label), raw_label)
+        return raw_label
 
     def detect_region(region: tuple[int, int, int, int], retry: bool,
                       sample_seed: int | None) -> DetectionList:
@@ -249,10 +314,9 @@ def vlm_detect(
         )
         truncated = getattr(response, "finish_reason", None) == "length"
         if truncated and retry and right - x > 1 and bottom - y > 1:
-            mx, my = (x + right) // 2, (y + bottom) // 2
             result = DetectionList()
-            for box in ((x, y, mx, my), (mx, y, right, my),
-                        (x, my, mx, bottom), (mx, my, right, bottom)):
+            result.did_split = True
+            for box in _quadrants(region, tile_overlap):
                 part = detect_region(box, False, sample_seed)
                 result.extend(part)
                 result.truncated |= part.truncated
@@ -267,9 +331,16 @@ def vlm_detect(
             bbox = denormalize_bbox(raw, right - x, bottom - y)
             if len(bbox) != 4 or bbox[2] <= bbox[0] or bbox[3] <= bbox[1]:
                 continue
-            result.append({"bbox": [bbox[0] + x, bbox[1] + y, bbox[2] + x, bbox[3] + y],
-                           "label": str(obj.get("label", "")),
-                           "sub_label": str(obj.get("sub_label") or "")})
+            mapped = [bbox[0] + x, bbox[1] + y, bbox[2] + x, bbox[3] + y]
+            if tile_overlap > 0 and _is_edge_truncated(mapped, region, img_rect):
+                continue
+            raw_label = str(obj.get("label") or "")
+            unify = tile is not None or n_samples > 1 or not retry
+            result.append({
+                "bbox": mapped,
+                "label": _canonicalize_label(raw_label, unify_unmatched=unify),
+                "sub_label": str(obj.get("sub_label") or ""),
+            })
         return result
 
     def starts(length: int) -> list[int]:
@@ -282,14 +353,18 @@ def vlm_detect(
     truncated = False
     for sample_index in range(n_samples):
         detections = []
+        did_split = False
         for y in starts(h):
             for x in starts(w):
-                part = detect_region((x, y, min(w, x + (tile or w)),
-                                      min(h, y + (tile or h))), tile is not None,
-                                     None if seed is None else seed + sample_index)
+                part = detect_region(
+                    (x, y, min(w, x + (tile or w)), min(h, y + (tile or h))),
+                    True,
+                    None if seed is None else seed + sample_index,
+                )
                 truncated |= part.truncated
+                did_split |= part.did_split
                 detections.extend(part)
-        samples.append(nms(detections) if tile is not None else detections)
+        samples.append(nms(detections) if (tile is not None or did_split) else detections)
     result = DetectionList()
     result.truncated = truncated
     if n_samples == 1:
@@ -300,7 +375,7 @@ def vlm_detect(
         for det in detections:
             match = next((c for c in clusters if sample_index not in c["samples"]
                           and c["det"]["label"].casefold() == det["label"].casefold()
-                          and containment(c["det"]["bbox"], det["bbox"]) >= 0.7), None)
+                          and bbox_iou(c["det"]["bbox"], det["bbox"]) >= 0.5), None)
             if match is None:
                 clusters.append({"det": det, "samples": {sample_index}})
             else:

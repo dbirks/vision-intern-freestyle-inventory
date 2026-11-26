@@ -19,6 +19,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import re
 from pathlib import Path
 from typing import Any
@@ -26,6 +27,7 @@ from typing import Any
 from PIL import Image
 from tqdm import tqdm
 
+from tools.bbox_utils import build_label_resolver
 from tools.utils import load_image
 from tools.vlm_detect import vlm_detect
 
@@ -39,23 +41,70 @@ def _is_local_dir(source: str | Path) -> bool:
 
 def _normalize_detections(detections: list[dict], classes: list[str],
                           aliases: dict[str, str] | None, keep_unmatched: bool) -> list[dict]:
-    def key(value: str) -> str:
-        return re.sub(r"[^\w]+|_", "", value.casefold())
-    canonical = {key(c): c for c in classes}
-    for alias, target in (aliases or {}).items():
-        if key(target) not in canonical:
-            raise ValueError(f"Alias target {target!r} is not a class")
-        canonical[key(alias)] = canonical[key(target)]
+    """Normalize detection labels using punctuation-stripped canonical matching and aliases."""
+    resolve = build_label_resolver(classes, aliases)
     out = []
     for det in detections:
-        raw = det.get("label", "")
-        label = canonical.get(key(raw))
+        raw = str(det.get("label") or "")
+        label = resolve(raw)
         if label is None:
             if not keep_unmatched:
                 continue
-            label = "unmatched:" + raw
+            norm_unmatched = re.sub(
+                r"\s+", " ", re.sub(r"[^\w\s-]+", "", raw.casefold()),
+            ).strip()
+            label = f"unmatched:{norm_unmatched}"
         out.append({**det, "label": label})
     return out
+
+
+def _collect_local_images(
+    image_dir: Path,
+    recursive: bool,
+    image_paths: list[str] | None,
+) -> list[Path]:
+    """Collect image paths under *image_dir*, supporting symlinks and blocking traversal."""
+    if image_paths is not None:
+        root_abs = Path(os.path.abspath(image_dir))
+        seen: set[Path] = set()
+        out: list[Path] = []
+        for p in image_paths:
+            cand_abs = Path(os.path.abspath(image_dir / p))
+            if not cand_abs.is_relative_to(root_abs) or cand_abs == root_abs:
+                raise ValueError("image_paths must stay within source")
+            rel = cand_abs.relative_to(root_abs)
+            if rel not in seen:
+                seen.add(rel)
+                out.append(image_dir / rel)
+        return out
+    if not recursive:
+        return sorted(
+            p for p in image_dir.iterdir()
+            if p.is_file() and p.suffix.lower() in _IMAGE_EXT
+        )
+    found: list[Path] = []
+    seen_dirs: set[tuple[int, int]] = set()
+    for dirpath, dirnames, filenames in os.walk(image_dir, followlinks=True):
+        st = os.stat(dirpath)
+        dir_id = (st.st_dev, st.st_ino)
+        if dir_id in seen_dirs:
+            dirnames[:] = []
+            continue
+        seen_dirs.add(dir_id)
+        kept_dirs = []
+        for d in sorted(dirnames):
+            try:
+                dst = os.stat(os.path.join(dirpath, d))
+                if (dst.st_dev, dst.st_ino) not in seen_dirs:
+                    kept_dirs.append(d)
+            except OSError:
+                continue
+        dirnames[:] = kept_dirs
+        for fn in filenames:
+            p = Path(dirpath) / fn
+            if p.is_file() and p.suffix.lower() in _IMAGE_EXT:
+                found.append(p)
+    return sorted(found)
 
 
 # ------------------------------------------------------------------
@@ -73,11 +122,7 @@ def _label_local(
     detect_options: dict, aliases: dict | None, keep_unmatched: bool,
     recursive: bool, image_paths: list[str] | None, max_samples: int | None,
 ) -> dict:
-    image_files = ([image_dir / p for p in image_paths] if image_paths is not None else
-                   sorted(p for p in (image_dir.rglob("*") if recursive else image_dir.iterdir())
-                          if p.is_file() and p.suffix.lower() in _IMAGE_EXT))
-    if any(not p.resolve().is_relative_to(image_dir.resolve()) for p in image_files):
-        raise ValueError("image_paths must stay within source")
+    image_files = _collect_local_images(image_dir, recursive, image_paths)
     if max_samples is not None:
         image_files = image_files[:max_samples]
     if not image_files:
@@ -312,12 +357,13 @@ def label_dataset(
     """
     if n_samples > 1 and temperature == 0:
         raise ValueError("n_samples > 1 requires nonzero temperature for meaningful self-consistency")
-    classes_lower = [c.lower() for c in classes]
+    classes_lower = list(dict.fromkeys(c.lower() for c in classes))
     detect_options = dict(max_dimension=max_dimension, image_format=image_format,
                           jpeg_quality=jpeg_quality, max_tokens=max_tokens, tile=tile,
                           tile_overlap=tile_overlap, n_samples=n_samples,
                           temperature=temperature, top_p=top_p, seed=seed,
-                          extra_body=extra_body, raw_response_log=raw_response_log)
+                          extra_body=extra_body, raw_response_log=raw_response_log,
+                          label_aliases=label_aliases)
 
     if _is_local_dir(source):
         return _label_local(
