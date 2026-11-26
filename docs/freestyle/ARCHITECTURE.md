@@ -50,8 +50,12 @@ plus `runs/<exp>/meta.json` (`{"experiment": ..., "config": ..., "git_sha": ...,
 `uv run python -m freestyle.eval.evaluate --gt data/gt/<split>.json --pred runs/<exp>/predictions.json --out runs/<exp>/metrics.json`
 * Localization (class-agnostic): AP50, AP50:95, recall@IoU0.5 at the best-F1 threshold, precision there.
 * Identification: top-1 accuracy over GT boxes matched at IoU≥0.5 (excluding GT `unknown`), macro-F1 over classes.
-* Counting: per image per class |pred−gt| → per-image total-count MAE, per-class count MAE,
-  exact-inventory rate (fraction of images where every class count is correct).
+* Counting: count vector = 18 catalog classes + `unknown`; a predicted generic `cartridge` and any
+  identity below the identifier's threshold count as `unknown`. Per image per class |pred−gt| →
+  per-image total-count MAE, per-class count MAE, exact-inventory rate (every entry incl. `unknown`
+  matches), total-count exact rate.
+* Thresholds are selected on `val` images only (validated against `data/splits.json`); bootstrap
+  groups are required (no silent per-image fallback). Identification galleries use `train` only.
 * All metrics reported with the image list and bootstrap 95% CI over groups (tiny test set).
 
 ## Experiments
