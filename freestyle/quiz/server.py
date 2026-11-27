@@ -333,8 +333,10 @@ class QuizStore:
             deferred = []
             for i, question in enumerate(self.questions):
                 image_id = question["image_id"]
-                count = next(q for q in self.by_image[image_id] if q["kind"] == COUNT)
-                count_answer = self._answered.get(count["qid"], {}).get("answer", {}).get("result")
+                # Train-only images have crop questions but no count question.
+                count = next((q for q in self.by_image[image_id] if q["kind"] == COUNT), None)
+                count_answer = (self._answered.get(count["qid"], {}).get("answer", {}).get("result")
+                                if count else None)
                 if count_answer == "skip":
                     if question["kind"] == COUNT and skips.get(image_id) == 1:
                         deferred.append(i)
