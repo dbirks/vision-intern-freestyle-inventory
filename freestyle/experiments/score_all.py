@@ -51,7 +51,7 @@ def build_human_gt(
             for q in qs
         )
         fraction = answered / len(qs) if qs else 0.0
-        if fraction < 0.8 or image['attributes']['human_counts'] is None:
+        if (fraction < 0.8 and image['attributes'].get('usable', True)) or image['attributes']['human_counts'] is None:
             excluded.append({'image_id': image_id, 'answered': answered,
                              'questions': len(qs), 'fraction': fraction,
                              'reason': 'below_80_percent' if fraction < 0.8 else 'missing_count'})
@@ -92,7 +92,13 @@ def demo_answers(queue, path):
 def grouped_predictions(predictions):
     result = defaultdict(list)
     for pred in predictions:
-        result[int(pred['image_id'])].append(dict(pred))
+        box = pred.get('bbox', [])
+        if len(box) != 4 or not all(np.isfinite(box)) or box[2] <= 0 or box[3] <= 0:
+            continue
+        key = pred['image_id']
+        if isinstance(key, str) and key.isdecimal():
+            key = int(key)
+        result[key].append(dict(pred))
     return result
 
 
@@ -234,21 +240,26 @@ def geometry(boxes, height):
 
 
 def prepare_rows(rows, image, score_thr, identity_thr, pair, with_shelves=True):
-    rows = [dict(r) for r in rows if float(r['score']) >= score_thr]
+    rows = [dict(r) for r in rows if float(r['score']) >= score_thr
+            and len(r['bbox']) == 4 and all(np.isfinite(r['bbox']))
+            and r['bbox'][2] > 0 and r['bbox'][3] > 0]
     for row in rows:
-        if row['identity_score'] < identity_thr:
+        if row['identity_score'] < identity_thr or row['class'] == 'cartridge':
             row['class'] = 'unknown'
+            row['family'] = None
+            row['part'] = None
         row['box'] = xyxy(row['bbox'])
         match = re.match(r'(.+)-part([12])$', row['class'])
         if match and not row.get('family'):
-            row.update(family=match.group(1), part=int(match.group(2)),
-                       family_confidence=row['identity_score'], part_confidence=row['identity_score'])
+            row.update(family=match.group(1), part=None,
+                       family_confidence=row['identity_score'], part_confidence=0.)
     if rows and (with_shelves or pair and any(r.get('family') for r in rows)):
         boxes = tuple(tuple(r['box']) for r in rows)
         for row, (shelf, column, tier, label) in zip(rows, geometry(boxes, image['height']), strict=True):
             row.update(shelf_idx=shelf, column_idx=column, tier=tier, shelf_name=label)
         if pair:
-            rows = infer_pairs(rows, mode='apply')
+            rows = infer_pairs(rows, mode='apply', family_threshold=identity_thr,
+                               part_threshold=identity_thr)
     return rows
 
 
@@ -259,14 +270,15 @@ def per_image(image, gt_anns, rows, counts, category_names, none):
     errors = {c: abs(predicted.get(c, 0) - actual.get(c, 0))
               for c in set(actual) | set(predicted)}
     gt_boxes = [a['bbox'] for a in gt_anns]
-    matches = match_boxes([r['bbox'] for r in rows], gt_boxes, iou_thr=.5).matches
+    matches = match_boxes([r['bbox'] for r in rows], gt_boxes, iou_thr=.5,
+                          pred_scores=[float(r['score']) for r in rows]).matches
     correct = sum(rows[p]['class'] == category_names.get(gt_anns[g]['category_id'])
                   for p, g, _ in matches if category_names.get(gt_anns[g]['category_id']) != 'unknown')
     eligible = sum(category_names.get(gt_anns[g]['category_id']) != 'unknown' for _, g, _ in matches)
     return {'total_error': abs(len(rows) - human['total']),
             'top_error': abs(sum(r['shelf_name'] == 'top' for r in rows) - human['top']),
             'bottom_error': abs(sum(r['shelf_name'] == 'bottom' for r in rows) - human['bottom']),
-            'class_errors': None if none else errors,
+            'class_errors': None if none or not counts['verified'] or counts['counts_mismatch'] else errors,
             'exact_inventory': None if none or not counts['verified'] or counts['counts_mismatch'] else int(not any(errors.values())),
             'id_correct': None if none else correct, 'id_n': None if none else eligible}
 
@@ -282,7 +294,8 @@ def aggregate(records, indices, classes, none):
         result['exact_inventory'] = float(np.mean(exact)) if exact else None
         n = sum(r['id_n'] for r in sample)
         result['identity_accuracy'] = sum(r['id_correct'] for r in sample) / n if n else None
-        result.update({f'class:{c}': float(np.mean([r['class_errors'].get(c, 0) for r in sample]))
+        eligible = [r['class_errors'] for r in sample if r['class_errors'] is not None]
+        result.update({f'class:{c}': float(np.mean([r.get(c, 0) for r in eligible])) if eligible else None
                        for c in classes})
     return result
 
@@ -292,26 +305,27 @@ def score_subset(images, gt, counts, rows_by_image, score_thr, identity_thr, pai
     for ann in gt['annotations']:
         annotations[ann['image_id']].append(ann)
     names = {c['id']: c['name'] for c in gt['categories']}
-    classes = sorted({c for image in images for c in counts['images'][image['file_name']]['classes']})
     records = []
-    loc_preds = []
     for image in images:
         rows = prepare_rows(rows_by_image[image['id']], image, score_thr, identity_thr, pair)
         records.append(per_image(image, annotations[image['id']], rows,
                                  counts['images'][image['file_name']], names, none))
-        loc_preds.extend(rows)
-    metrics = aggregate(records, range(len(records)), classes, none)
-    loc_gt = {**gt, 'images': images,
-              'annotations': [a for im in images for a in annotations[im['id']]]}
+    classes = sorted({c for r in records for c in (r['class_errors'] or {})})
+    eligible_images = [im for im in images if counts['images'][im['file_name']]['verified']
+                       and not counts['images'][im['file_name']]['counts_mismatch']]
+    loc_gt = {**gt, 'images': eligible_images,
+              'annotations': [a for im in eligible_images for a in annotations[im['id']]]}
     # AP uses all scores; bootstrap resamples whole groups including their boxes.
-    loc_all = [p for im in images for p in rows_by_image[im['id']]]
+    loc_all = [p for im in eligible_images for p in rows_by_image[im['id']]]
     prepared = _prepare_dataset(loc_gt, loc_all)
     loc_records, n_gt = _per_image_localization_records(prepared, iou_thresholds=(0.5,))
+    loc_index = {im['id']: i for i, im in enumerate(eligible_images)}
     def summary(ix):
+        loc_ix = [loc_index[images[i]['id']] for i in ix if images[i]['id'] in loc_index]
         values = aggregate(records, ix, classes, none)
-        scores = np.concatenate([loc_records[i][0.5][0] for i in ix]) if ix else np.array([])
-        matches = np.concatenate([loc_records[i][0.5][1] for i in ix]) if ix else np.array([])
-        values['ap50'] = _compute_coco_ap_from_records(scores, matches, sum(n_gt[i] for i in ix))
+        scores = np.concatenate([loc_records[i][0.5][0] for i in loc_ix]) if loc_ix else np.array([])
+        matches = np.concatenate([loc_records[i][0.5][1] for i in loc_ix]) if loc_ix else np.array([])
+        values['ap50'] = _compute_coco_ap_from_records(scores, matches, sum(n_gt[i] for i in loc_ix))
         return values
     metrics = summary(list(range(len(images)))) if images else {}
     ci = compute_group_bootstrap_ci([im['group_id'] for im in images], summary,
@@ -324,26 +338,32 @@ def select_thresholds(images, gt, counts, rows_by_image, pair, none):
     # Deterministic grid chosen solely by validation counting error.
     if not images:
         raise ValueError('no eligible validation images for threshold selection')
-    candidates = (0., .1, .2, .3, .4, .5, .6, .7, .8, .9)
+    candidates = tuple(i / 20 for i in range(20))
     totals = {thr: sum(abs(sum(float(r['score']) >= thr for r in rows_by_image[im['id']])
                            - im['attributes']['human_counts']['total']) for im in images)
               for thr in candidates}
     best_total = min(totals.values())
-    best = None
+    options = []
     for score_thr in (t for t in candidates if totals[t] == best_total):
         for identity_thr in ((0.,) if none else (0., .25, .5, .75)):
             class_error = 0
             if not none:
                 for im in images:
+                    if not counts['images'][im['file_name']].get('verified', True) or counts['images'][im['file_name']].get('counts_mismatch', False):
+                        continue
                     rows = prepare_rows(rows_by_image[im['id']], im, score_thr, identity_thr, pair, False)
                     actual = counts['images'][im['file_name']]['classes']
                     predicted = Counter(r['class'] for r in rows)
                     class_error += sum(abs(predicted.get(c, 0) - actual.get(c, 0))
                                        for c in set(actual) | set(predicted))
-            key = (best_total, class_error, score_thr, identity_thr)
-            if best is None or key < best:
-                best = key
-    return best
+            options.append((best_total, class_error, score_thr, identity_thr))
+    best_error = min(option[:2] for option in options)
+    tied = [option for option in options if option[:2] == best_error]
+    scores = sorted({option[2] for option in tied})
+    score = scores[(len(scores) - 1) // 2]
+    identities = sorted(option[3] for option in tied if option[2] == score)
+    identity = identities[(len(identities) - 1) // 2]
+    return (*best_error, score, identity)
 
 
 def validate_groups(gt, split, splits):
@@ -361,9 +381,9 @@ def markdown(result):
     lines = [title, '', 'Counting is scored against quiz counts; per-class counts come from answered crops.',
              'AP50 compares with human-filtered boxes that originate from model proposals; it is not independent localization GT.',
              'Identity accuracy is conditional on a matched human-answered, known-identity crop.',
-             'Class inventory may be incomplete where questions are unanswered or human totals disagree with crop counts; exact inventory excludes those images.',
+             'Class inventory and AP exclude incomplete images and count mismatches.',
              'Thresholds minimize validation total count error, then class count error; embedding validation uses held-out groups.',
-             'Training-gallery confidence thresholds are selected on validation; +val galleries add human-labelled validation crops, holding out the query group during validation.',
+             'Training-gallery confidence thresholds are selected on validation; +val galleries hold out the query group during validation and use all validation groups at test time. Train and validation may contain near duplicates.',
              'Sharp-full means cabinet_full with no or mild motion blur; partial/blurry means cabinet_partial or severe blur. Other audit cases are omitted from these subsets.',
              '', 'Excluded images:']
     for split in ('val', 'test'):
@@ -401,6 +421,15 @@ def markdown(result):
     return '\n'.join(lines)
 
 
+def audit_subsets(images, audit):
+    usable = [im for im in images if im['attributes'].get('usable', True)]
+    sharp = [im for im in usable if audit.get(im['file_name'], {}).get('scene_label') == 'cabinet_full'
+             and audit.get(im['file_name'], {}).get('motion_blur') in ('none', 'mild')]
+    partial = [im for im in usable if audit.get(im['file_name'], {}).get('scene_label') == 'cabinet_partial'
+               or audit.get(im['file_name'], {}).get('motion_blur') == 'severe']
+    return sharp, partial
+
+
 def run(args):
     queue = read_json(args.queue)
     if args.demo:
@@ -417,7 +446,8 @@ def run(args):
         raise ValueError('answers file contains no valid answers')
     splits = read_json(args.splits)
     audit = {i['image_id']: i for i in read_json(args.audit)['images']}
-    proposals = proposal_data(read_json(args.proposals))
+    proposal_coco = read_json(args.proposals)
+    proposals = proposal_data(proposal_coco)
     gt, counts, excluded = {}, {}, {}
     for split in ('val', 'test'):
         gt[split], counts[split], excluded[split] = build_human_gt(queue, answers, split)
@@ -428,7 +458,8 @@ def run(args):
         raise ValueError('no eligible test images')
     result = {'version': 1, 'demo': args.demo, 'excluded': excluded, 'rows': [], 'skipped_runs': [],
               'limitations': ['All localization reference boxes originate from model proposals.',
-                              'Per-class human counts include only answered crops.',
+                              'Per-class and AP metrics use fully answered images without count mismatches.',
+                              'Training and validation splits may include near-duplicate images.',
                               'Validation embeddings use leave-one-group-out gallery; test uses all eligible validation crops.',
                               'Training VLM gallery confidence is selected on validation; test labels are never used.']}
     for path in sorted(map(Path, glob.glob(args.runs))):
@@ -438,7 +469,7 @@ def run(args):
             continue
         meta = read_json(path / 'meta.json') if (path / 'meta.json').is_file() else {}
         family = meta.get('config', {}).get('family', '')
-        category_names = {c['id']: c['name'] for c in gt['val']['categories']}
+        category_names = {c['id']: c['name'] for c in proposal_coco['categories']}
         predictions = {}
         for split, pred_path in (('val', val_path), ('test', test_path)):
             raw = read_json(pred_path)
@@ -462,7 +493,7 @@ def run(args):
                 train_items = train_gallery(emb, proposals, splits, confidence) if train_variant else None
                 if train_variant and not train_items[0]:
                     continue
-                val_rows = {im['id']: identify(predictions['val'][im['id']], im, method, proposals, emb,
+                val_rows = {im['id']: identify((predictions['val'].get(im['id']) or predictions['val'].get(im['file_name'], [])), im, method, proposals, emb,
                                                 gt['val'], validation=True, train_items=train_items, fitted=fitted)
                             for im in gt['val']['images']}
                 variants[confidence] = (train_items, val_rows)
@@ -471,23 +502,21 @@ def run(args):
                                                'reason': 'no VLM-labelled training crop embeddings'})
                 continue
             for pair in (False, True):
-                selected = None
+                selections = []
                 for confidence, (train_items, val_rows) in variants.items():
                     key = select_thresholds(gt['val']['images'], gt['val'], counts['val'],
                                             val_rows, pair, method == 'none')
-                    selection = (*key, confidence if confidence is not None else -1.)
-                    if selected is None or selection < selected[0]:
-                        selected = (selection, confidence, train_items)
-                key, confidence, train_items = selected
+                    selections.append((key, confidence, train_items))
+                best_error = min(item[0][:2] for item in selections)
+                tied = [item for item in selections if item[0][:2] == best_error]
+                tied.sort(key=lambda item: item[1] if item[1] is not None else -1.)
+                key, confidence, train_items = tied[(len(tied) - 1) // 2]
                 score_thr, id_thr = key[2:4]
-                test_rows = {im['id']: identify(predictions['test'][im['id']], im, method, proposals, emb,
+                test_rows = {im['id']: identify((predictions['test'].get(im['id']) or predictions['test'].get(im['file_name'], [])), im, method, proposals, emb,
                                                  gt['val'], train_items=train_items, fitted=fitted)
                              for im in gt['test']['images']}
                 images = gt['test']['images']
-                sharp = [im for im in images if audit.get(im['file_name'], {}).get('scene_label') == 'cabinet_full'
-                         and audit.get(im['file_name'], {}).get('motion_blur') in ('none', 'mild')]
-                partial = [im for im in images if audit.get(im['file_name'], {}).get('scene_label') == 'cabinet_partial'
-                           or audit.get(im['file_name'], {}).get('motion_blur') == 'severe']
+                sharp, partial = audit_subsets(images, audit)
                 subsets = {name: score_subset(ims, gt['test'], counts['test'], test_rows, score_thr, id_thr,
                                               pair, method == 'none', args.bootstrap)
                            for name, ims in [('all', images), ('sharp-full', sharp), ('partial/blurry', partial)]}

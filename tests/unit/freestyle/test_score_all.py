@@ -192,3 +192,79 @@ def test_train_gallery_selection_and_validation_calibration():
                         validation=True, train_items=items)
         outcomes[cutoff] = select_thresholds([image], gt, counts, {1: rows}, False, False)
     assert outcomes[.5][:2] < outcomes[0.][:2]
+
+
+def test_pair_derived_family_and_threshold():
+    from freestyle.experiments.score_all import prepare_rows
+
+    rows = [{'bbox': [x, 10, 10, 20], 'score': .9, 'class': 'coca-cola-part1',
+             'identity_score': .6} for x in (10, 25)]
+    assert [r['class'] for r in prepare_rows(rows, {'height': 100}, 0, .5, True)] == [
+        'coca-cola-part1', 'coca-cola-part2']
+    assert all(r['class'] == 'unknown' for r in prepare_rows(rows, {'height': 100}, 0, .75, True))
+
+
+def test_negative_bypasses_completion_cutoff(monkeypatch):
+    image = {'id': 1, 'file_name': 'negative', 'attributes': {
+        'human_counts': {'total': 0}, 'usable': False, 'verified': True}}
+    coco = {'images': [image], 'annotations': [], 'info': {}}
+    counts = {'images': {'negative': {}}, 'mismatches': [], 'unverified': []}
+    monkeypatch.setattr('freestyle.experiments.score_all.build_coco', lambda *args: (coco, counts))
+    queue = {'questions': [{'qid': str(i), 'image_id': 'negative'} for i in range(6)]}
+    assert build_human_gt(queue, {'0': {'result': 'not_cabinet'}}, 'test')[0]['images'] == [image]
+
+
+def test_incomplete_class_metrics_are_excluded():
+    from freestyle.experiments.score_all import aggregate, per_image
+
+    image = {'attributes': {'human_counts': {'total': 2, 'top': 2, 'bottom': 0}}}
+    counts = {'classes': {'sprite': 1}, 'verified': False, 'counts_mismatch': True}
+    record = per_image(image, [], [], counts, {}, False)
+    assert record['total_error'] == 2
+    assert record['class_errors'] is None
+    assert aggregate([record], [0], ['sprite'], False)['class:sprite'] is None
+
+
+def test_generic_and_predicted_only_class():
+    from freestyle.experiments.score_all import aggregate, per_image, prepare_rows
+
+    rows = [{'bbox': [0, 0, 10, 10], 'score': .9, 'class': 'cartridge', 'identity_score': .9}]
+    rows = prepare_rows(rows, {'height': 100}, 0, 0, False)
+    image = {'attributes': {'human_counts': {'total': 1, 'top': 1, 'bottom': 0}}}
+    record = per_image(image, [], rows, {'classes': {}, 'verified': True, 'counts_mismatch': False}, {}, False)
+    assert aggregate([record], [0], list(record['class_errors']), False)['class:unknown'] == 1
+
+
+def test_threshold_ties_choose_middle():
+    from freestyle.experiments.score_all import select_thresholds
+
+    image = {'id': 1, 'file_name': 'a', 'height': 100, 'attributes': {'human_counts': {'total': 0}}}
+    counts = {'images': {'a': {'classes': {}, 'verified': True, 'counts_mismatch': False}}}
+    assert select_thresholds([image], {}, counts, {1: []}, False, True)[2] == .45
+
+
+def test_matching_prefers_detection_score():
+    from freestyle.experiments.score_all import per_image
+
+    image = {'attributes': {'human_counts': {'total': 1, 'top': 1, 'bottom': 0}}}
+    rows = [{'bbox': [0, 0, 10, 10], 'score': .2, 'class': 'wrong', 'shelf_name': 'top'},
+            {'bbox': [1, 0, 10, 10], 'score': .9, 'class': 'sprite', 'shelf_name': 'top'}]
+    record = per_image(image, [{'bbox': [0, 0, 10, 10], 'category_id': 1}], rows,
+                       {'classes': {'sprite': 1}, 'verified': True, 'counts_mismatch': False}, {1: 'sprite'}, False)
+    assert record['id_correct'] == 1
+
+
+def test_prediction_keys_and_invalid_geometry():
+    from freestyle.experiments.score_all import grouped_predictions
+
+    rows = [{'image_id': 'a.jpg', 'bbox': [0, 0, 1, 1]},
+            {'image_id': 'a.jpg', 'bbox': [0, 0, 0, 1]}]
+    assert grouped_predictions(rows)['a.jpg'] == rows[:1]
+
+
+def test_audit_subsets_exclude_verified_negative():
+    from freestyle.experiments.score_all import audit_subsets
+
+    negative = {'file_name': 'negative', 'attributes': {'usable': False}}
+    sharp, partial = audit_subsets([negative], {'negative': {'motion_blur': 'severe'}})
+    assert sharp == partial == []

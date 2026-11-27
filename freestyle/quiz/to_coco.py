@@ -64,7 +64,11 @@ def _identity(question: dict[str, Any], answer: dict[str, Any] | None) -> tuple[
         return _answer_class(question, answer), HUMAN, result
     if result == "two_plus":
         return UNKNOWN, HUMAN, result
-    return guess, HUMAN, result  # 'correct' keeps the model's guess, verified by a human
+    if result == "correct":
+        return guess, HUMAN, result
+    if result == "partial":
+        return (str(answer["class"]), HUMAN, result) if answer.get("class") else (UNKNOWN, MODEL, result)
+    raise ValueError(f"unknown crop answer result: {result!r}")
 
 
 def _answer_class(question: dict[str, Any], answer: dict[str, Any]) -> str:
@@ -127,7 +131,7 @@ def build_coco(
         count_answer = answers.get(f"{COUNT}:{image_id}")
         meta = _image_counts(image, count_answer)
         crop_qids = [qid for qid in qids if questions[qid]["kind"] == CROP]
-        answered = sum(1 for qid in qids if qid in answers)
+        answered = sum(1 for qid in qids if answers.get(qid, {}).get("result") not in (None, "", "skip"))
         # every crop identity must be human 'verified' is on: a skipped box keeps
         # model identity, which is never ground truth (ARCHITECTURE.md)
         human_crops = all(
@@ -155,7 +159,7 @@ def build_coco(
             attributes = {
                 "truncated": bool(base.get("truncated")) or "partial" == result,
                 "occluded": bool(base.get("occluded")),
-                "identity_visible": bool(base.get("identity_visible", True)) and result != "two_plus",
+                "identity_visible": bool(base.get("identity_visible", True)) and result != "two_plus" and name != UNKNOWN,
                 "source": f"quiz:{source}",
                 "box_source": MODEL,
                 "identity_source": source,

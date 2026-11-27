@@ -358,7 +358,7 @@ def test_to_coco_drops_not_a_cartridge_and_flags_two_plus_partial(store):
     assert by_proposal[11]["attributes"]["identity_visible"] is False
     assert by_proposal[12]["attributes"]["box_partial"] is True
     assert by_proposal[12]["attributes"]["truncated"] is True
-    assert counts_of(counts, IMAGE_A)["crop_total"] == 2
+    assert counts_of(counts, IMAGE_A)["crop_total"] == 1
 
 
 def test_to_coco_not_cabinet_clears_boxes_and_marks_unusable(store):
@@ -415,3 +415,13 @@ def test_to_coco_cli_writes_both_files(store, tmp_path, capsys):
     assert rc == 0
     assert out.is_file() and (tmp_path / "gt" / "test_counts.json").is_file()
     assert json.loads(out.read_text())["info"]["total_images"] == 1
+
+
+def test_partial_identity_requires_explicit_class():
+    from freestyle.quiz.to_coco import _identity
+
+    question = {'guess': 'sprite'}
+    assert _identity(question, {'result': 'partial'}) == ('unknown', 'model', 'partial')
+    assert _identity(question, {'result': 'partial', 'class': 'sprite'}) == ('sprite', 'human', 'partial')
+    with pytest.raises(ValueError):
+        _identity(question, {'result': 'unexpected'})
