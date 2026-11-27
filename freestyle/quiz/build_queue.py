@@ -17,6 +17,12 @@ Run:
     uv run python -m freestyle.quiz.build_queue \
         --proposals data/labels/bootstrap_v2.json --splits data/splits.json \
         --splits-order test,val --out data/gt/quiz_queue.json
+
+``freestyle.quiz.active`` builds on this document: it merges the bottom-shelf face
+proposals in for the train split, scores each crop with the deployed bundle's own
+identifier, and keeps the ~140 questions worth asking, tagging every question with
+a ``purpose`` (``eval`` for test, ``train`` for gallery-feeding crops, ``tune`` for
+val). ``build_queue`` itself stays purpose-blind — it is the raw proposal view.
 """
 
 from __future__ import annotations
@@ -41,6 +47,15 @@ DEFAULT_SPLITS = REPO_ROOT / "data" / "splits.json"
 COUNT = "count"
 CROP = "crop"
 UNKNOWN = "unknown"
+
+#: Why a question is in the queue. ``eval`` questions are measured with and never
+#: trained on; ``tune`` questions pick thresholds on val; ``train`` questions feed
+#: the identifier gallery. See :mod:`freestyle.quiz.active`.
+PURPOSE_EVAL = "eval"
+PURPOSE_TUNE = "tune"
+PURPOSE_TRAIN = "train"
+PURPOSES = (PURPOSE_EVAL, PURPOSE_TUNE, PURPOSE_TRAIN)
+PURPOSE_BY_SPLIT = {"test": PURPOSE_EVAL, "val": PURPOSE_TUNE, "train": PURPOSE_TRAIN}
 #: Question kinds in the order they appear inside one image.
 KINDS = (COUNT, CROP)
 SHELF_RANK = {"top": 0, "bottom": 1}
@@ -432,6 +447,9 @@ def validate_queue(queue: dict[str, Any]) -> dict[str, Any]:
         seen.add(qid)
         if question.get("kind") not in KINDS:
             raise ValueError(f"unknown question kind {question.get('kind')!r}")
+        purpose = question.get("purpose")
+        if purpose is not None and purpose not in PURPOSES:
+            raise ValueError(f"unknown question purpose {purpose!r}")
     return queue
 
 

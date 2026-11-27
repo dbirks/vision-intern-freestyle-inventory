@@ -9,9 +9,13 @@ from __future__ import annotations
 import json
 from pathlib import Path
 
+import numpy as np
 import pytest
 from PIL import Image
 
+from freestyle.identify.embed import Embedder
+from freestyle.identify import refresh_gallery as rg
+from freestyle.quiz import active as act
 from freestyle.quiz import build_queue as bq
 from freestyle.quiz import server as quiz_server
 from freestyle.quiz import to_coco
@@ -470,3 +474,420 @@ def test_audit_quality_orders_within_split(proposals):
     same_split = {"images": {IMAGE_A: "test", IMAGE_B: "test"}}
     queue = bq.build_queue(data, same_split, ["test"], CLASSES, root, audit)
     assert [im["image_id"] for im in queue["images"]] == [IMAGE_B, IMAGE_A]
+
+
+# ============================================================ active-learning queue
+
+IMAGE_T = "gT/010.jpg"  # split train
+SPRITE, COLA1, COLA2, BLANK = 1, 2, 3, 4  # category ids in the synthetic proposals
+
+
+def _ann(ann_id, image_id, category_id, x, y, *, conf=0.9, family=None, part=None):
+    attrs = {"source": "vlm:bootstrap", "id_confidence": conf}
+    if family:
+        attrs["id_family"] = family
+    if part:
+        attrs["id_part"] = part
+    return {"id": ann_id, "image_id": image_id, "category_id": category_id,
+            "bbox": [float(x), float(y), 40.0, 80.0], "attributes": attrs}
+
+
+@pytest.fixture
+def active_doc(tmp_path):
+    """Proposals for one test, one val and one train frame, plus their split map."""
+    root = tmp_path / "images"
+    for name in (IMAGE_A, IMAGE_B, IMAGE_T):
+        _write_frame(root, name)
+    anns = [
+        # test frame: three boxes per shelf, all read confidently
+        *[_ann(i, 1, SPRITE, x, 20.0, conf=0.9) for i, x in enumerate((20.0, 120.0, 220.0), start=1)],
+        *[_ann(i, 1, SPRITE, x, 200.0, conf=0.9) for i, x in enumerate((20.0, 120.0, 220.0), start=4)],
+        # val frame: one confident match, one shy of the threshold, one disagreement
+        _ann(10, 2, SPRITE, 20.0, 20.0, conf=0.9),
+        _ann(11, 2, SPRITE, 120.0, 25.0, conf=0.55),
+        _ann(12, 2, BLANK, 220.0, 30.0, conf=0.9, family="coca cola"),
+        _ann(13, 2, SPRITE, 20.0, 200.0, conf=0.95),
+        # train frame: a well-fed class, a two-part family with no part read, a thin class
+        _ann(20, 3, SPRITE, 20.0, 20.0, conf=0.8),
+        _ann(21, 3, BLANK, 120.0, 25.0, conf=0.5, family="coca cola"),
+        _ann(22, 3, BLANK, 220.0, 30.0, conf=0.4, family="coca cola zero"),
+        _ann(23, 3, COLA2, 20.0, 200.0, conf=0.5),
+        _ann(24, 3, BLANK, 120.0, 205.0, conf=0.95, family="sprite"),
+    ]
+    data = {
+        "images": [
+            {"id": 1, "file_name": IMAGE_A, "width": 400, "height": 300,
+             "attributes": {"scene": "cabinet_full"}},
+            {"id": 2, "file_name": IMAGE_B, "width": 400, "height": 300,
+             "attributes": {"scene": "cabinet_full"}},
+            {"id": 3, "file_name": IMAGE_T, "width": 400, "height": 300,
+             "attributes": {"scene": "cabinet_full"}},
+        ],
+        "categories": [{"id": i + 1, "name": c["name"]} for i, c in enumerate(CLASSES)],
+        "annotations": anns,
+    }
+    splits = {"version": 1, "groups": {}, "images": {IMAGE_A: "test", IMAGE_B: "val", IMAGE_T: "train"}}
+    queue = bq.build_queue(data, splits, ["test", "val", "train"], CLASSES, root)
+    return queue, splits, root
+
+
+def _crops(queue, split):
+    return [q for q in queue["questions"] if q["kind"] == bq.CROP and q["split"] == split]
+
+
+def _preds(queue, split, default=("sprite", 0.9), overrides=None):
+    """k-NN predictions for a split's crops; ``overrides`` maps ann_id -> (class, score)."""
+    overrides = overrides or {}
+    out = {}
+    for question in _crops(queue, split):
+        cls, score = overrides.get(question["ann_id"], default)
+        out[question["qid"]] = {"class": cls, "score": score}
+    return out
+
+
+def test_active_queue_selects_test_sample_then_train_then_val(active_doc):
+    queue, _, _ = active_doc
+    chosen = act.select_questions(queue, (), _all_preds(active_doc), {}, test_crops=2, val_cap=10,
+                                 train_cap=10)
+    purposes = [q["purpose"] for q in chosen]
+    assert purposes == sorted(purposes, key=act.BLOCK_ORDER.index), "test, then train, then val"
+    assert [q["split"] for q in chosen if q["kind"] == bq.COUNT] == ["test", "val"], \
+        "every count question stays, the train frame gets no count question"
+    assert {q["purpose"] for q in chosen if q["split"] == "test"} == {"eval"}
+    assert {q["purpose"] for q in chosen if q["split"] == "val"} == {"tune"}
+    assert {q["purpose"] for q in chosen if q["split"] == "train"} == {"train"}
+    eval_crops = [q for q in chosen if q["purpose"] == "eval" and q["kind"] == bq.CROP]
+    assert len(eval_crops) == 2, "exactly the sampled number of evaluation crops"
+    assert {q["shelf"] for q in eval_crops} == {"top", "bottom"}
+
+
+def _all_preds(doc):
+    queue, _, _ = doc
+    preds = {}
+    preds.update(_preds(queue, "test"))
+    preds.update(_preds(queue, "val", overrides={12: ("sprite", 0.8)}))
+    preds.update(_preds(queue, "train", overrides={21: ("sprite", 0.8), 22: ("coca-cola-part1", 0.7),
+                                                   23: ("coca-cola-part2", 0.7)}))
+    return preds
+
+
+def test_active_eval_sample_is_fixed_and_stratified(active_doc):
+    queue, _, _ = active_doc
+    crops = _crops(queue, "test")
+    first = act.select_crop_sample(crops, 2, seed=0)
+    assert act.select_crop_sample(crops, 2, seed=0) == first, "the same seed asks the same questions"
+    assert len(first) == 2
+    shelves = {next(q["shelf"] for q in crops if q["qid"] == qid) for qid in first}
+    assert shelves == {"top", "bottom"}, "3 top / 3 bottom of 2 -> one per shelf"
+    assert act.select_crop_sample(crops, 99, seed=0) == {q["qid"] for q in crops}
+
+
+def test_active_val_block_only_takes_uncertain_crops(active_doc):
+    queue, _, _ = active_doc
+    preds = _all_preds(active_doc)
+    chosen = act.select_questions(queue, (), preds, {}, test_crops=0, val_cap=10, train_cap=0)
+    val = {q["ann_id"] for q in chosen if q["split"] == "val" and q["kind"] == bq.CROP}
+    assert val == {11, 12}, "0.55 confidence and the family disagreement, not the confident ones"
+    assert all(q["selected_by"] == "uncertain" for q in chosen
+               if q["split"] == "val" and q["kind"] == bq.CROP)
+    capped = act.select_questions(queue, (), preds, {}, test_crops=0, val_cap=1, train_cap=0)
+    assert sum(1 for q in capped if q["split"] == "val" and q["kind"] == bq.CROP) == 1
+
+
+def test_active_train_block_prioritises_two_part_and_thin_classes(active_doc):
+    queue, _, _ = active_doc
+    preds = _all_preds(active_doc)
+    counts = {"sprite": 40, "nns-sweetener": 60, "coca-cola-part1": 0, "coca-cola-part2": 1}
+    chosen = act.select_questions(queue, (), preds, counts, test_crops=0, val_cap=0, train_cap=2)
+    train = [q for q in chosen if q["split"] == "train"]
+    assert [q["ann_id"] for q in train] == [21, 22], "unread parts first, then the thinnest classes"
+    assert train[0]["ask_part"] is True
+    wider = act.select_questions(queue, (), preds, counts, test_crops=0, val_cap=0, train_cap=99)
+    order = {q["ann_id"] for q in wider if q["split"] == "train"}
+    assert order == {21, 22, 23}
+    assert 20 not in order and 24 not in order, "certain crops are not worth asking"
+    by_priority = sorted((q for q in wider if q["split"] == "train"),
+                         key=lambda q: act.train_priority(q, bq.family_classes(CLASSES), counts,
+                                                          prediction=preds[q["qid"]]))
+    assert [q["ann_id"] for q in by_priority] == [21, 22, 23], "unread part, then thin, then fed"
+
+
+def test_active_train_block_never_asks_test_or_val_boxes(active_doc):
+    queue, _, _ = active_doc
+    chosen = act.select_questions(queue, (), _all_preds(active_doc), {}, test_crops=0, val_cap=0,
+                                 train_cap=99)
+    assert {q["image_id"] for q in chosen if q["purpose"] == "train"} == {IMAGE_T}
+
+
+def test_active_keeps_every_answered_question(active_doc):
+    queue, _, _ = active_doc
+    crops = _crops(queue, "val")
+    answered = {crops[0]["qid"]: {"result": "correct"}, _crops(queue, "train")[0]["qid"]: {"result": "skip"}}
+    chosen = act.select_questions(queue, answered, _all_preds(active_doc), {}, test_crops=0,
+                                 val_cap=0, train_cap=0)
+    qids = {q["qid"] for q in chosen}
+    assert set(answered) <= qids, "an answer is never thrown away"
+    assert all(q["selected_by"] == "answered" for q in chosen if q["qid"] in answered)
+
+
+def test_active_build_writes_purposes_counts_and_images(active_doc):
+    queue, _, _ = active_doc
+    answered = {_crops(queue, "test")[0]["qid"]: {"result": "correct"}}
+    rebuilt = act.build_active_queue(queue, answered, _all_preds(active_doc), {}, test_crops=2,
+                                    val_cap=2, train_cap=2)
+    bq.validate_queue(rebuilt)
+    assert rebuilt["selection"]["mode"] == "active"
+    assert rebuilt["selection"]["before"]["total"] == len(queue["questions"])
+    assert rebuilt["selection"]["after"]["total"] == len(rebuilt["questions"])
+    assert rebuilt["splits_order"] == ["test", "train", "val"]
+    assert [im["image_id"] for im in rebuilt["images"]] == [IMAGE_A, IMAGE_T, IMAGE_B]
+    assert all(im["qids"] for im in rebuilt["images"])
+    firsts = [im["first_index"] for im in rebuilt["images"]]
+    assert firsts == sorted(firsts)
+    index = {q["qid"]: i for i, q in enumerate(rebuilt["questions"])}
+    assert all(index[qid] >= im["first_index"] for im in rebuilt["images"] for qid in im["qids"])
+
+
+def test_active_uncertainty_rules():
+    base = {"qid": "crop:x/1.jpg:1", "confidence": 0.9, "family": "sprite", "guess": "sprite"}
+    assert act.is_uncertain(base, {"class": "sprite", "score": 0.9}) is False
+    assert act.is_uncertain(base, {"class": "hi-c", "score": 0.9}) is True, "family disagreement"
+    assert act.is_uncertain(base, {"class": "unknown", "score": 0.0}) is True
+    assert act.is_uncertain({**base, "confidence": 0.59}, {"class": "sprite"}) is True
+    assert act.is_uncertain({**base, "confidence": 0.59}, None, use_knn=False) is True
+    assert act.is_uncertain({**base, "guess": "unknown", "family": None}, None, use_knn=False) is False
+    assert act.crop_family({"family": "Coca-Cola Zero", "guess": "unknown"}) == "coca cola zero"
+    assert act.gallery_shortfall({"part_options": [{"class": "coca-cola-part1"},
+                                                  {"class": "coca-cola-part2"}]},
+                                 {"coca-cola-part1": 4, "coca-cola-part2": 40}) == 1, \
+        "the scarcest part of the family sets the need"
+
+
+def test_active_gallery_counts_accepts_lists_and_arrays():
+    assert act.gallery_counts(["sprite", "sprite", "hi-c"]) == {"sprite": 2, "hi-c": 1}
+    assert act.gallery_counts(np.asarray(["sprite", "hi-c", "hi-c"])) == {"sprite": 1, "hi-c": 2}
+
+
+def test_active_face_merge_offsets_ids_and_keeps_splits_separate(active_doc):
+    queue, splits, root = active_doc
+    bootstrap = {
+        "images": [{"id": 1, "file_name": IMAGE_A, "width": 400, "height": 300}],
+        "categories": [{"id": 1, "name": "sprite"}],
+        "annotations": [_ann(1, 1, SPRITE, 20.0, 200.0)],
+    }
+    faces = {
+        "images": [{"id": 1, "file_name": IMAGE_A, "width": 400, "height": 300}],
+        "categories": [{"id": 1, "name": "sprite"}],
+        "annotations": [
+            {"id": 5, "image_id": 1, "category_id": BLANK, "bbox": [20.0, 200.0, 40.0, 80.0],
+             "attributes": {"source": "vlm:faces", "bottom_shelf": True, "identity_visible": True,
+                            "truncated": False}},
+            {"id": 6, "image_id": 1, "category_id": BLANK, "bbox": [300.0, 205.0, 40.0, 80.0],
+             "attributes": {"source": "vlm:faces", "bottom_shelf": True, "identity_visible": True,
+                            "truncated": False}},
+            {"id": 7, "image_id": 1, "category_id": BLANK, "bbox": [300.0, 20.0, 40.0, 80.0],
+             "attributes": {"source": "vlm:faces", "bottom_shelf": False, "identity_visible": True}},
+        ],
+    }
+    merged = act.merge_face_proposals(bootstrap, faces, {IMAGE_A: "test"}, want_split="test")
+    ids = sorted(a["id"] for a in merged["annotations"])
+    assert ids == [5 + act.FACE_ANN_OFFSET, 6 + act.FACE_ANN_OFFSET], "a clean face box replaces its twin"
+    assert merged["n_bootstrap_replaced"] == 1
+    assert all(int(a["id"]) >= act.FACE_ANN_OFFSET for a in merged["annotations"] if int(a["id"]) != 1)
+    untouched = act.merge_face_proposals(bootstrap, faces, {IMAGE_A: "test"}, want_split="train")
+    assert [a["id"] for a in untouched["annotations"]] == [1], "other splits' proposals are left alone"
+
+
+def test_active_queue_still_serves_the_quiz_app(active_doc, tmp_path):
+    queue, _, root = active_doc
+    rebuilt = act.build_active_queue(queue, {}, _all_preds(active_doc), {}, test_crops=2, val_cap=2,
+                                    train_cap=2)
+    store = QuizStore(rebuilt, tmp_path / "gt" / "quiz_answers.jsonl", root)
+    assert store.state_payload()["answered"] == 0
+    crop = next(q for q in store.questions if q["kind"] == bq.CROP and q["purpose"] == "train")
+    store.answer(crop["qid"], {"result": "class", "class": TOP_CLASS})
+    assert store.state_payload()["answered"] == 1
+    assert store.crop_jpeg(store.questions.index(crop))[:2] == b"\xff\xd8"
+
+
+# ================================================================ gallery refresh
+
+
+STUB_DIM = 168
+
+
+def _gallery(rows, *, model="stub"):
+    """rows: ``(file_name, ann_id, bbox_xywh, label)`` -> gallery.npz arrays."""
+    rng = np.random.default_rng(0)
+    embeddings = np.stack([rng.normal(size=STUB_DIM).astype(np.float32) for _ in rows]) if rows \
+        else np.zeros((0, STUB_DIM), dtype=np.float32)
+    return {
+        "embeddings": embeddings,
+        "labels": np.asarray([r[3] for r in rows], dtype=str),
+        "image_ids": np.asarray([str(100 + i) for i in range(len(rows))], dtype=str),
+        "groups": np.asarray([rg.group_id_for(r[0]) for r in rows], dtype=str),
+        "splits": np.asarray(["train"] * len(rows), dtype=str),
+        "bboxes": np.asarray([r[2] for r in rows], dtype=np.float32),
+        "annotation_ids": np.asarray([str(r[1]) for r in rows], dtype=str),
+        "file_names": np.asarray([r[0] for r in rows], dtype=str),
+        "model": np.asarray([model], dtype=str),
+    }
+
+
+def _bundle(dir_path: Path, rows, *, name="base-v1", with_files=False):
+    dir_path.mkdir(parents=True, exist_ok=True)
+    np.savez(dir_path / "gallery.npz", **_gallery(rows))
+    (dir_path / "pipeline.yaml").write_text(
+        "localizer:\n  type: tiled_detector\n  checkpoint: detector/c.pth\n"
+        "identifier:\n  type: embedding_knn\n  gallery: gallery.npz\n  model: stub\n"
+        "  k: 5\n  max_per_class: 10\ncounting:\n  identity_thr: 0.45\n", encoding="utf-8")
+    (dir_path / "classes.json").write_text(json.dumps({"detector_classes": ["cartridge"]}), encoding="utf-8")
+    (dir_path / "manifest.json").write_text(json.dumps({
+        "schema_version": 1, "name": name, "embedder_id": "stub",
+        "detector_classes": ["cartridge"], "thresholds": {"score_thr": 0.3, "identity_thr": 0.45},
+        "provenance": {"run_id": "R", "notes": "base notes"},
+        "files": {} if not with_files else {"pipeline.yaml": {"sha256": "x"}},
+    }), encoding="utf-8")
+    return dir_path
+
+
+def _active_fixture(tmp_path, base_rows=None):
+    """A tiny base bundle plus a queue with train, val and test crop questions."""
+    root = tmp_path / "images"
+    for name in (IMAGE_T, "gU/011.jpg", IMAGE_A, IMAGE_B):
+        _write_frame(root, name)
+    base_rows = base_rows if base_rows is not None else [
+        (IMAGE_T, 20, [20.0, 20.0, 40.0, 80.0], "sprite"),
+        ("gU/011.jpg", 21, [120.0, 25.0, 40.0, 80.0], "hi-c"),
+    ]
+    base = _bundle(tmp_path / "artifacts" / "base-v1", base_rows)
+    questions = [
+        {"qid": bq.crop_qid(IMAGE_T, 20), "kind": "crop", "split": "train", "purpose": "train",
+         "image_id": IMAGE_T, "ann_id": 20, "bbox": [20.0, 20.0, 60.0, 100.0], "guess": "sprite",
+         "confidence": 0.5, "attributes": {}},
+        {"qid": bq.crop_qid(IMAGE_T, 100021), "kind": "crop", "split": "train", "purpose": "train",
+         "image_id": IMAGE_T, "ann_id": 100021, "bbox": [120.0, 205.0, 160.0, 285.0],
+         "guess": "unknown", "confidence": 0.4, "attributes": {},
+         "part_options": [{"part": 1, "class": "coca-cola-part1"}, {"part": 2, "class": "coca-cola-part2"}]},
+        {"qid": bq.crop_qid(IMAGE_A, 30), "kind": "crop", "split": "test", "purpose": "eval",
+         "image_id": IMAGE_A, "ann_id": 30, "bbox": [20.0, 20.0, 60.0, 100.0], "guess": "sprite",
+         "confidence": 0.5, "attributes": {}},
+        {"qid": bq.crop_qid(IMAGE_B, 31), "kind": "crop", "split": "val", "purpose": "tune",
+         "image_id": IMAGE_B, "ann_id": 31, "bbox": [20.0, 20.0, 60.0, 100.0], "guess": "sprite",
+         "confidence": 0.5, "attributes": {}},
+    ]
+    queue = {"version": 1, "classes": CLASSES, "questions": questions,
+             "images": [{"image_id": q["image_id"], "split": q["split"], "qids": [q["qid"]],
+                         "coco_image_id": 1, "width": 400, "height": 300} for q in questions]}
+    splits = {IMAGE_T: "train", "gU/011.jpg": "train", IMAGE_A: "test", IMAGE_B: "val"}
+    return base, root, queue, splits
+
+
+def test_refresh_reuses_model_rows_and_applies_human_labels(tmp_path):
+    base, root, queue, splits = _active_fixture(tmp_path)
+    answers = {
+        queue["questions"][0]["qid"]: {"result": "class", "class": "coca-cola-part1"},
+        queue["questions"][1]["qid"]: {"result": "part", "part": 2,
+                                       "part_options": [{"part": 1, "class": "coca-cola-part1"},
+                                                          {"part": 2, "class": "coca-cola-part2"}]},
+        queue["questions"][2]["qid"]: {"result": "class", "class": "coca-cola-part2"},
+        queue["questions"][3]["qid"]: {"result": "class", "class": "coca-cola-part2"},
+    }
+    labels = rg.collect_train_labels(queue, answers, splits, gallery=load_base(base))
+    by_key = {(row["image_id"], row["ann_id"]): row for row in labels["rows"]}
+    assert by_key[(IMAGE_T, 20)]["class"] == "coca-cola-part1", "the human overrides the model"
+    assert by_key[(IMAGE_T, 20)]["identity_source"] == "human"
+    assert by_key[(IMAGE_T, 100021)]["class"] == "coca-cola-part2", "a face crop joins the gallery"
+    assert by_key[("gU/011.jpg", 21)]["identity_source"] == "vlm", "unanswered keeps the model label"
+    assert IMAGE_A not in {row["image_id"] for row in labels["rows"]}
+    assert IMAGE_B not in {row["image_id"] for row in labels["rows"]}
+
+
+def load_base(base: Path):
+    return rg.load_gallery(base / "gallery.npz")
+
+
+def test_refresh_gallery_never_holds_test_or_val_images(tmp_path):
+    """The leakage assertion: no test or val image id in a refreshed gallery."""
+    base, root, queue, splits = _active_fixture(tmp_path)
+    answers = {q["qid"]: {"result": "class", "class": "coca-cola-part2"} for q in queue["questions"]}
+    result = rg.refresh_bundle(base=base, out="out-v2", queue=queue, answers=answers, splits=splits,
+                              images_root=root, artifacts_dir=tmp_path / "artifacts",
+                              embedder=Embedder("stub"), overwrite=True)
+    gallery = load_base(Path(result["bundle"]))
+    leaked = [name for name in map(str, gallery["file_names"]) if splits.get(name) != "train"]
+    assert leaked == []
+    assert {str(s) for s in gallery["splits"]} == {"train"}
+    assert set(gallery["file_names"].tolist()) <= {IMAGE_T, "gU/011.jpg"}
+
+
+def test_refresh_gallery_reproduces_the_base_with_no_answers(tmp_path):
+    base, root, queue, splits = _active_fixture(tmp_path)
+    base_gallery = load_base(base)
+    result = rg.refresh_bundle(base=base, out="out-v2", queue=queue, answers={}, splits=splits,
+                              images_root=root, artifacts_dir=tmp_path / "artifacts",
+                              embedder=Embedder("stub"), overwrite=True)
+    fresh = load_base(Path(result["bundle"]))
+    assert [str(x) for x in fresh["labels"]] == [str(x) for x in base_gallery["labels"]]
+    assert np.array_equal(fresh["embeddings"], base_gallery["embeddings"])
+    assert [str(x) for x in fresh["file_names"]] == [str(x) for x in base_gallery["file_names"]]
+    assert result["n_human"] == 0
+
+
+def test_refresh_gallery_writes_bundle_manifest_and_verifies(tmp_path):
+    base, root, queue, splits = _active_fixture(tmp_path)
+    answers = {queue["questions"][0]["qid"]: {"result": "class", "class": "dr-pepper-part1"},
+               queue["questions"][1]["qid"]: {"result": "not_cartridge"}}
+    result = rg.refresh_bundle(base=base, out="out-v2", queue=queue, answers=answers, splits=splits,
+                              images_root=root, artifacts_dir=tmp_path / "artifacts",
+                              embedder=Embedder("stub"), overwrite=True,
+                              answers_path="data/gt/quiz_answers.jsonl")
+    from freestyle.artifacts import verify_bundle
+
+    manifest = verify_bundle(Path(result["bundle"]))
+    refresh = manifest["provenance"]["gallery_refresh"]
+    assert refresh["n_human_train_labels"] == 1
+    assert refresh["n_human_corrections"] == 1
+    assert refresh["answers"] == "data/gt/quiz_answers.jsonl"
+    assert manifest["embedder_id"] == "stub"
+    assert manifest["provenance"]["base_bundle"] == "base-v1"
+    assert manifest["thresholds"] == {"score_thr": 0.3, "identity_thr": 0.45}
+    assert "human-verified TRAIN crop labels" in manifest["provenance"]["notes"]
+    assert (Path(result["bundle"]) / "pipeline.yaml").is_file()
+    assert [str(x) for x in load_base(Path(result["bundle"]))["labels"]] == ["dr-pepper-part1", "hi-c"]
+
+
+def test_refresh_gallery_refuses_a_test_row(tmp_path):
+    base, root, queue, splits = _active_fixture(tmp_path)
+    queue["questions"][0]["split"] = "test"  # a mislabelled question must not leak
+    answers = {queue["questions"][0]["qid"]: {"result": "class", "class": "coca-cola-part1"}}
+    labels = rg.collect_train_labels(queue, answers, splits, gallery=load_base(base))
+    row = next(row for row in labels["rows"] if row["image_id"] == IMAGE_T)
+    assert row["class"] == "sprite" and row["identity_source"] == "vlm", "the test answer is ignored"
+    assert labels["n_human"] == 0
+    with pytest.raises(ValueError, match="leak"):
+        rg._assert_train_only({"file_names": np.asarray([IMAGE_T, IMAGE_A])}, splits)
+
+
+def test_refresh_cli_writes_labels_and_bundle(tmp_path, capsys, active_doc):
+    queue, splits, root = active_doc
+    (tmp_path / "queue.json").write_text(json.dumps(queue), encoding="utf-8")
+    (tmp_path / "splits.json").write_text(json.dumps(splits), encoding="utf-8")
+    base = _bundle(tmp_path / "artifacts" / "base-v1", [(IMAGE_T, 20, [20.0, 20.0, 40.0, 80.0], "sprite")])
+    answers = tmp_path / "answers.jsonl"
+    answers.write_text(json.dumps({"qid": bq.crop_qid(IMAGE_T, 21), "kind": "crop",
+                                  "image_id": IMAGE_T, "split": "train", "ann_id": 21,
+                                  "answer": {"result": "class", "class": "dr-pepper-part2"}}) + "\n",
+                      encoding="utf-8")
+    code = rg.main(["--base", str(base), "--out", "cli-v2",
+                    "--queue", str(tmp_path / "queue.json"), "--answers", str(answers),
+                    "--splits", str(tmp_path / "splits.json"), "--images-root", str(root),
+                    "--labels-out", str(tmp_path / "labels.json"),
+                    "--artifacts-dir", str(tmp_path / "artifacts"), "--dry-run"])
+    assert code == 0
+    printed = capsys.readouterr().out
+    assert "train crop questions: 5" in printed
+    labels = json.loads((tmp_path / "labels.json").read_text())
+    assert labels["n_rows"] == 2 and labels["n_human"] == 1
+    assert labels["rows"][0]["identity_source"] == "vlm", "the unanswered box keeps the model label"
+    assert {row["image_id"] for row in labels["rows"]} == {IMAGE_T}
