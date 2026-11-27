@@ -283,3 +283,147 @@ def test_cli_fuse_and_bundles(tmp_path, monkeypatch, capsys):
     assert cli.main(["bundles", "--json"]) == 0
     listed = json.loads(capsys.readouterr().out)
     assert [b["name"] for b in listed["bundles"]] == ["prod-v1"]
+
+
+def _stub_embeddings(tmp_path: Path, run_dir: Path) -> Path:
+    """Write a run ``embeddings.npz`` with train/val/test rows, incl. an unknown row.
+
+    Train rows use solid colours so a matching query crop retrieves them via the stub
+    embedder. Val/test/unknown rows exist to prove the gallery builder filters them out.
+    """
+    from freestyle.identify.embed import Embedder
+
+    red = Image.new("RGB", (24, 24), color=(200, 20, 20))
+    green = Image.new("RGB", (24, 24), color=(20, 200, 20))
+    blue = Image.new("RGB", (24, 24), color=(20, 20, 200))
+    emb = Embedder("stub")
+    vectors = emb.embed([red, red, green, blue])
+    np.savez(
+        run_dir / "embeddings.npz",
+        embeddings=np.concatenate([vectors, vectors[:1]], axis=0),
+        labels=np.array(["coca-cola-part1", "coca-cola-part1", "sprite", "hi-c", "unknown"]),
+        image_ids=np.array(["10", "10", "11", "12", "10"]),
+        groups=np.array(["tr-a", "tr-a", "tr-b", "va-c", "tr-a"]),
+        splits=np.array(["train", "train", "train", "val", "train"]),
+        bboxes=np.zeros((5, 4), dtype=np.float32),
+        annotation_ids=np.array(["1", "2", "3", "4", "5"]),
+        file_names=np.array(["a.jpg", "a.jpg", "b.jpg", "c.jpg", "a.jpg"]),
+        model=np.array(["stub"]),
+        pad=np.array([0.08], dtype=np.float32),
+    )
+    return run_dir / "embeddings.npz"
+
+
+def _knn_run(tmp_path: Path) -> Path:
+    run_dir = tmp_path / "runs" / "S2_test-abcdefgh"
+    (run_dir / "training").mkdir(parents=True)
+    (run_dir / "training" / "checkpoint_best_total.pth").write_bytes(b"fake-detector-weights")
+    _stub_embeddings(tmp_path, run_dir)
+    # The run evaluated identifier=none (family-C detector-only run); the gallery is attached later.
+    resolved = {
+        "id": "S2_test",
+        "family": "C_det_agnostic_plus_embed",
+        "localizer": {"type": "tiled_detector", "tile": 1280, "overlap": 0.25},
+        "identifier": {"type": "none"},
+        "embeddings": {"model": "stub"},
+        "count": {"identity_thr": 0.4},
+    }
+    (run_dir / "resolved.yaml").write_text(yaml.safe_dump(resolved), encoding="utf-8")
+    (run_dir / "git_sha").write_text("abc123\n", encoding="utf-8")
+    (run_dir / "meta.json").write_text(
+        json.dumps({"experiment": "S2_test", "git_sha": "abc123", "git_dirty": False}),
+        encoding="utf-8",
+    )
+    (run_dir / "metrics.json").write_text(
+        json.dumps(
+            {
+                "experiment": "S2_test (vs-model-labels, NOT GT)",
+                "n_images": 12,
+                "n_groups": 11,
+                "score_thr": 0.31,
+                "score_thr_source": "selected_on:val",
+                "localization": {"ap50": 0.71, "ap50_95": 0.49, "f1": 0.76},
+                "identification": {"top1_acc": 0.0, "macro_f1": 0.0},
+                "counting": {"total_count_mae": 3.58, "exact_inventory_rate": 0.0},
+            }
+        ),
+        encoding="utf-8",
+    )
+    return run_dir
+
+
+def test_export_attaches_knn_gallery_from_embeddings(tmp_path):
+    run_dir = _knn_run(tmp_path)
+    artifacts_dir = tmp_path / "artifacts"
+    bundle = artifacts.export_bundle(
+        run_dir,
+        "rfdetr-m-1280-knn-v0",
+        artifacts_dir=artifacts_dir,
+        identifier={"type": "embedding_knn", "model": "stub", "k": 1},
+        counting_override={"neighbour_vote": "report"},
+    )
+
+    manifest = json.loads((bundle / "manifest.json").read_text(encoding="utf-8"))
+    assert manifest["embedder_id"] == "stub"
+    assert manifest["detector_classes"] == ["cartridge"]
+    assert manifest["thresholds"] == {"score_thr": 0.31, "identity_thr": 0.4}
+    assert manifest["provenance"]["metrics_caveat"].upper().find("NOT") >= 0
+    assert manifest["provenance"]["metrics_source"].endswith("NOT GT)")
+    assert "gallery.npz" in manifest["files"]
+
+    cfg = yaml.safe_load((bundle / "pipeline.yaml").read_text(encoding="utf-8"))
+    assert cfg["identifier"] == {"type": "embedding_knn", "model": "stub", "k": 1, "gallery": "gallery.npz"}
+    assert cfg["counting"]["neighbour_vote"] == "report"
+
+    with np.load(bundle / "gallery.npz", allow_pickle=False) as g:
+        # Train-split, known-class rows only: the 3 train rows minus the 1 dropped unknown.
+        assert list(g["labels"]) == ["coca-cola-part1", "coca-cola-part1", "sprite"]
+        assert list(g["groups"]) == ["tr-a", "tr-a", "tr-b"]
+        # Regression: splits must persist as full 'train' strings, not truncated to 't'.
+        assert all(str(s) == "train" for s in g["splits"])
+
+
+def test_export_knn_gallery_rejects_embedder_mismatch(tmp_path):
+    run_dir = _knn_run(tmp_path)
+    with pytest.raises(ValueError, match="disagrees"):
+        artifacts.export_bundle(
+            run_dir,
+            "bad-embedder",
+            artifacts_dir=tmp_path / "artifacts",
+            identifier={"type": "embedding_knn", "model": "facebook/dinov2-base", "k": 5},
+        )
+
+
+def test_knn_bundle_loads_and_identifies(tmp_path, monkeypatch):
+    import freestyle.infer.detector as detector_mod
+
+    class FakeTiledDetector:
+        def __init__(self, checkpoint, **kwargs):
+            self.checkpoint = checkpoint
+            self.backend = type("Backend", (), {"class_names": {0: "cartridge"}})()
+
+        def predict(self, image):
+            return [{"box": [2, 2, 22, 22], "score": 0.9}]
+
+    monkeypatch.setattr(detector_mod, "TiledDetector", FakeTiledDetector)
+
+    run_dir = _knn_run(tmp_path)
+    artifacts_dir = tmp_path / "artifacts"
+    artifacts.export_bundle(
+        run_dir,
+        "rfdetr-m-1280-knn-v0",
+        artifacts_dir=artifacts_dir,
+        identifier={"type": "embedding_knn", "model": "stub", "k": 1},
+        counting_override={"neighbour_vote": "report"},
+    )
+
+    # load_bundle rebuilds EmbeddingIdentifier from the train-only gallery; the truncated
+    # 't' split bug would raise 'Gallery may contain train rows only' here.
+    pipeline = artifacts.load_bundle("rfdetr-m-1280-knn-v0", device="cpu", artifacts_dir=artifacts_dir)
+    assert pipeline.identity_thr == 0.4
+    assert pipeline.neighbour_vote == "report"
+
+    query = Image.new("RGB", (32, 32), color=(200, 20, 20))
+    result = pipeline.run(query, "img1", group="query-group-9")
+    assert result["counts"] == {"coca-cola-part1": 1}
+    assert result["unknown"] == 0

@@ -21,6 +21,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
+import numpy as np
 import yaml
 
 from freestyle.pipeline import EmbeddingIdentifier, Pipeline, ProposalLocalizer
@@ -84,6 +85,78 @@ def _load_optional_json(path: Path) -> Any:
     if not path.is_file():
         return None
     return json.loads(path.read_text(encoding="utf-8"))
+
+
+# Labels that are never usable as identification gallery rows: ``unknown`` (identity
+# not determinable) and the class-agnostic super-class ``cartridge``.
+_GALLERY_EXCLUDE_LABELS = frozenset({"unknown", "cartridge"})
+
+
+def _build_gallery_from_embeddings(
+    embeddings_npz: Path,
+    dest_npz: Path,
+    *,
+    split: str = "train",
+    model: str | None = None,
+) -> str:
+    """Derive a ``gallery.npz`` from a run's cached ``embeddings.npz``.
+
+    Keeps only ``<split>`` rows whose crop identity is a known catalog class (drops
+    ``unknown``/``cartridge``). The embedder model recorded in ``embeddings.npz`` is
+    returned so the identifier uses the *same* backbone that produced the vectors.
+    An explicit ``model`` must agree with it (the caller decides the identifier
+    backbone), otherwise this is rejected — mismatched embedders make the KNN useless.
+    """
+    if not embeddings_npz.is_file():
+        raise FileNotFoundError(
+            f"No gallery asset and no cached embeddings to build one from: {embeddings_npz}"
+        )
+    with np.load(embeddings_npz, allow_pickle=False) as data:
+        embeddings = np.asarray(data["embeddings"], dtype=np.float32)
+        labels = np.asarray(data["labels"], dtype=str)
+        image_ids = np.asarray(data["image_ids"], dtype=str)
+        groups = np.asarray(data["groups"], dtype=str)
+        splits = np.asarray(data["splits"], dtype=str)
+        embedded_model = str(data["model"][0]) if "model" in data and len(data["model"]) else None
+        bboxes = np.asarray(data["bboxes"], dtype=np.float32) if "bboxes" in data else None
+        annotation_ids = np.asarray(data["annotation_ids"], dtype=str) if "annotation_ids" in data else None
+        file_names = np.asarray(data["file_names"], dtype=str) if "file_names" in data else None
+
+    if model and embedded_model and model != embedded_model:
+        raise ValueError(
+            f"Identifier embedder {model!r} disagrees with the run embeddings model "
+            f"{embedded_model!r}; the gallery embeddings must be re-embedded, not relabeled"
+        )
+    resolved_model = model or embedded_model
+    if not resolved_model:
+        raise ValueError("Cannot resolve embedder model from the run embeddings.npz")
+
+    keep = (splits == split) & ~np.isin(labels, list(_GALLERY_EXCLUDE_LABELS))
+    keep &= np.array([bool(s) for s in image_ids]) & np.array([bool(g) for g in groups])
+    n_rows = int(keep.sum())
+    if n_rows == 0:
+        raise ValueError(
+            f"No usable {split!r} gallery rows in {embeddings_npz} "
+            f"(need known-class crops, not unknown/cartridge)"
+        )
+
+    payload: dict[str, Any] = {
+        "embeddings": embeddings[keep],
+        "labels": labels[keep],
+        "image_ids": image_ids[keep],
+        "groups": groups[keep],
+        "splits": np.array([split] * n_rows, dtype=str),
+        "model": np.asarray([resolved_model], dtype=str),
+    }
+    if bboxes is not None:
+        payload["bboxes"] = bboxes[keep]
+    if annotation_ids is not None:
+        payload["annotation_ids"] = annotation_ids[keep]
+    if file_names is not None:
+        payload["file_names"] = file_names[keep]
+    dest_npz.parent.mkdir(parents=True, exist_ok=True)
+    np.savez(dest_npz, **payload)
+    return resolved_model
 
 
 def _load_base_configs(run_dir: Path) -> tuple[dict[str, Any], dict[str, Any]]:
@@ -189,8 +262,17 @@ def export_bundle(
     *,
     artifacts_dir: str | Path | None = None,
     overwrite: bool = False,
+    identifier: dict[str, Any] | None = None,
+    counting_override: dict[str, Any] | None = None,
 ) -> Path:
-    """Freeze a completed experiment run directory into ``artifacts/<name>/``."""
+    """Freeze a completed experiment run directory into ``artifacts/<name>/``.
+
+    ``identifier`` optionally overrides/attaches the run's identifier (e.g. attach an
+    ``embedding_knn`` to a run that evaluated ``none``). When the requested identifier is
+    ``embedding_knn`` and the run has no saved ``gallery.npz``, the gallery is rebuilt from
+    the run's cached ``embeddings.npz`` (train-split, known-class crops only). ``counting_override``
+    optionally overrides frozen counting knobs (e.g. ``{"neighbour_vote": "report"}`).
+    """
     if not name or "/" in name or "\\" in name or name in (".", ".."):
         raise ValueError(f"Invalid bundle name: {name!r}")
     run_path = Path(run_dir)
@@ -212,6 +294,8 @@ def export_bundle(
         raise ValueError("localizer.type is required to export a bundle")
 
     ident = dict(pipeline_cfg.get("identifier") or {"type": "none"})
+    if identifier:
+        ident = {**ident, **identifier}
     counting = dict(pipeline_cfg.get("counting") or resolved.get("count") or {})
     counting.setdefault("identity_thr", 0.5)
     counting.setdefault("neighbour_vote", "off")
@@ -220,6 +304,8 @@ def export_bundle(
         counting["score_thr"] = float(metrics["score_thr"])
     else:
         counting.setdefault("score_thr", 0.0)
+    if counting_override:
+        counting.update(counting_override)
 
     detector_classes, categories = _extract_detector_classes(run_path, pipeline_cfg, resolved)
 
@@ -257,14 +343,20 @@ def export_bundle(
         # 2. Identifier gallery npz if embedding_knn.
         embedder_id: str | None = None
         if ident.get("type") == "embedding_knn":
-            embedder_id = str(ident.get("model") or "facebook/dinov2-base")
-            ident["model"] = embedder_id
+            requested_model = ident.get("model")
             gallery = _resolve_asset(ident.get("gallery"), run_path, ("gallery.npz",))
-            if gallery is None:
-                raise FileNotFoundError(
-                    f"Identifier gallery not found in {run_path} (configured: {ident.get('gallery')!r})"
+            if gallery is not None:
+                embedder_id = str(requested_model or "facebook/dinov2-base")
+                shutil.copy2(gallery, stage_dir / "gallery.npz")
+            else:
+                # No saved gallery: rebuild it from the run's cached crop embeddings
+                # (train-split, known-class rows) using the same embedder backbone.
+                embedder_id = _build_gallery_from_embeddings(
+                    run_path / "embeddings.npz",
+                    stage_dir / "gallery.npz",
+                    model=(str(requested_model) if requested_model else None),
                 )
-            shutil.copy2(gallery, stage_dir / "gallery.npz")
+            ident["model"] = embedder_id
             ident["gallery"] = "gallery.npz"
         elif ident.get("type") == "vlm_crop":
             embedder_id = str(ident.get("model") or "") or None
@@ -322,6 +414,10 @@ def export_bundle(
                 "git_dirty": meta.get("git_dirty"),
                 "git_diff_hash": meta.get("git_diff_hash"),
                 "metrics_summary": _metrics_summary(metrics),
+                "metrics_caveat": (
+                    "metrics are measured against VLM bootstrap model labels, NOT human-verified ground truth"
+                ),
+                "metrics_source": (metrics.get("experiment") if isinstance(metrics, dict) else None),
             },
             "files": files_manifest,
         }
@@ -503,6 +599,17 @@ def main(argv: list[str] | None = None) -> int:
     exp.add_argument("--name", required=True, help="Bundle name under artifacts/<name>/.")
     exp.add_argument("--artifacts-dir", default=None, help="Override artifacts directory.")
     exp.add_argument("--overwrite", action="store_true", help="Replace an existing bundle.")
+    exp.add_argument(
+        "--identifier",
+        default=None,
+        help="JSON identifier override, e.g. '{\"type\":\"embedding_knn\",\"model\":\"google/siglip2-base-patch16-224\",\"k\":5}'. "
+        "When embedding_knn and the run has no gallery.npz, the gallery is rebuilt from the run's embeddings.npz (train-split, known-class crops).",
+    )
+    exp.add_argument(
+        "--counting",
+        default=None,
+        help="JSON counting override, e.g. '{\"neighbour_vote\":\"report\"}'.",
+    )
 
     ver = sub.add_parser("verify", help="Verify a bundle's manifest and SHA-256 checksums.")
     ver.add_argument("name", help="Bundle name under artifacts/.")
@@ -510,8 +617,15 @@ def main(argv: list[str] | None = None) -> int:
 
     args = parser.parse_args(argv)
     if args.command == "export":
+        ident_override = json.loads(args.identifier) if args.identifier else None
+        counting_override = json.loads(args.counting) if args.counting else None
         out = export_bundle(
-            args.run, args.name, artifacts_dir=args.artifacts_dir, overwrite=args.overwrite
+            args.run,
+            args.name,
+            artifacts_dir=args.artifacts_dir,
+            overwrite=args.overwrite,
+            identifier=ident_override,
+            counting_override=counting_override,
         )
         print(out)
         return 0
