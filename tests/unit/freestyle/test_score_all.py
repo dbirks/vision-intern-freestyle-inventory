@@ -76,6 +76,10 @@ def test_full_scoring_with_fake_runs(tmp_path, monkeypatch):
                           'attributes': {'id_mode': 'two_stage', 'id_confidence': .9}})
         predictions[split].append({'image_id': idx, 'bbox': [10, 10, 10, 20], 'category_id': 1,
                                    'score': .9, 'proposed_class': 'sprite', 'id_score': .9})
+    split_images['local/train.jpg'] = 'train'
+    groups['local/train.jpg'] = 'train'
+    proposals.append({'id': 6, 'image_id': 6, 'bbox': [10, 10, 10, 20], 'category_id': 1,
+                      'attributes': {'source': 'vlm:bootstrap', 'id_confidence': .9}})
     queue = {'version': 1, 'classes': [{'id': 1, 'name': 'sprite'}, {'id': 2, 'name': 'unknown'}],
              'images': images, 'questions': questions}
     queue_path = tmp_path / 'queue.json'
@@ -85,26 +89,32 @@ def test_full_scoring_with_fake_runs(tmp_path, monkeypatch):
     save(tmp_path / 'splits.json', {'images': split_images, 'groups': groups})
     save(tmp_path / 'audit.json', {'images': audit})
     save(tmp_path / 'proposals.json', {'images': [{'id': i + 1, 'file_name': im['image_id']}
-                                                   for i, im in enumerate(images)],
+                                                  for i, im in enumerate(images)]
+                                                 + [{'id': 6, 'file_name': 'local/train.jpg'}],
                                        'annotations': proposals, 'categories': queue['classes']})
     run = tmp_path / 'runs' / 'D_fake'
     save(run / 'meta.json', {'config': {'family': 'D_det_multiclass'}})
     for split in predictions:
         save(run / split / 'predictions.json', predictions[split])
-    np.savez(run / 'embeddings.npz', embeddings=np.ones((5, 2)),
-             file_names=np.array([im['image_id'] for im in images]),
-             annotation_ids=np.array([str(i) for i in range(1, 6)]),
-             bboxes=np.array([[10, 10, 10, 20]] * 5))
+    np.savez(run / 'embeddings.npz', embeddings=np.ones((6, 2)),
+             file_names=np.array([im['image_id'] for im in images] + ['local/train.jpg']),
+             annotation_ids=np.array([str(i) for i in range(1, 7)]),
+             bboxes=np.array([[10, 10, 10, 20]] * 6))
     out = tmp_path / 'RESULTS_GT.md'
     assert main(['--queue', str(queue_path), '--answers', str(answer_path), '--runs', str(run),
                  '--splits', str(tmp_path / 'splits.json'), '--audit', str(tmp_path / 'audit.json'),
                  '--proposals', str(tmp_path / 'proposals.json'), '--out', str(out), '--bootstrap', '20']) == 0
     data = json.loads((tmp_path / 'results_gt.json').read_text())
-    assert len(data['rows']) == 10
-    assert {r['identifier'] for r in data['rows']} == {'none', 'own', 'knn', 'proto', 'vlm'}
+    assert len(data['rows']) == 18
+    assert {r['identifier'] for r in data['rows']} == {'none', 'own', 'knn', 'proto', 'vlm', 'knn_trainvlm',
+                                                   'knn_trainvlm+val', 'linear_trainvlm',
+                                                   'linear_trainvlm+val'}
     assert data['excluded']['test'][0]['image_id'] == 'local/5.jpg'
     for row in data['rows']:
         assert row['threshold_source'] == 'val'
+        if 'trainvlm' in row['identifier']:
+            assert row['train_vlm_confidence_thr'] in (0., .5, .75, .9)
+            assert row['train_gallery_size'] == 1
         assert row['subsets']['all']['bootstrap_ci95']['n_groups'] == 2
         assert row['subsets']['sharp-full']['n_images'] == 1
         assert row['subsets']['partial/blurry']['n_images'] == 1
@@ -151,3 +161,34 @@ def test_pair_rule_and_no_test_gallery():
               'annotations': [{'image_id': 1, 'category_id': 1, 'attributes': {'proposal_ann_id': 1}}]}
     assert gallery(emb, val_gt) == ([0], ['sprite'])
     assert gallery(emb, val_gt, 'g') == ([], [])
+
+
+def test_train_gallery_selection_and_validation_calibration():
+    import numpy as np
+
+    from freestyle.experiments.score_all import identify, select_thresholds, train_gallery
+
+    names = ['train'] * 4 + ['val', 'test']
+    emb = {'file_names': np.array(names), 'annotation_ids': np.array([str(i) for i in range(6)]),
+           'embeddings': np.ones((6, 2)), 'bboxes': np.array([[0, 0, 10, 10]] * 6)}
+    proposals = {'train': [{'id': i, 'class': 'wrong' if i < 3 else 'correct',
+                            'attributes': {'source': 'vlm:bootstrap',
+                                           'id_confidence': .4 if i < 3 else .9}}
+                           for i in range(4)],
+                 'test': [{'id': 5, 'class': 'wrong',
+                           'attributes': {'source': 'vlm:bootstrap', 'id_confidence': 1.}}]}
+    splits = {'images': {'train': 'train', 'val': 'val', 'test': 'test'}}
+    assert train_gallery(emb, proposals, splits, 0)[0] == [0, 1, 2, 3]
+    assert train_gallery(emb, proposals, splits, .5) == ([3], ['correct'])
+    image = {'id': 1, 'file_name': 'val', 'group_id': 'vg', 'height': 100,
+             'attributes': {'human_counts': {'total': 1}}}
+    gt = {'images': [image], 'annotations': [], 'categories': []}
+    counts = {'images': {'val': {'classes': {'correct': 1}}}}
+    pred = [{'bbox': [0, 0, 10, 10], 'score': .9}]
+    outcomes = {}
+    for cutoff in (0., .5):
+        items = train_gallery(emb, proposals, splits, cutoff)
+        rows = identify(pred, image, 'knn_trainvlm', proposals, emb, gt,
+                        validation=True, train_items=items)
+        outcomes[cutoff] = select_thresholds([image], gt, counts, {1: rows}, False, False)
+    assert outcomes[.5][:2] < outcomes[0.][:2]

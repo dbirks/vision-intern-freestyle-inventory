@@ -23,7 +23,7 @@ from freestyle.eval.metrics import (
     _compute_coco_ap_from_records, _per_image_localization_records, _prepare_dataset,
     compute_group_bootstrap_ci, load_groups_map,
 )
-from freestyle.identify.classify import KNNClassifier, PrototypeClassifier
+from freestyle.identify.classify import KNNClassifier, LinearProbe, PrototypeClassifier
 from freestyle.quiz.build_queue import shelf_labels
 from freestyle.quiz.to_coco import build_coco, load_answers
 
@@ -139,7 +139,31 @@ def gallery(emb, val_gt, held_out_group=None):
     return indexes, targets
 
 
-def identify(preds, image, method, proposals, emb, val_gt, validation=False):
+def train_gallery(emb, proposals, splits, confidence):
+    """Select VLM-labelled training proposals using the authoritative split map."""
+    labels = {}
+    for name, anns in proposals.items():
+        if splits.get('images', {}).get(name) != 'train':
+            continue
+        for ann in anns:
+            attrs = ann.get('attributes', {})
+            source = str(attrs.get('source') or '')
+            score = attrs.get('id_confidence')
+            if (source.startswith('vlm:') and score is not None
+                    and 0 <= float(score) <= 1 and float(score) >= confidence
+                    and ann['class'] not in ('unknown', 'cartridge')):
+                labels[(name, str(ann['id']))] = ann['class']
+    indexes, targets = [], []
+    for idx, (name, ann_id) in enumerate(zip(emb['file_names'], emb['annotation_ids'], strict=True)):
+        key = (str(name), str(ann_id))
+        if key in labels:
+            indexes.append(idx)
+            targets.append(labels[key])
+    return indexes, targets
+
+
+def identify(preds, image, method, proposals, emb, val_gt, validation=False,
+             train_items=None, fitted=None):
     rows = [dict(p, **{'class': 'unknown', 'identity_score': 0.0}) for p in preds]
     if method == 'none':
         return rows
@@ -166,20 +190,37 @@ def identify(preds, image, method, proposals, emb, val_gt, validation=False):
         return rows
     if emb is None or not rows:
         return rows
-    indexes, targets = gallery(emb, val_gt, image['group_id'] if validation else None)
+    uses_train = 'trainvlm' in method
+    uses_val = not uses_train or method.endswith('+val')
+    indexes, targets = (list(train_items[0]), list(train_items[1])) if uses_train and train_items else ([], [])
+    if uses_val:
+        val_indexes, val_targets = gallery(emb, val_gt, image['group_id'] if validation else None)
+        indexes.extend(val_indexes)
+        targets.extend(val_targets)
     if not indexes:
         return rows
     query = np.flatnonzero(emb['file_names'].astype(str) == image['file_name'])
     if not len(query):
         return rows
-    clf = (KNNClassifier(k=5) if method == 'knn' else PrototypeClassifier())
-    clf.fit(emb['embeddings'][indexes], targets)
+    key = (method, tuple(indexes))
+    if fitted is None:
+        fitted = {}
+    if key not in fitted:
+        if method.startswith('knn'):
+            clf = KNNClassifier(k=5)
+        elif method.startswith('linear'):
+            clf = LinearProbe()
+        else:
+            clf = PrototypeClassifier()
+        fitted[key] = clf.fit(emb['embeddings'][indexes], targets)
+    clf = fitted[key]
     overlaps = box_iou([r['bbox'] for r in rows], emb['bboxes'][query])
-    for row, ious in zip(rows, overlaps, strict=True):
-        idx = int(np.argmax(ious))
-        if ious[idx] >= .5:
-            labels, scores = clf.predict_with_scores(emb['embeddings'][query[idx:idx + 1]])
-            row.update({'class': str(labels[0]), 'identity_score': float(scores[0])})
+    chosen = np.argmax(overlaps, axis=1)
+    valid = np.flatnonzero(overlaps[np.arange(len(rows)), chosen] >= .5)
+    if len(valid):
+        labels, scores = clf.predict_with_scores(emb['embeddings'][query[chosen[valid]]])
+        for idx, label, score in zip(valid, labels, scores, strict=True):
+            rows[idx].update({'class': str(label), 'identity_score': float(score)})
     return rows
 
 
@@ -302,7 +343,7 @@ def select_thresholds(images, gt, counts, rows_by_image, pair, none):
             key = (best_total, class_error, score_thr, identity_thr)
             if best is None or key < best:
                 best = key
-    return best[2], best[3]
+    return best
 
 
 def validate_groups(gt, split, splits):
@@ -322,13 +363,14 @@ def markdown(result):
              'Identity accuracy is conditional on a matched human-answered, known-identity crop.',
              'Class inventory may be incomplete where questions are unanswered or human totals disagree with crop counts; exact inventory excludes those images.',
              'Thresholds minimize validation total count error, then class count error; embedding validation uses held-out groups.',
+             'Training-gallery confidence thresholds are selected on validation; +val galleries add human-labelled validation crops, holding out the query group during validation.',
              'Sharp-full means cabinet_full with no or mild motion blur; partial/blurry means cabinet_partial or severe blur. Other audit cases are omitted from these subsets.',
              '', 'Excluded images:']
     for split in ('val', 'test'):
         lines.append(f"- {split}: " + (', '.join(x['image_id'] + ' (' + x['reason'] + ')'
                                                 for x in result['excluded'][split]) or 'none'))
-    lines += ['', '| Localiser | Identifier | Pair | Subset | Images | Total MAE (95% CI) | Top MAE | Bottom MAE | Exact inventory | ID accuracy | AP50 |',
-              '|---|---|---|---|---:|---|---:|---:|---:|---:|---:|']
+    lines += ['', '| Localiser | Identifier | Pair | Train confidence | Train crops | Subset | Images | Total MAE (95% CI) | Top MAE | Bottom MAE | Exact inventory | ID accuracy | AP50 |',
+              '|---|---|---|---:|---:|---|---:|---|---:|---:|---:|---:|---:|']
     def fmt(x):
         return '—' if x is None else f'{x:.3f}'
     def estimate(value, key):
@@ -337,7 +379,8 @@ def markdown(result):
         return fmt(value['metrics'].get(key)) + interval
     for row in result['rows']:
         for subset, value in row['subsets'].items():
-            lines.append(f"| {row['run']} | {row['identifier']} | {row['pair_rule']} | {subset} | {value['n_images']} | "
+            lines.append(f"| {row['run']} | {row['identifier']} | {row['pair_rule']} | {fmt(row['train_vlm_confidence_thr'])} | "
+                         f"{row['train_gallery_size']} | {subset} | {value['n_images']} | "
                          f"{estimate(value, 'total_error')} | {estimate(value, 'top_error')} | "
                          f"{estimate(value, 'bottom_error')} | {estimate(value, 'exact_inventory')} | "
                          f"{estimate(value, 'identity_accuracy')} | {estimate(value, 'ap50')} |")
@@ -386,7 +429,8 @@ def run(args):
     result = {'version': 1, 'demo': args.demo, 'excluded': excluded, 'rows': [], 'skipped_runs': [],
               'limitations': ['All localization reference boxes originate from model proposals.',
                               'Per-class human counts include only answered crops.',
-                              'Validation embeddings use leave-one-group-out gallery; test uses all eligible validation crops.']}
+                              'Validation embeddings use leave-one-group-out gallery; test uses all eligible validation crops.',
+                              'Training VLM gallery confidence is selected on validation; test labels are never used.']}
     for path in sorted(map(Path, glob.glob(args.runs))):
         val_path, test_path = path / 'val/predictions.json', path / 'test/predictions.json'
         if not val_path.is_file() or not test_path.is_file():
@@ -407,25 +451,52 @@ def run(args):
         if family.startswith('D_'):
             methods.append('own')
         if emb is not None:
-            methods += ['knn', 'proto']
+            methods += ['knn', 'proto', 'knn_trainvlm', 'knn_trainvlm+val',
+                        'linear_trainvlm', 'linear_trainvlm+val']
         for method in methods:
-            rows = {split: {im['id']: identify(predictions[split][im['id']], im, method, proposals, emb,
-                                               gt['val'], validation=split == 'val')
-                            for im in gt[split]['images']} for split in ('val', 'test')}
+            train_variant = 'trainvlm' in method
+            candidates = (0., .5, .75, .9) if train_variant else (None,)
+            fitted = {}
+            variants = {}
+            for confidence in candidates:
+                train_items = train_gallery(emb, proposals, splits, confidence) if train_variant else None
+                if train_variant and not train_items[0]:
+                    continue
+                val_rows = {im['id']: identify(predictions['val'][im['id']], im, method, proposals, emb,
+                                                gt['val'], validation=True, train_items=train_items, fitted=fitted)
+                            for im in gt['val']['images']}
+                variants[confidence] = (train_items, val_rows)
+            if not variants:
+                result['skipped_runs'].append({'run': path.name, 'identifier': method,
+                                               'reason': 'no VLM-labelled training crop embeddings'})
+                continue
             for pair in (False, True):
-                score_thr, id_thr = select_thresholds(gt['val']['images'], gt['val'], counts['val'],
-                                                      rows['val'], pair, method == 'none')
+                selected = None
+                for confidence, (train_items, val_rows) in variants.items():
+                    key = select_thresholds(gt['val']['images'], gt['val'], counts['val'],
+                                            val_rows, pair, method == 'none')
+                    selection = (*key, confidence if confidence is not None else -1.)
+                    if selected is None or selection < selected[0]:
+                        selected = (selection, confidence, train_items)
+                key, confidence, train_items = selected
+                score_thr, id_thr = key[2:4]
+                test_rows = {im['id']: identify(predictions['test'][im['id']], im, method, proposals, emb,
+                                                 gt['val'], train_items=train_items, fitted=fitted)
+                             for im in gt['test']['images']}
                 images = gt['test']['images']
                 sharp = [im for im in images if audit.get(im['file_name'], {}).get('scene_label') == 'cabinet_full'
                          and audit.get(im['file_name'], {}).get('motion_blur') in ('none', 'mild')]
                 partial = [im for im in images if audit.get(im['file_name'], {}).get('scene_label') == 'cabinet_partial'
                            or audit.get(im['file_name'], {}).get('motion_blur') == 'severe']
-                subsets = {name: score_subset(ims, gt['test'], counts['test'], rows['test'], score_thr, id_thr,
+                subsets = {name: score_subset(ims, gt['test'], counts['test'], test_rows, score_thr, id_thr,
                                               pair, method == 'none', args.bootstrap)
                            for name, ims in [('all', images), ('sharp-full', sharp), ('partial/blurry', partial)]}
                 result['rows'].append({'run': path.name, 'identifier': method, 'pair_rule': 'on' if pair else 'off',
                                        'score_thr': score_thr, 'identity_thr': id_thr,
+                                       'train_vlm_confidence_thr': confidence,
+                                       'train_gallery_size': len(train_items[0]) if train_items else 0,
                                        'threshold_source': 'val', 'subsets': subsets})
+
     if not result['rows']:
         raise ValueError('no runs with both validation and test predictions')
     out.parent.mkdir(parents=True, exist_ok=True)
