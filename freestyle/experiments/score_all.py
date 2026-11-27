@@ -322,7 +322,7 @@ def markdown(result):
              'Identity accuracy is conditional on a matched human-answered, known-identity crop.',
              'Class inventory may be incomplete where questions are unanswered or human totals disagree with crop counts; exact inventory excludes those images.',
              'Thresholds minimize validation total count error, then class count error; embedding validation uses held-out groups.',
-             'Sharp-full means cabinet_full with no motion blur; partial/blurry means partial or any blur. Other audit cases are omitted from these subsets.',
+             'Sharp-full means cabinet_full with no or mild motion blur; partial/blurry means cabinet_partial or severe blur. Other audit cases are omitted from these subsets.',
              '', 'Excluded images:']
     for split in ('val', 'test'):
         lines.append(f"- {split}: " + (', '.join(x['image_id'] + ' (' + x['reason'] + ')'
@@ -417,9 +417,9 @@ def run(args):
                                                       rows['val'], pair, method == 'none')
                 images = gt['test']['images']
                 sharp = [im for im in images if audit.get(im['file_name'], {}).get('scene_label') == 'cabinet_full'
-                         and audit.get(im['file_name'], {}).get('motion_blur') == 'none']
+                         and audit.get(im['file_name'], {}).get('motion_blur') in ('none', 'mild')]
                 partial = [im for im in images if audit.get(im['file_name'], {}).get('scene_label') == 'cabinet_partial'
-                           or audit.get(im['file_name'], {}).get('motion_blur') in ('mild', 'severe')]
+                           or audit.get(im['file_name'], {}).get('motion_blur') == 'severe']
                 subsets = {name: score_subset(ims, gt['test'], counts['test'], rows['test'], score_thr, id_thr,
                                               pair, method == 'none', args.bootstrap)
                            for name, ims in [('all', images), ('sharp-full', sharp), ('partial/blurry', partial)]}
