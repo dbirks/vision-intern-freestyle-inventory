@@ -1,0 +1,37 @@
+# S6: B1 OWLv2, cheap post-hoc cleanup only (no training).
+# Changes vs B1: containment_threshold 0.8 in the tile merge (suppress a clipped fragment
+# under the full box it sits inside) + max_box_area_frac 0.08, which rejects "boxes" that
+# cover more than 8% of the frame -- those are whole shelves / cabinet sections, never a
+# single cartridge (real boxes: median 0.5%, p99 5.2% of frame area in the model labels).
+# Scored vs bootstrap model labels (NOT GT).
+id: S6_owlv2_containment
+family: B_zeroshot_plus_embed
+compute:
+  target: k8s:5090
+  vram_mb: 12000
+  timeout: 1200
+data:
+  train: labels/bootstrap_v2.json
+  val: labels/bootstrap_v2.json
+  test: labels/bootstrap_v2.json
+  bootstrap: labels/bootstrap_v2.json
+  label_source: bootstrap
+  bootstrap_filter:
+    verdicts: [correct]
+localizer:
+  type: zeroshot
+  backend: owlv2
+  model_id: google/owlv2-large-patch14-ensemble
+  prompts: ["cartridge box", "narrow cardboard box"]
+  tile: 1024
+  overlap: 0.25
+  score_thr: 0.1
+  containment_threshold: 0.8
+  max_box_area_frac: 0.08
+identifier:
+  type: none
+embeddings:
+  model: facebook/dinov2-base
+  batch_size: 64
+count:
+  identity_thr: 0.5

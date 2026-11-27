@@ -1,0 +1,34 @@
+# S5_rfdetr_large_agnostic: RF-DETR Large instead of Medium, everything else C2 (tile 1024)
+# Single variable vs C2. Model bootstrap labels only (vs-model-labels, NOT GT).
+id: S5_rfdetr_large_agnostic
+family: C_det_agnostic_plus_embed
+compute:
+  target: k8s:5090
+  vram_mb: 16384
+  timeout: 1500
+data:
+  train: labels/bootstrap_v2.json
+  val: labels/bootstrap_v2.json
+  test: labels/bootstrap_v2.json
+  bootstrap: labels/bootstrap_v2.json
+  label_source: bootstrap
+  bootstrap_filter:
+    verdicts: [correct]
+localizer:
+  type: tiled_detector
+  tile: 1024
+  overlap: 0.25
+  training:
+    model: RFDETRLarge
+    resolution: 576
+    epochs: 100
+    batch_size: 4
+    early_stopping: true
+    early_stopping_patience: 15
+identifier:
+  type: none
+embeddings:
+  model: google/siglip2-base-patch16-224
+  batch_size: 64
+count:
+  identity_thr: 0.5

@@ -1,0 +1,42 @@
+# S4 c2_long: NOT RUN in window 2 (no GPU time spent). The premise turned out to be false:
+# the C2 baseline's own training log (runs/C2_rfdetr_medium_agnostic_siglip2-89fe7c2b/training/
+# metrics.csv + job.log) shows early stopping firing at epoch 63 of 100 ("Monitored metric
+# __rfdetr_effective_map__ did not improve in the last 15 records", best score at epoch ~48),
+# so the 100-epoch cap was never binding and raising it to 250 with the same seed and the
+# same patience cannot change the fit -- only waste ~5 GPU-minutes. What the curve does say:
+# val mAP@50 peaks at epoch 32 and drifts down to 0.914 by epoch 63, so more epochs do not
+# help this 11-image training set. Kept as a config so the reasoning is reproducible.
+# S4_c2_long: C2 with 2.5x the epochs (250), early stopping still on
+# Single variable vs C2. Model bootstrap labels only (vs-model-labels, NOT GT).
+id: S4_c2_long
+family: C_det_agnostic_plus_embed
+compute:
+  target: k8s:5090
+  vram_mb: 12000
+  timeout: 1800
+data:
+  train: labels/bootstrap_v2.json
+  val: labels/bootstrap_v2.json
+  test: labels/bootstrap_v2.json
+  bootstrap: labels/bootstrap_v2.json
+  label_source: bootstrap
+  bootstrap_filter:
+    verdicts: [correct]
+localizer:
+  type: tiled_detector
+  tile: 1024
+  overlap: 0.25
+  training:
+    model: RFDETRMedium
+    resolution: 576
+    epochs: 250
+    batch_size: 4
+    early_stopping: true
+    early_stopping_patience: 15
+identifier:
+  type: none
+embeddings:
+  model: google/siglip2-base-patch16-224
+  batch_size: 64
+count:
+  identity_thr: 0.5

@@ -1,0 +1,42 @@
+# S3: C2 + copy-paste/slot-shuffle synthetic train images (freestyle.augment).
+# Single variable vs C2: the training set only. run_cli is called with split='train' and a
+# split map, so the bank is built from train-split model labels (its own guard refuses any
+# other split); synthetics inherit their parent image's train/val holdout assignment.
+# Model bootstrap labels only (vs-model-labels, NOT GT).
+id: S3_c2_copypaste
+family: C_det_agnostic_plus_embed
+compute:
+  target: k8s:5090
+  vram_mb: 12000
+  timeout: 2100
+data:
+  train: labels/bootstrap_v2.json
+  val: labels/bootstrap_v2.json
+  test: labels/bootstrap_v2.json
+  bootstrap: labels/bootstrap_v2.json
+  label_source: bootstrap
+  bootstrap_filter:
+    verdicts: [correct]
+localizer:
+  type: tiled_detector
+  tile: 1024
+  overlap: 0.25
+  training:
+    model: RFDETRMedium
+    resolution: 576
+    epochs: 100
+    batch_size: 4
+    early_stopping: true
+    early_stopping_patience: 15
+    augment:
+      n_per_image: 3
+      slot_shuffle_prob: 0.5
+      blend_mode: hybrid
+      perspective_jitter: 0.03
+identifier:
+  type: none
+embeddings:
+  model: google/siglip2-base-patch16-224
+  batch_size: 64
+count:
+  identity_thr: 0.5

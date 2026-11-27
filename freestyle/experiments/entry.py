@@ -96,6 +96,72 @@ def find_checkpoint(training_dir, name='checkpoint_best_total.pth'):
     return hits[-1] if hits else training_dir / name
 
 
+def merge_coco(base, extra):
+    """Append *extra*'s images/annotations to *base* with renumbered ids (categories shared).
+
+    Ids are offset so the two annotation spaces cannot collide; category ids must already
+    agree because both files come from the same label source.
+    """
+    images = list(base['images'])
+    annotations = list(base['annotations'])
+    if {c['id'] for c in base['categories']} != {c['id'] for c in extra['categories']}:
+        raise ValueError('augmenting COCO requires identical category ids')
+    image_offset = max([i['id'] for i in images], default=0)
+    ann_offset = max([a['id'] for a in annotations], default=0)
+    for image in extra['images']:
+        images.append({**image, 'id': image['id'] + image_offset})
+    for ann in extra['annotations']:
+        annotations.append({**ann, 'id': ann['id'] + ann_offset,
+                            'image_id': ann['image_id'] + image_offset})
+    return {**base, 'categories': base['categories'], 'images': images, 'annotations': annotations}
+
+
+def augment_training_set(c, root, out, combined_path, train_coco, training_splits):
+    """Add copy-paste/slot-shuffle synthetic images to the *train-only* detector input.
+
+    Sources are train-split instances only: ``run_cli`` refuses any split other than
+    ``'train'`` and ``build_bank`` refuses to run without a split filter, so neither val
+    nor test crops can enter the bank. Synthetic images inherit the split of their parent
+    image, which keeps the deterministic group holdout leak-free. Returns
+    ``(coco_path, split_map_path, images_root)`` covering real *and* synthetic inputs.
+    """
+    from freestyle.augment.copy_paste import run_cli
+
+    data = c['data']
+    spec = dict(c['localizer'].get('training', {}).get('augment') or {})
+    n_per_image = int(spec.get('n_per_image', 3))
+    if n_per_image <= 0:
+        raise ValueError('augment.n_per_image must be positive')
+    aug_dir = out / 'augment'
+    run_cli(coco_path=combined_path, split_map_path=root / data['splits'], split='train',
+            images_root=root / data['images_root'], out_dir=aug_dir, n_per_image=n_per_image,
+            seed=c['seed'], class_balance=bool(spec.get('class_balance', True)),
+            blend_mode=spec.get('blend_mode', 'hybrid'),
+            perspective_jitter=float(spec.get('perspective_jitter', 0.03)),
+            slot_shuffle_prob=float(spec.get('slot_shuffle_prob', 0.0)),
+            apply_photometric=bool(spec.get('photometric', False)))
+    synthetic = json.loads((aug_dir / 'annotations.json').read_text())
+    merged_path = out / 'training_input_augmented.json'
+    merged_path.write_text(json.dumps(merge_coco(train_coco, synthetic)))
+    # One images_root for the exporter: reach the real (read-only) files through symlinks.
+    for image in train_coco['images']:
+        link = aug_dir / image['file_name']
+        if link.is_symlink() or link.exists():
+            continue
+        link.parent.mkdir(parents=True, exist_ok=True)
+        link.symlink_to((root / data['images_root'] / image['file_name']).resolve())
+    split_of = dict(training_splits['images'])
+    images = dict(split_of)
+    for image in synthetic['images']:
+        parent = (image.get('attributes') or {}).get('parent')
+        if parent not in split_of:
+            raise ValueError(f'synthetic image {image["file_name"]} has no train-split parent')
+        images[image['file_name']] = split_of[parent]
+    path = out / 'training_splits_augmented.json'
+    path.write_text(json.dumps({'images': images}))
+    return merged_path, path, aug_dir
+
+
 def stage_train(c, root, out):
     if c['family'] not in ('C_det_agnostic_plus_embed', 'D_det_multiclass', 'E_shelf',
                            'F_det_plus_vlm_id'):
@@ -123,26 +189,64 @@ def stage_train(c, root, out):
     training_split_path = out / 'training_splits.json'
     training_split_path.write_text(json.dumps(training_splits))
     # Tiling must agree between export and tiled inference, so both read the same knobs.
-    export_tiles(str(combined_path), str(root / c['data']['images_root']),
-                 str(dataset), str(training_split_path),
+    images_root, coco_file, split_file = str(root / c['data']['images_root']), combined_path, training_split_path
+    if c['localizer'].get('training', {}).get('augment'):
+        coco_file, split_file, images_root = augment_training_set(
+            c, root, out, combined_path, train_coco, training_splits)
+    export_tiles(str(coco_file), str(images_root), str(dataset), str(split_file),
                  tile=c['localizer'].get('tile', 1024), overlap=c['localizer'].get('overlap', 0.25),
                  class_agnostic=c['family'] != 'D_det_multiclass')
     train({**c['localizer']['training'], 'dataset_dir': str(dataset), 'seed': c['seed']},
           out / 'training')
     prune_training_weights(out / 'training')
+    # Derived inputs (exported tiles, synthetic PNGs, their symlinks) are reproducible from
+    # the config; keeping them would double or triple the collected run on a near-full disk.
+    prune_derived_inputs(out)
 
 
 def prune_training_weights(training_dir):
-    """Drop Lightning resumption states so the run stays collectable.
+    """Keep only the best weights, so a collected run costs ~130 MB instead of ~400 MB.
 
-    Each ``*.ckpt`` is a full optimizer/LR-scheduler snapshot (0.5 GB per epoch
-    checkpoint here) and only useful for resuming an interrupted fit; inference needs the
-    ``.pth`` weights, which stay. Returns the bytes freed.
+    Each ``*.ckpt`` is a full optimizer/LR-scheduler snapshot (0.5 GB per epoch checkpoint
+    here) and only useful for resuming an interrupted fit; ``last_ema.pth`` and
+    ``checkpoint_best_ema.pth`` are duplicates of the reported weights' magnitude. The
+    ``.pth`` the pipeline loads (``checkpoint_best_total.pth``) stays.
     """
     freed = 0
-    for path in Path(training_dir).rglob('*.ckpt'):
+    training_dir = Path(training_dir)
+    weights = sorted(training_dir.rglob('*.pth'))
+    # Inference only needs the best total weights; the EMA copy and last-resume copy are
+    # byte-identical in size and worthless once the fit is finished.
+    keep = [p for p in weights if p.name == 'checkpoint_best_total.pth'] or weights[-1:]
+    for path in weights:
+        if path in keep:
+            continue
         freed += path.stat().st_size
         path.unlink()
+    for path in training_dir.rglob('*.ckpt'):
+        freed += path.stat().st_size
+        path.unlink()
+    return freed
+
+
+def prune_derived_inputs(out):
+    """Delete exported tiles and synthetic training images once training has consumed them.
+
+    Val/test inference re-tiles from the read-only source images, so nothing downstream
+    reads ``dataset/`` or ``augment/``; the synthetic contact sheet is kept as evidence.
+    """
+    freed = 0
+    out = Path(out)
+    for name in ('dataset', 'augment'):
+        target = out / name
+        if not target.exists():
+            continue
+        for path in target.rglob('*'):
+            if path.is_symlink():
+                path.unlink()
+            elif path.is_file() and path.name != 'contact_sheet.png':
+                freed += path.stat().st_size
+                path.unlink()
     return freed
 
 
@@ -188,6 +292,27 @@ def stage_embeddings(c, root, out):
               '--batch-size', str(spec.get('batch_size', 64))])
 
 
+def filter_oversized_proposals(pred_path, sizes, max_area_frac):
+    """Drop proposals covering more than *max_area_frac* of their frame.
+
+    Zero-shot backends happily return a whole shelf or cabinet section as one "box"; such a
+    detection can never match a cartridge annotation, so rejecting it is pure precision.
+    Boxes of unknown-sized images are kept. Returns ``(kept_annotations, dropped_count)``.
+    """
+    if not 0 < max_area_frac <= 1:
+        raise ValueError('max_box_area_frac must be in (0, 1]')
+    kept, dropped = [], 0
+    for det in json.loads(Path(pred_path).read_text()):
+        size = sizes.get(det.get('image_id'))
+        if size:
+            width, height = size
+            if det['bbox'][2] * det['bbox'][3] > max_area_frac * width * height:
+                dropped += 1
+                continue
+        kept.append(det)
+    return kept, dropped
+
+
 def stage_split(c, root, out, split):
     from freestyle.pipeline import main
 
@@ -200,6 +325,8 @@ def stage_split(c, root, out, split):
         from freestyle.propose.run import main as propose
         backend = loc.pop('backend')
         loc.pop('type')
+        # Not a propose CLI flag: applied to the cached proposals below (see stage_split).
+        max_box_area_frac = loc.pop('max_box_area_frac', None)
         args = ['--backend', backend, '--images', str(manifest),
                 '--images-root', str(root / c['data']['images_root']), '--splits',
                 str(root / c['data']['splits']), '--out', str(out / f'proposals_{split}')]
@@ -216,7 +343,16 @@ def stage_split(c, root, out, split):
             else:
                 args.extend([key, str(v)])
         propose(args)
-        loc = {'type': 'proposals', 'path': str(out / f'proposals_{split}' / 'predictions.json')}
+        proposals = out / f'proposals_{split}' / 'predictions.json'
+        if max_box_area_frac:
+            sizes = {i['id']: (i['width'], i['height']) for i in gt['images']}
+            kept, dropped = filter_oversized_proposals(proposals, sizes, float(max_box_area_frac))
+            filtered = out / f'proposals_{split}_filtered.json'
+            filtered.write_text(json.dumps(kept))
+            print(f'[entry] {split}: dropped {dropped} shelf-sized proposals '
+                  f'(> {max_box_area_frac} of frame area), kept {len(kept)}')
+            proposals = filtered
+        loc = {'type': 'proposals', 'path': str(proposals)}
     elif loc['type'] == 'tiled_detector':
         loc.setdefault('checkpoint', str(find_checkpoint(out / 'training')))
     ident = dict(c['identifier'])

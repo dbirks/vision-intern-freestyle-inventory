@@ -11,6 +11,20 @@ from freestyle.geometry import make_tiles, merge_tiled, tile_boxes_to_image
 from freestyle.train.train_detector import metadata
 
 
+def align_class_index(class_names, cls):
+    """Map a predicted class id onto the checkpoint's own class_names space.
+
+    rf-detr reports the *dataset label id* (a class-agnostic tile dataset numbers its one
+    category 1), while ``class_names`` is keyed by detection-head index (0). Passing the raw
+    id through makes the pipeline's index->name lookup miss and every family-C run die at
+    the first val image with 'Unknown detector class index: 1'. Aligning positionally is a
+    no-op whenever ids and keys already agree, so multiclass checkpoints keep their classes.
+    """
+    keys = (list(class_names) if isinstance(class_names, dict)
+            else list(range(len(class_names or []))))
+    return keys[int(cls) % len(keys)] if keys else int(cls)
+
+
 class RFDetrPredictor:
     def __init__(self, checkpoint):
         from rfdetr import RFDETR
@@ -20,7 +34,8 @@ class RFDetrPredictor:
 
     def predict(self, image, threshold):
         result = self.model.predict(image, threshold=threshold)
-        return [{"box": box.tolist(), "score": float(score), "category_id": int(cls)}
+        return [{"box": box.tolist(), "score": float(score),
+                 "category_id": align_class_index(self.class_names, cls)}
                 for box, score, cls in zip(result.xyxy, result.confidence, result.class_id, strict=True)]
 
 

@@ -1,0 +1,34 @@
+# S2_c2_tile1280: C2 with tile 1280 (bigger tiles, fewer of them)
+# Single variable vs C2. Model bootstrap labels only (vs-model-labels, NOT GT).
+id: S2_c2_tile1280
+family: C_det_agnostic_plus_embed
+compute:
+  target: k8s:5090
+  vram_mb: 12000
+  timeout: 1200
+data:
+  train: labels/bootstrap_v2.json
+  val: labels/bootstrap_v2.json
+  test: labels/bootstrap_v2.json
+  bootstrap: labels/bootstrap_v2.json
+  label_source: bootstrap
+  bootstrap_filter:
+    verdicts: [correct]
+localizer:
+  type: tiled_detector
+  tile: 1280
+  overlap: 0.25
+  training:
+    model: RFDETRMedium
+    resolution: 576
+    epochs: 100
+    batch_size: 4
+    early_stopping: true
+    early_stopping_patience: 15
+identifier:
+  type: none
+embeddings:
+  model: google/siglip2-base-patch16-224
+  batch_size: 64
+count:
+  identity_thr: 0.5
