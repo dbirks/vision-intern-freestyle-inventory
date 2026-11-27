@@ -20,7 +20,8 @@ The goal of this project is to locate, identify (across 18 active catalog SKUs p
 1. **Data reality:** Out of 1,383 declared server frames, only **54** survived retention (~96.1% retention loss), joined by **15** local workstation frames (**69 images** across **56 independent groups**). Removing 29 `no_cabinet`/`occluded` negatives leaves **40 usable cabinet frames** (`29` `cabinet_full`, `11` `cabinet_partial`), all from a single physical cabinet and stocking arrangement (`docs/freestyle/DATA_AUDIT.md:31-56, 305-318`).
 2. **Bootstrap & fine-print limits:** Vision Intern's `label_dataset` + `judge_labels` + a new two-stage VLM identifier (`david-birks/inkling-2-mini` labeller/identifier, `qwen3-8-flash-next` judge) produced **563 proposals** across 29 unique cabinet scenes (`runs/bootstrap_v2/summary.md:8`). Two-stage identification reduced `unknown` labels from **77.8%** (438/563) in `bootstrap_v1` to **45.5%** (256/563) in `bootstrap_v2`, while revealing that printed Part 1 / Part 2 numerals are legible in only **2 of 123** (1.6%) two-part brand crops (`runs/bootstrap_v2/summary.md:49, 70-74`).
 3. **Trained tiled RF-DETR vs zero-shot detectors (vs model labels, NOT GT):** In GPU Window #1 on an RTX 5090, class-agnostic tiled RF-DETR trained on 10 frames of model labels (`S2_c2_tile1280` at **0.710 AP50**, `C2_rfdetr_medium_agnostic_siglip2` at **0.697 AP50**, `C1_rfdetr_small_agnostic_dinov2` at **0.694 AP50**) outperformed zero-shot open-vocabulary detectors (`B3_gdino_dinov2` at **0.232 AP50**, `B1_owlv2_dinov2` at **0.181 AP50**) by ~3x, because zero-shot models merge adjacent cartridges and stacked NNS tiers (`devlog/content/2026-11-26-rfdetr-beats-zero-shot.md:12-23`, `runs/*/metrics.json`).
-4. **GT quiz & scoring readiness:** The phone-first GT quiz queue is generated (`data/gt/quiz_queue.json`), `freestyle/quiz/server.py` is implemented, and `freestyle/experiments/score_all.py` has a dry-run harness verified in `runs/score_all_demo/RESULTS_GT.md` (the historical test snapshot is noted in Section 13).
+4. **Two label spaces, one decision left open:** A second detector family was trained on the cartridges' printed **front faces** instead of the whole leaning box (`faces_v1` → cleaned `faces_v2` → GPU runs `G1`/`G2`). Faces overlap less (mean neighbour max-IoU **0.119** vs **0.201** for whole boxes) and carry readable Part numerals (59 numerals on 597 faces vs 2 of 123 whole-frame crops), and the face detectors land in the same metric range as the whole-cartridge detector (`G2` total-count MAE **3.333** vs `S2` **3.583**, `G1` AP50 **0.663** vs `S2` **0.710**) — but they are scored against *their own* model labels, so no GPU variant can settle the choice. Only the human counts can (`docs/freestyle/FAILURES.md`, §8.9 here).
+5. **GT quiz & scoring readiness:** The phone-first GT quiz queue is generated (`data/gt/quiz_queue.json`: **333** questions over **18** images — 188/`test`, 145/`val`; 18 `count` + 315 `crop`), `freestyle/quiz/server.py` is implemented, `freestyle/experiments/score_all.py` has a dry-run harness verified in `runs/score_all_demo/RESULTS_GT.md` (the historical test snapshot is noted in Section 13), and `scripts/finalize_after_gt.sh` now holds the exact post-GT sequence. Human answers so far: **6 of 333** questions (one `not_cabinet` negative plus five `skip`s on a single near-blank test frame), i.e. the quiz has been smoke-tested, not answered.
 
 ---
 
@@ -90,7 +91,7 @@ Model-generated labels (`data/labels/*.json`) are **never** treated as ground tr
 - **Model:** Bounding-box geometry originates from `data/labels/bootstrap_v2.json` (`attributes.box_source = "model"`). Consequently, `to_coco` emits `<split>_counts.json` flagging `counts_mismatch` wherever human total counts disagree with answered crop counts—identifying frames with missed/merged model boxes that need box correction in `review.server`.
 - **Protocol rules (`docs/freestyle/GT_PROTOCOL.md:7-38`):** One box per visible physical cartridge (two-high NNS stacks get two boxes); never guess `Part 1`/`Part 2` or `AA`/`CC` from shelf order when pixels do not support it (mark `unknown`); `score_all.py:31-72` (`build_human_gt`) requires `>= 80%` answered questions and a non-null `human_counts` per image, and strips any annotation lacking `identity_source == "human"`.
 
-**Current GT status:** `data/gt/quiz_queue.json` is built, and human answers (`data/gt/quiz_answers.jsonl`) + exported `data/gt/{val,test}.json` are pending (`<!-- GT-PENDING: Verify quiz completion counts, mismatch list, and human GT dataset statistics in data/gt/{val,test}.json and docs/freestyle/RESULTS_GT.md. -->`).
+**Current GT status:** `data/gt/quiz_queue.json` is built (**333** questions across **18** images: 12 test images / 11 groups first, then 6 val images; 18 `count` + 315 `crop`). `data/gt/quiz_answers.jsonl` holds **6** answers — the 2026-11-27 smoke pass over one near-blank test frame (`10455345…/013.jpg`: `not_cabinet` on the count question, 5 `skip`s), which exercised the skip-cascade path added in `b29ada6`. No `data/gt/{val,test}.json` export exists yet, so no human GT number appears anywhere in this report. `scripts/finalize_after_gt.sh` refuses to score anything until ≥80 % of each split's questions are answered (`<!-- GT-PENDING: Verify quiz completion counts, mismatch list, and human GT dataset statistics in data/gt/{val,test}.json and docs/freestyle/RESULTS_GT.md. -->`).
 
 ---
 
@@ -218,9 +219,12 @@ Following Review #4 (`docs/freestyle/reviews/codex-review-4-k8s.md`, commit `840
 
 ### 7.3 Resource Usage per Experiment
 
-All figures below come from `runs/*/meta.json`, `runs/*/training/meta.json`, and `runs/*/provenance.json` on `RTX 5090` (`k8s:5090`, `mode: hami`, `vram_mb: 12000`):
+The full ledger — every run plus the bundle CPU demos, Collective call counts and the
+field-by-field provenance — lives in [`RESOURCES.md`](RESOURCES.md). Condensed below.
 
-| Run | Train Time (s) | Peak PyTorch VRAM (`peak_gpu_bytes` / `training`) | Test Inference (`s/img`) | Val Inference (`s/img`) | Job Wall Total (s) |
+All figures come from `runs/*/meta.json` (`timings`, `inference`, `peak_gpu_bytes`, `job_wall`) and `runs/*/provenance.json` on `RTX 5090` (`k8s:5090`, `mode: hami`, `vram_mb: 12000` unless noted):
+
+| Run | Train Time (s) | Peak PyTorch VRAM (`peak_gpu_bytes`) | Test Inference (`s/img`) | Val Inference (`s/img`) | Job Wall Total (s) |
 |---|---:|---|---:|---:|---:|
 | `B1_owlv2_dinov2-4c99011d` | — | `1.97 GiB` (`2,112,137,216 B`) | `0.945` proposal (`0.059` pipe) | `30.226` proposal (`0.101` pipe) | `330` (`47` pip + `283` cmd) |
 | `B2_sam3_siglip2-babcbfe8` | — | `0.01 GiB` (`9,568,256 B`, emb only) | Blocked (403 gated HF) | Blocked | Unfinished (`83` pip, failed) |
@@ -230,8 +234,14 @@ All figures below come from `runs/*/meta.json`, `runs/*/training/meta.json`, and
 | `D1_rfdetr_small_multiclass-6f3c344b` | `195.7` (`181.7` trainer) | `6.16 GiB` (`6,616,291,328 B`) | `0.352` | `0.513` | `301` (`80` pip + `221` cmd) |
 | `S1_c2_tile768-d52f6d7c` | `223.2` (`215.6` trainer) | `4.09 GiB` (`4,394,649,088 B`) | `0.363` | `0.519` | `293` (`49` pip + `244` cmd) |
 | `S2_c2_tile1280-db269936` | `145.2` (`137.8` trainer) | `4.09 GiB` (`4,394,649,088 B`) | `0.223` | `0.309` | `213` (`50` pip + `163` cmd) |
+| `S3_c2_copypaste-205b1c7c` | `427.3` | `4.09 GiB` (`4,394,649,088 B`) | `0.337` | `0.429` | `499` (`51` pip + `448` cmd) |
+| `S5_rfdetr_large_agnostic-7f6457d4` | `176.3` | `4.09 GiB` (`4,394,649,088 B`) | `0.359` | `0.445` | `247` (`50` pip + `197` cmd; `vram_mb: 16384`) |
+| `S6_owlv2_containment-cbc70383` | — | `1.97 GiB` (`2,112,137,216 B`) | `0.965` proposal (`0.016` pipe) | `1.109` proposal (`0.050` pipe) | `52` (`19` pip + `33` cmd) |
+| `S7_c2_tile1280_copypaste-b6fc182e` | `327.6` | `4.09 GiB` (`4,394,649,088 B`) | `0.221` | `0.351` | `396` (`50` pip + `346` cmd) |
+| `G1_rfdetr_medium_faces-cc431fcd` | `75.3` | `4.09 GiB` (`4,394,649,088 B`) | `0.168` | `0.279` | `139` (`49` pip + `90` cmd) |
+| `G2_rfdetr_small_faces-7c7b4587` | `191.4` | `6.89 GiB` (`7,398,841,344 B`) | `0.242` | `0.365` | `262` (`52` pip + `210` cmd) |
 
-*Notes:* For `B1` and `B3`, `proposal_seconds_per_image` on `val` (the first split evaluated) includes initial HF checkpoint load, whereas `test` reflects warm tiled inference; `pipe` is post-hoc cached-proposal lookup. `S3_c2_copypaste-e6ce578e` failed wait (`jobs.batch ... not found`, `runs/driver-S.log`) and `S3_c2_copypaste-205b1c7c` was subsequently collected with metrics and metadata; `C2_...-27f2e3d6` did not produce those files.
+*Notes:* For `B1`, `B3` and `S6`, `proposal_seconds_per_image` on `val` (the first split evaluated) includes initial HF checkpoint load, whereas `test` reflects warm tiled inference; `pipe` is post-hoc cached-proposal lookup. `S3_c2_copypaste-e6ce578e` failed wait (`jobs.batch ... not found`, `runs/driver-S.log`) and `S3_c2_copypaste-205b1c7c` was subsequently collected with metrics and metadata; `C2_...-27f2e3d6` did not produce those files. Peak VRAM does not rank by detector size: `C1`/`D1` (Small @ 512) peak at ~6.15 GiB and `G2` (Small, 1024 px tiles) at 6.89 GiB, while every Medium @ 576 run sits at 4.09 GiB — resolution and batch size drive the mark. Card time actually burned: ~61 min of job wall across 12 jobs in GPU window #1 (of which ~25 min was `unpack+pip`), and 401 s across `G1`+`G2` in window #2. CPU bundle cost: v0 = 67.18 s / 3 frames, 1.73 GB peak RSS (`runs/bundle_demo/count.err`); v1 = 38.8 s identify on the densest frame because it makes one Collective call per crop (`runs/bundle_demo_v1/counts.json`). VLM budget: bootstrap v1 266 calls / 1,896.7 s, bootstrap v2 686 calls / 2,276.0 s, face labelling 197 calls / ~28 min, all with 0 failed calls (`runs/bootstrap_v1/timing.json`, `runs/bootstrap_v2/summary.md`, `runs/faces_v1/timing.json`).
 
 ---
 
@@ -289,17 +299,207 @@ The demo's identity is weak: the NNS-heavy gallery biases kNN toward NNS, includ
 
 An interim modulo class-index workaround risked silently shifting multiclass identities. Investigation of RF-DETR 1.12.1 found zero-based head indices over sorted training categories. Training now saves an explicit head-index-to-category mapping, existing checkpoints had mappings recovered, and unknown indices fail loudly. The audit found D1 was not shifted (`devlog/content/2026-11-26-end-to-end-on-cpu.md`; `freestyle/train/recover_mapping.py`; `freestyle/infer/detector.py`).
 
-### 8.5 GPU window follow-up
+### 8.5 Bundle v1: duplicate suppression, 2-shelf counting, hybrid identifier
+
+`artifacts/rfdetr-m-1280-v1` (frozen from `runs/S2_c2_tile1280-db269936`, config
+`configs/pipeline/v1_cartridges.yaml`, all knobs tuned on the **6 val frames only**) changes three
+things relative to v0 (`artifacts/rfdetr-m-1280-knn-v0`):
+
+1. **Duplicate suppression after tile merge** — class-agnostic, so it no longer needs a class
+   agreement it does not have: IoU 0.45, containment 0.7, and a looser same-shelf-row IoU 0.3 when
+   the two boxes share a column (x-overlap ≥ 0.5 of the narrower box). On val against bootstrap
+   labels this took overlapping box pairs from **13 → 0** (`artifacts/rfdetr-m-1280-v1/manifest.json`
+   `provenance.notes`).
+2. **Shelf cap `max_rows: 2`** — the two-high NNS stack is now a *tier* of the top shelf instead of
+   a phantom third shelf; `shelf_hint: true` also feeds top/bottom context to the identifier.
+3. **Hybrid identifier `hybrid_vlm_knn`** — `david-birks/inkling-2-mini` (two-stage, 2× upscale)
+   names the **brand family** from logo/colour; embedding kNN (`google/siglip2-base-patch16-224`,
+   `k=5`) may only refine *within* that family, over a **class-balanced** gallery (≤10 crops per
+   class, vs v0's 139 crops of which 60 were NNS). Family confidence < 0.45 or identity score < 0.45
+   stays `unknown`. `pair_rule: report` (never `apply`) pending human GT
+   (`artifacts/rfdetr-m-1280-v1/pipeline.yaml`).
+
+Measured effects (all **unverified by a human**; `runs/bundle_demo_v1/counts.json`,
+`devlog/content/2026-11-27-bundle-v1.md`):
+
+| Frame | v0 counts | v1 counts |
+|---|---|---|
+| `local/downloads/frame.jpg` | NNS 8, Hi-C 4, Fanta 3, Vanilla 2 + 9 unknown | NNS 7, Lemon 2, Fanta 2, CC 1, AA 1, Sprite 1, Orange 1, Vanilla 1 + 7 unknown |
+| `50828e4b…/008.jpg` | **NNS 22**, Fanta 3, Hi-C 3, Vanilla 1 + 3 unknown | NNS 5, Fanta 2, CC 2, AA 1 + 10 unknown |
+| `10455345…/013.jpg` | NNS 3 | Sprite 1 + 2 unknown |
+
+The 7 NNS on `frame.jpg` is what is physically there (a 3-stack plus 4) on visual inspection, which
+is the *only* evidence for it; the 10455345 frame has since been answered `not_cabinet` in a quiz
+smoke pass, so v0's 3 NNS on it were three hallucinations (`data/gt/quiz_answers.jsonl`).
+
+Val proxy vs bootstrap labels: v1 predicts 103 boxes / 139 bootstrap, AP50 0.591 with **0**
+overlapping box pairs; v0 predicts 113 boxes, AP50 0.624, 13 overlapping pairs — i.e. v1 buys
+clean geometry and fewer duplicates at a small localisation cost on 6 images
+(`artifacts/rfdetr-m-1280-v1/manifest.json`).
+
+**Cost:** identify time rises from 9.4 s to 38.8 s on the densest frame because the hybrid
+identifier makes one Collective call per crop; v1 needs `LLMC_API_KEY` at inference time
+(`runs/bundle_demo_v1/counts.json` vs `runs/bundle_demo/frames/counts.json`).
+
+**Known gaps in v1 (stated plainly, not hidden):** the bottom shelf (Coke family) is mostly
+`unknown` because the auto-labelled gallery has almost no confident Part 1/Part 2 examples; and
+`score_thr` is pinned at the v0 value 0.308 even though val prefers 0.10–0.15 once suppression is
+on, because below ~0.25 the class-agnostic head emits a **phantom second class index** and
+`RFDetrPredictor.predict` raised `Unknown RF-DETR detector class index: 1`
+(`artifacts/rfdetr-m-1280-v1/pipeline.yaml` comment, `configs/pipeline/v1_cartridges.yaml`).
+
+### 8.6 RF-DETR class-index handling and the phantom no-object slot
+
+An interim modulo class-index workaround risked silently shifting multiclass identities.
+Investigation of RF-DETR 1.12.1 found zero-based head indices over sorted training categories.
+Training now saves an explicit head-index-to-category mapping (`freestyle/train/recover_mapping.py`
+recovers it for existing checkpoints), unknown indices fail loudly, and the audit confirmed `D1`
+was **not** shifted (`devlog/content/2026-11-26-end-to-end-on-cpu.md`; `freestyle/infer/detector.py`).
+A second, related bug surfaced while tuning v1: for a **single-category** checkpoint the classifier
+head is `(2, 256)` — one foreground plus one background slot — and treating that background slot as
+a detectable class index is what produced the `Unknown RF-DETR detector class index: 1` error below
+`score_thr ≈ 0.25`. Fixed by dropping the no-object slot for single-category checkpoints (`80c1a44`),
+but the v1 bundle still ships the conservative threshold until the fix is re-exported and re-tuned
+against human GT.
+
+### 8.7 Experiment family G — detecting the printed front face
+
+**Idea and origin.** On the bottom shelf the cartridges lean outward, so an axis-aligned box around
+a whole leaning cartridge covers parts of its neighbours and is hard to count
+(`devlog/content/2026-11-27-front-faces-idea.md`). Family **G** detects only the **front face** — the
+narrow printed end carrying the logo and the Part 1/2 numeral — which is small, upright and
+non-overlapping. A full 3D cartridge model was considered and rejected: it needs 3D annotations or a
+calibrated camera, which ~25 photos cannot support.
+
+**Label construction (`runs/faces_v1/`, `runs/faces_v2/`).** Inkling 2 Mini labelled all 29 cabinet
+frames (full frame + 2×2 tiles) through Vision Intern's label → judge path, judged by
+`qwen3-8-flash-next` in crop mode: **715** face proposals in ~28 min from **197** fresh Collective
+calls with 0 errors (`runs/faces_v1/timing.json`, `runs/faces_v1/summary.md`). Mean neighbour
+max-IoU fell from **0.201** (whole-cartridge `bootstrap_v2`) to **0.146**, and to **0.098** where both
+labeller runs agreed. **326 / 715** faces carried an identity. Critically, asked about the *face*
+the VLM read **59** Part numerals (45 `1`, 14 `2`) where whole-cartridge crops yielded **2 of 123**
+(`runs/faces_v2/summary.md` vs `runs/bootstrap_v2/summary.md`).
+
+Cleanup (`faces_v2`) kept **597 / 715**: dropped 95 judge-rejected, 15 weak-evidence, 6
+leaning-column duplicates, 1 flat-aspect and 1 thin-strip. Neighbour overlap improved to **0.119**.
+One rule needed care: "one face per leaning column" also requires a vertical-gap guard, otherwise a
+fanned-out bottom row chains 17 real faces into a single "column". **53 residual duplicate pairs**
+were flagged for human review and deliberately *not* auto-deleted, because the same geometry also
+describes a genuine back-row face behind a front-row one.
+
+**Training and results (GPU window #2, RTX 5090):**
+
+| Run | Target | Train s | Peak VRAM | Test s/img | AP50 (95 % CI) | P / R / F1 | Total count MAE | ID Top-1 |
+|---|---|---:|---:|---:|---|---|---:|---:|
+| `G1_rfdetr_medium_faces-cc431fcd` | front faces | 75.3 | 4.09 GiB | 0.168 | **0.663** (0.453–0.800) | 0.573 / 0.718 / 0.637 | 5.750 (3.081–8.919) | 0.000 (`none`) |
+| `G2_rfdetr_small_faces-7c7b4587` | front faces | 191.4 | 6.89 GiB | 0.242 | **0.631** (0.402–0.793) | 0.697 / 0.624 / 0.658 | **3.333** (1.500–5.636) | 0.000 (`none`) |
+| `S2_c2_tile1280-db269936` | whole cartridges | 145.2 | 4.09 GiB | 0.223 | **0.710** (0.504–0.841) | 0.772 / 0.750 / 0.761 | 3.583 (1.333–6.730) | 0.000 (`none`) |
+
+(`runs/*/metrics.json`; `docs/freestyle/RESULTS.md`; trained on 9 train frames of `faces_v2` vs 10 of
+`bootstrap_v2`. G1/G2 have `identifier: none`, so their identity rows are structural, not measured.)
+
+**The rows are not comparable and that is the finding.** `G1`/`G2` are scored against face labels,
+`S2` against whole-cartridge labels, and both "answer keys" are model-made. Faces and whole boxes now
+sit in the same range, so no further GPU variant can separate them — which is why GPU window #2 was
+closed after ~12 minutes of the ~60 offered and Inkling was restored
+(`devlog/content/2026-11-27-face-detectors-trained.md`). Both detectors predicted the same 12 test
+images, so a single pass of "N top / M bottom: right?" answers scores faces vs whole cartridges, all
+identity methods and the pair rule at once with confidence intervals. The face failure signature is
+also different — `G1`'s dominant error is `FP:background = 56` (faces invented on shelf slats and
+frame edges) versus `S2`'s `FP:fragment = 17` — see [`FAILURES.md`](FAILURES.md) §1, §2.6.
+
+### 8.8 Review rounds and the bug classes they found
+
+Five adversarial reviews were run against the code that produces every number in this report; each
+finding was reproduced on CPU with synthetic data before being fixed. Findings and fixes:
+
+| Review | Target | Bug classes found | Disposition |
+|---|---|---|---|
+| #1 (`docs/freestyle/reviews/codex-review-1.md`) | identification + eval | **Gallery leakage** (test set and same-event burst frames could train the identifier); pipeline fitted every gallery row with no split check | Fixed: validated group/split provenance, train-only galleries, group-disjointness enforced |
+| #2 (`docs/freestyle/reviews/agy-review-2.md`) | `freestyle/` runtime | `identity_thr` **defeated** by normalized `predict_proba`; OWLv2 broken on `transformers 5.24.1` (scores rescaled to 1.0); SAM3 `bfloat16` dtype crash; copy-paste `--photometric` warped pixels without moving boxes; string `image_id`s made `eval` silently drop 100 % of predictions; unused `gallery_groups`; `Siglip2` ignoring `do_resize=False`; cross-class duplicates at tile seams | Fixed; the cross-class tile-seam duplicate class is what later became the v1 `suppress_*` work |
+| #3 (`docs/freestyle/reviews/agy-review-3.md`) | Vision Intern **core** dense-scene path | Cross-tile `nms` preferred clipped fragments over full boxes; consensus/NMS ran **before** alias normalisation; crop-mode sheets omitted the boxes the judge was asked to verify and crashed on OOB/inverted boxes; `transformers` backend never derived `finish_reason` (silently disabling truncation auto-split); greedy `\[.*\]` verdict parsing dropped all verdicts on truncated output; unlocked `raw_response_log` appends; symlinked images rejected | Fixed upstream in `fb8c805` / `289cc0e` / `4b96e5f` (see §5.1) |
+| #4 (`docs/freestyle/reviews/codex-review-4-k8s.md`) | `k8s/` launch + provenance | **`--dry-run` could delete an unrelated Job**; auto `share` mode ran training with no enforced VRAM cap; failed jobs waited to timeout and lost collection; existing workspace pod/PVC trusted (foreign pod deletable); gated HF models got no token; artifact/snapshot reuse could corrupt results; recorded git state did not identify the executed snapshot; private data mounted writable | Fixed in `84042db` + `17222a2`: pinned image digest, tarball SHA-256 verified twice, `provenance.json` + `env.txt`, ownership labels gate `--replace`, HF token opt-in, read-only `/data-ro`, `sitecustomize` memory cap in share mode |
+| #5 (`docs/freestyle/reviews/agy-review-5-score-all.md`) | `score_all.py` + `quiz/to_coco.py` — the code that will consume the human answers | `pair=on` was a **100 % no-op** for all 7 non-VLM identifiers and *bypassed* `identity_thr` on `vlm`; human-verified `not_cabinet` negatives silently dropped by the 80 % rule; partially answered / `counts_mismatch` images corrupted `class:{c}` MAE, AP50 and threshold selection; predicted-only classes (incl. `unknown`) omitted from per-class MAE and generic `cartridge` not mapped to `unknown`; `to_coco` promoted a wrong model guess to `identity_source="human"` on `"partial"`; threshold tie-breaks collapsed to `0.0`; `match_boxes` called without scores so low-confidence duplicates stole GT matches | Fixed in `5ff55c2` (pair rule for every identifier, negatives kept, partial-answer handling, generic→unknown, tie-breaks, score-aware matching) |
+
+Review #5 matters most for the pending work: it is the only review whose subject is the human-GT
+scoring path, and it found the pair rule — the hypothesis §10.2 says the quiz will test — was
+not running at all.
+
+### 8.9 Provisional architecture selection (pending human GT)
+
+> [!IMPORTANT]
+> **This selection is unverified.** It is the candidate the evidence *available today* points at,
+> recorded so the final step is a scoring pass rather than a redesign. Nothing below has been
+> measured against human ground truth; the deciding numbers are pending.
+>
+> `<!-- GT-PENDING: fill the table in §8.2 and the face-vs-whole-box comparison in this section from docs/freestyle/RESULTS_GT.md (produced by scripts/finalize_after_gt.sh). -->`
+
+**Candidate (working default): bundle `rfdetr-m-1280-v1`** — RF-DETR **Medium**, 1280 px tiles
+(`S2`), plus:
+* class-agnostic duplicate suppression after tile merge (IoU 0.45 / containment 0.7 / same-row IoU 0.3),
+* **2-shelf** counting (`max_rows: 2`, a 2-high NNS stack is a tier), `shelf_hint: true`,
+* **hybrid** identifier: Inkling 2 Mini brand family + class-balanced SigLIP2 kNN refining inside
+  that family, thresholds 0.45/0.45, `unknown` below either,
+* pair rule in `report` mode only.
+
+**Alternative to be decided by GT: family G** — the same pipeline shape driven by a **front-face**
+detector (`G2` RF-DETR Small @ 1024 px tiles, or `G1` Medium @ 1280 px) instead of a
+whole-cartridge detector.
+
+**Justification from evidence that exists today (and only that):**
+
+1. *Model-label agreement.* Among the **class-agnostic** whole-cartridge runs, `S2` has the lowest
+   total-count MAE (**3.583**, CI 1.333–6.730) of any run ever collected, the joint-best AP50
+   (0.710, CI 0.504–0.841) behind `S3`'s 0.718, the lowest `FN:stacked_tier` (1) and the
+   second-lowest FP count (`runs/S2_c2_tile1280-db269936/metrics.json`,
+   `runs/S2_c2_tile1280-db269936/failures/failures.json`).
+   It is also the cheapest run in the sweep: 145.2 s train, 213 s job wall, 0.223 s/img.
+2. *Visual review (unverified).* `S2` + suppression + 2-shelf counting produced **0** overlapping
+   box pairs on val and the physically correct 7 NNS on the best frame, where v0's plain kNN produced
+   8 NNS / 4 Hi-C and **22 NNS** on another frame (`runs/bundle_demo*/…counts.json`). The identity
+   review over 69 val crops judged 29 / 32 confidently-readable crops correct for the hybrid vs
+   26 / 32 for plain kNN — my own read, not a human's
+   (`artifacts/rfdetr-m-1280-v1/manifest.json` `provenance.notes`, `runs/v1iter/eyeball.json`).
+3. *Resources.* `S2` is the cheapest detector in the family; faces are cheaper still (`G1` 139 s job
+   wall, 0.168 s/img) but the v1 hybrid's per-crop VLM call dominates end-to-end cost either way
+   ([`RESOURCES.md`](RESOURCES.md) §2). Choosing `S2` costs no extra card time.
+4. *Why the alternative is genuinely still open.* `G2` reports the lowest total-count MAE of any
+   class-agnostic run (**3.333**, CI 1.500–5.636) *in its own label space*, faces reduce neighbour
+   overlap (0.119 vs 0.201) and unlock numerals the whole-box crops cannot read (59 vs 2). Two
+   label spaces that cannot be compared is exactly the situation the quiz breaks — the human counts
+   are the same object for both families.
+
+**What would flip this selection:** human counts that show the face detector counts the leaning
+bottom row better (G's whole point), or an ID accuracy on human-answered crops where the
+whole-cartridge hybrid loses; also a `counts_mismatch` list dominated by merged bottom-row boxes
+would argue that whole-cartridge boxes are the wrong target regardless of AP50.
+
+**Explicitly not decided here:** `identity_thr` / `family_threshold` (0.45/0.45), `score_thr`
+(0.308, pinned by the phantom-class-index bug rather than by data), the pair rule's `apply` mode, and
+whether `S3` (copy-paste, AP50 0.718) is a better base than `S2` — all four must be re-tuned against
+`data/gt/val.json` before the bundle is called final.
+
+### 8.10 GPU window follow-up
 
 SAM 3 remained blocked by a Hugging Face 403: the token was not approved for the gated model (`devlog/content/2026-11-26-gpu-window-first-results.md`). During collection the workstation disk reached 100%; Lightning checkpoints were approximately 0.5 GB per run. Intermediate local checkpoints are pruned while best weights are retained; the full set remains on the cluster volume (`devlog/content/2026-11-26-rfdetr-beats-zero-shot.md`).
 
 Inkling's scheduled restoration reminder did not fire while the session was waiting. It was restored around 22:45, roughly two hours beyond the time box, although the GPU had been idle since 20:05. The recorded operational fix is a detached host-side restoration timer independent of the session (`devlog/content/2026-11-26-sweep-and-inkling-restored.md`).
 
+**Window #2 (2026-11-27).** Inkling was paused at 09:11 with explicit permission to run past 60
+minutes; `G1` and `G2` consumed 401 s of job wall and the window was closed after ~12 minutes because
+the model-made answer key could not separate the two families any further
+(`devlog/content/2026-11-27-gpu-window-2.md`, `runs/G*/meta.json`). The restore is now driven by a
+detached timer in its own tmux window on the host (set for 11:15), so it cannot be skipped the way
+the window-#1 restore was. Two operational lessons are recorded: the restore timer must be independent
+of the agent session, and a GPU window is only worth holding while it can change a decision.
+
 ---
 
 ## 9. Visual Failure Analysis
 
-`freestyle/eval/failures.py` decomposes test-set errors (vs `bootstrap_v2` model labels at IoU `0.5` and val-selected `score_thr`; `n_gt = 176` across `12` images) into missed detections (**FN**: `adjacent_merge`, `edge_truncated`, `stacked_tier`, `plain`), false positives (**FP**: `duplicate`, `fragment`, `background`), identity errors (**ID**), and localization errors (**LOC**, `0.3 <= IoU < 0.5`). Note: in `failures.json`, `n_tp` counts boxes correct in **both** localization and class, so class-agnostic runs (`B1`, `B3`, `C1`, `C2`, `S1`, `S2`) move correctly localized known-class boxes into `ID` (`<class>->UNK`):
+`freestyle/eval/failures.py` decomposes test-set errors (vs `bootstrap_v2` model labels — or vs
+`faces_v2` face labels for the G family, `n_gt = 170` — at IoU `0.5` and val-selected `score_thr`;
+`n_gt = 176` across `12` images) into missed detections (**FN**: `adjacent_merge`, `edge_truncated`, `stacked_tier`, `plain`), false positives (**FP**: `duplicate`, `fragment`, `background`), identity errors (**ID**), and localization errors (**LOC**, `0.3 <= IoU < 0.5`). Note: in `failures.json`, `n_tp` counts boxes correct in **both** localization and class, so class-agnostic runs (`B1`, `B3`, `C1`, `C2`, `S1`, `S2`, `S3`, `S5`, `S6`, `S7`, `G1`, `G2`) move correctly localized known-class boxes into `ID` (`<class>->UNK`). [`FAILURES.md`](FAILURES.md) carries the same table for every collected run, a curated six-image gallery of the recurring modes, and the follow-ups:
 
 | Run | Thr | Pred Kept | TP (Loc+Cls) | Total Failures | FN (Tot) | FN: adj_merge / edge / plain / stack | FP (Tot) | FP: bg / dup / frag | ID | LOC |
 |---|---:|---:|---:|---:|---:|---|---:|---|---:|---:|---:|
@@ -310,11 +510,18 @@ Inkling's scheduled restoration reminder did not fire while the session was wait
 | `D1_rfdetr_small_multiclass-6f3c344b` | 0.576 | 160 | 88 | 124 | 52 | 15 / 3 / 26 / 8 | 36 | 4 / 15 / 17 | 34 | 2 |
 | `S1_c2_tile768-d52f6d7c` | 0.813 | 138 | 32 | 180 | 74 | 19 / 6 / 40 / 9 | 36 | 4 / 9 / 23 | 67 | 3 |
 | `S2_c2_tile1280-db269936` | 0.308 | 171 | 46 | 166 | 41 | 16 / 4 / 20 / 1 | 36 | 12 / 7 / 17 | 86 | 3 |
+| `S3_c2_copypaste-205b1c7c` | 0.373 | 189 | 52 | 173 | 36 | 17 / 3 / 14 / 2 | 49 | 14 / **16** / 19 | 84 | 4 |
+| `S5_rfdetr_large_agnostic-7f6457d4` | 0.657 | 148 | 40 | 163 | 55 | 20 / 4 / 26 / 5 | 27 | 6 / 7 / 14 | 79 | 2 |
+| `S6_owlv2_containment-cbc70383` | 0.104 | 55 | 13 | 180 | 138 | 32 / 13 / 74 / **19** | 17 | 16 / 1 / 0 | 18 | 7 |
+| `S7_c2_tile1280_copypaste-b6fc182e` | 0.443 | 160 | 45 | 163 | 48 | 18 / 2 / 23 / 5 | 32 | 12 / 4 / 16 | 82 | 1 |
+| `G1_rfdetr_medium_faces-cc431fcd` *(faces)* | 0.374 | 213 | 48 | 201 | 36 | 12 / 4 / 18 / 2 | 79 | **56** / 2 / 21 | 74 | 12 |
+| `G2_rfdetr_small_faces-7c7b4587` *(faces)* | 0.559 | 152 | 36 | 171 | 55 | 10 / 10 / 30 / 5 | 37 | 18 / 4 / 15 | 70 | 9 |
 
 **Typical failure patterns documented across runs (`devlog/content/2026-11-26-gpu-window-first-results.md:23-30`, `devlog/content/2026-11-26-rfdetr-beats-zero-shot.md:21-26`, `runs/bootstrap_v1/summary.md:53-60`):**
 - **Zero-shot adjacent & stacked merging (`B1`, `B3`):** `B1` (`FN:adjacent_merge = 51`) and `B3` (`FN:adjacent_merge = 45`, `FN:stacked_tier = 11`) merge the two-high NNS sweetener stack into one tall box, span multiple neighbouring cartridges with a single wide box, and miss most of the dark, leaning bottom shelf. `B1` also emits `54` background false positives and `33` fragments.
 - **RF-DETR localization gains & residual fragments (`C1`, `C2`, `S2`):** Supervised tiled training slashes `FN:adjacent_merge` (`51` -> `15–19`), `FN:stacked_tier` (`11` in `B3` -> `1` in `S2`), and `LOC` errors (`14` in `B1` -> `2–5`). Residual localization errors shift toward `FP:fragment` (`17–35`, partial sub-boxes on cartridges or tile borders) and `FP:duplicate` (`7–15`, including cross-class duplicates at tile seams in `D1` where `FP:duplicate = 15`).
-- **`D1` multi-class confusions:** Out of `34` ID errors in `D1`, `23` are known-to-`UNK` (`FL-VAN->UNK`: 6, `NNS->UNK`: 4, `FANTA->UNK`: 3, `FL-LEM->UNK`: 3, `HI-C->UNK`: 3, `SPRITE->UNK`: 3, `FL-ORG->UNK`: 1), and `11` are inter-class confusions, predominantly yellow/orange/cream flavours and `HI-C`/`ING-AA` collapsing toward `FL-VAN` or `FANTA` (`FANTA->FL-VAN`: 2, `ING-AA->FL-VAN`: 2, `FANTA->FL-LEM`: 1, `FL-LEM->FANTA`: 1, `FL-LEM->FL-VAN`: 1, `FL-VAN->FANTA`: 1, `HI-C->FL-VAN`: 1, `SPRITE->FL-VAN`: 1, `SPRITE->NNS`: 1).
+- **`D1` multi-class confusions:** Out of `34` ID errors in `D1`, `23` are known-to-`UNK` (`FL-VAN->UNK`: 6, `NNS->UNK`: 4, `FANTA->UNK`: 3, `FL-LEM->UNK`: 3, `HI-C->UNK`: 3, `SPRITE->UNK`: 3, `FL-ORG->UNK`: 1), and `11` are inter-class confusions, predominantly yellow/orange/cream flavours and `HI-C`/`ING-AA` collapsing toward `FL-VAN` or `FANTA` (`FANTA->FL-VAN`: 2, `ING-AA->FL-VAN`: 2, `FANTA->FL-LEM`: 1, `FL-LEM->FANTA`: 1, `FL-LEM->FL-VAN`: 1, `FL-VAN->FANTA`: 1, `HI-C->FL-VAN`: 1, `SPRITE->FL-VAN`: 1, `SPRITE->NNS`: 1). No two-part brand pair appears anywhere in the matrix — the labels almost never resolve a Part numeral, so Part 1/Part 2 confusion is unmeasurable, not absent.
+- **Face-family signature (`G1`, `G2`):** faces halve `FN:adjacent_merge` (16→12) and nearly eliminate `FP:duplicate` (7→2/4), but `FP:background` triples (12→56 in `G1`): a face detector fires on shelf slats, door edges and frame corners, and the face labels themselves carry 53 unresolved duplicate pairs (`runs/faces_v2/summary.md`). `G1` also has the highest `LOC` (12) because a face is small, so a few pixels move IoU a lot (`runs/G1_rfdetr_medium_faces-cc431fcd/failures/failures.json`, [`FAILURES.md`](FAILURES.md) §1).
 
 <!-- GT-PENDING: Re-run freestyle.eval.failures against data/gt/test.json (once human GT exists) and update the FN/FP/ID/LOC breakdown and true confusion pairs against human ground truth from docs/freestyle/RESULTS_GT.md. -->
 
@@ -346,14 +553,15 @@ To determine whether external references or layout geometry can resolve Part 1 v
 
 ## 11. Limitations & Risks
 
-1. **No human ground truth yet:** All `runs/*/metrics.json` and `failures.json` numbers measure agreement with `bootstrap_v2.json` VLM proposals, not verified human GT.
-2. **Quiz GT box dependency:** `freestyle.quiz` labels identities and counts on `bootstrap_v2` model boxes (`box_source = "model"`), meaning quiz-derived AP50 measures agreement with human-filtered proposals rather than independent box-drawing GT (`runs/score_all_demo/RESULTS_GT.md:4`). Frames flagged with `counts_mismatch` require `freestyle.review.server` box edits.
+1. **No human ground truth yet:** All `runs/*/metrics.json` and `failures.json` numbers measure agreement with `bootstrap_v2.json` VLM proposals (or `faces_v2.json` for the G family), not verified human GT. The quiz has been smoke-tested only: **6 of 333** queued questions answered (`data/gt/quiz_answers.jsonl`, one `not_cabinet` negative plus five `skip`s), and no `data/gt/{val,test}.json` export exists.
+2. **Quiz GT box dependency — and the face family has no quiz path:** `freestyle.quiz` labels identities and counts on `bootstrap_v2` **whole-cartridge** boxes (`box_source = "model"`), so quiz-derived AP50 measures agreement with human-filtered proposals rather than independent box-drawing GT (`runs/score_all_demo/RESULTS_GT.md:4`). Frames flagged `counts_mismatch` need `freestyle.review.server` box edits. Consequence for §8.9: the quiz can decide faces vs whole boxes on **counts** (a cartridge is a cartridge), but if faces win, face-level box GT does not exist yet and would have to be drawn in the review app over `data/labels/faces_v2.json` before any face-family AP/ID number can be called human-verified.
 3. **Single cabinet & slot-memorization hazard:** All 69 frames come from one physical cabinet with no observed stocking changes (`docs/freestyle/DATA_AUDIT.md:305-314`).
 4. **Tiny dataset, 96.1% retention loss, & hard test slice:** Only 40 usable cabinet frames (`12` test frames in `11` groups, `7/12` partial, `6/12` severe blur, `0` upside-down in `test`), yielding wide bootstrap CIs (`docs/freestyle/DATA_AUDIT.md:315-351`).
-5. **Fine-print numeral ceiling:** Only **2 / 123** two-part brand crops had readable numerals (`runs/bootstrap_v2/summary.md:70-74`).
-6. **Gated/incomplete experiments:** `B2_sam3_siglip2` is blocked by HF gated access (`facebook/sam3`); `S4`, `A1`–`A3`, `E1`, and `F1` have configs without completed runs; S3, S5, S6 and S7 have since been collected.
-7. **Privacy & PII:** People appear in **38 / 69** frames; `data/`, `runs/`, and `artifacts/` must stay gitignored and on private hosts/cluster PVCs (`docs/freestyle/DATA_AUDIT.md:325-327`).
-8. **Current working-tree state:** Tracked edits are uncommitted in `freestyle/experiments/score_all.py`, `freestyle/experiments/entry.py`, `freestyle/infer/detector.py`, and `docs/freestyle/RESULTS.md`, and `tests/unit/freestyle/test_score_all.py::test_full_scoring_with_fake_runs` currently fails (`ValueError: too many values to unpack` at `freestyle/experiments/score_all.py:457`) due to the in-progress `score_all.py` edit.
+5. **Fine-print numeral ceiling (partly lifted, unverified):** Whole-cartridge crops yielded **2 / 123** legible Part numerals (`runs/bootstrap_v2/summary.md:70-74`); the front-face pass read **59** numerals off 597 cleaned faces (45 `1`, 14 `2`, `runs/faces_v2/summary.md`) — an order-of-magnitude improvement that no human has checked, and the pair rule is still unvalidated (§10.2).
+6. **Gated/incomplete experiments:** `B2_sam3_siglip2` is blocked by HF gated access (`facebook/sam3`); `S4`, `A1`–`A3`, `E1`, and `F1` have configs without completed runs (`configs/experiments/`). `S3`, `S5`, `S6`, `S7`, `G1`, `G2` have since been collected.
+7. **Privacy & PII:** People appear in **38 / 69** frames; `data/`, `runs/`, and `artifacts/` must stay gitignored and on private hosts/cluster PVCs (`docs/freestyle/DATA_AUDIT.md:325-327`). The galleries referenced from `FAILURES.md` are paths into those gitignored trees, never committed assets.
+8. **Bundle `v1` is provisional by construction:** its `score_thr` (0.308) is pinned by the RF-DETR phantom no-object class index rather than chosen on data (§8.6), and its identity thresholds (0.45/0.45) were picked from an unverified visual crop review — all four counting/identity knobs must be re-tuned on `data/gt/val.json` before any bundle is called final (§8.9).
+9. **Current working-tree state:** the review-#5 fixes are committed (`5ff55c2`) and `tests/unit/freestyle/test_score_all.py::test_full_scoring_with_fake_runs` passes again — the full unit suite is **398 passed, 9 skipped** (`UV_PROJECT_ENVIRONMENT=/var/tmp/vision-intern-test-venv uv run pytest tests/unit -q`). The only uncommitted changes at the time of writing are the documents and `scripts/finalize_after_gt.sh` produced by this finalization pass.
 
 ---
 
@@ -464,6 +672,21 @@ uv run python -m freestyle.cli count <image...> --bundle <bundle_name> --out run
 uv run python -m freestyle.cli fuse <frame1.jpg> <frame2.jpg> --bundle <bundle_name> --method max --json --device cpu
 ```
 
+### 12.7 One command once the human answers exist
+
+Everything GT-dependent is sequenced in `scripts/finalize_after_gt.sh` (see its header for the
+flags). It answers the queue first (`freestyle.quiz.server`, bound to the tailnet address), then
+checks sufficiency (≥ 80 % of each split's questions answered — it aborts loudly below that),
+exports `data/gt/{test,val}.json`, scores every run with `score_all` (1,000 group-bootstrap reps),
+reports which `<!-- GT-PENDING -->` placeholders in this report still need numbers, exports the
+winning bundle (best **test total-count MAE**, ties broken by identity accuracy) and finishes with a
+`freestyle.cli count` demo over three frames.
+
+```bash
+scripts/finalize_after_gt.sh --dry-run     # plan + validate paths, mutate nothing, skip the quiz
+scripts/finalize_after_gt.sh               # full sequence once data/gt/quiz_answers.jsonl is filled in
+```
+
 ---
 
 ## 13. Appendix
@@ -490,11 +713,19 @@ uv run python -m freestyle.cli fuse <frame1.jpg> <frame2.jpg> --bundle <bundle_n
 | `S5_rfdetr_large_agnostic` | `C_det_agnostic_plus_embed` | `k8s:5090` (16384) | `RFDETRLarge` (`res: 576`, `ep: 100`, `bs: 4`, `tile: 1024`) | `none` / `siglip2-base-patch16-224` | Completed (`7f6457d4`) |
 | `S6_owlv2_containment` | `B_zeroshot_plus_embed` | `k8s:5090` (12000) | `owlv2-large-patch14-ensemble`, `containment_threshold: 0.8`, `max_box_area_frac: 0.08` | `none` / `dinov2-base` | Completed (`cbc70383`) |
 | `S7_c2_tile1280_copypaste` | `C_det_agnostic_plus_embed` | `k8s:5090` (12000) | `RFDETRMedium`, 1280 px tiles + copy-paste | `none` / `siglip2-base-patch16-224` | Completed (`b6fc182e`) |
+| `G1_rfdetr_medium_faces` | `C_det_agnostic_plus_embed` | `k8s:5090` (12000) | `RFDETRMedium` (`res: 576`, `ep: 100`, `bs: 4`, `tile: 1280`), target **`cartridge_face`** from `labels/faces_v2.json` (single variable vs `S2`) | `none` / `siglip2-base-patch16-224` | Completed (`cc431fcd`) |
+| `G2_rfdetr_small_faces` | `C_det_agnostic_plus_embed` | `k8s:5090` (12000) | `RFDETRSmall` (`res: 512`, `ep: 100`, `bs: 8`, `tile: 1024`), target **`cartridge_face`** from `labels/faces_v2.json` | `none` / `siglip2-base-patch16-224` | Completed (`7c7b4587`) |
 | `Z0_cpu_chain_check` | `B_zeroshot_plus_embed` | `k8s:5090` (`mode: none`) | `owlv2-base-patch16-ensemble`, `device: cpu`, `chain_check: true` | `none` | Passed (`runs/chain-check/Z0_cpu_chain_check-87d5893f`) |
 
 ### 13.2 Unit Test Summary
 
-Historical draft snapshot, before subsequent commits; this is not a claim about the current working tree or current test status:
+Current status on this branch (`UV_PROJECT_ENVIRONMENT=/var/tmp/vision-intern-test-venv uv run pytest tests/unit -q`, 2026-11-27, after the review-#5 fixes):
+
+```text
+398 passed, 9 skipped in 30.74s
+```
+
+Earlier historical draft snapshot (superseded; kept so the record of the breakage is not lost):
 
 ```text
 uv run pytest tests/unit -q
