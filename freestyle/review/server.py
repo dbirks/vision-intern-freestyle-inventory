@@ -80,7 +80,13 @@ PALETTE = [
 ]
 
 
+# Catalog rows with an empty color_hint, coloured as they look in the cabinet.
+_NAME_COLOR = {"nns-sweetener": "#2f8fd0", "ingredient-aa": "#f2c94c", "ingredient-cc": "#9b8fd6"}
+
+
 def _color_for(name: str, hint: str) -> str:
+    if not (hint or "").strip() and name in _NAME_COLOR:
+        return _NAME_COLOR[name]
     h = (hint or "").strip().lower()
     if h.startswith("#"):
         return h

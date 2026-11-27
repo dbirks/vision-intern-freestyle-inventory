@@ -1,0 +1,129 @@
+<!doctype html>
+<html lang="en" data-theme="light">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover" />
+<title>Freestyle GT Quiz</title>
+<meta name="description" content="Phone-first ground-truth quiz: one zoomed crop at a time." />
+<meta name="color-scheme" content="light dark" />
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Ccircle cx='16' cy='16' r='15' fill='%23c8102e'/%3E%3Cpath d='M11 9h11v3.5h-7v3h5.5v3.3H15V24h-4V9z' fill='%23fff8f1'/%3E%3C/svg%3E" type="image/svg+xml" />
+<link rel="preconnect" href="https://fonts.googleapis.com" />
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=DM+Mono:wght@400;500&family=Manrope:wght@400;500;600;700;800&family=Young+Serif&display=swap" />
+<link rel="stylesheet" href="/static/quiz.css" />
+<script>
+  (function () {
+    var t;
+    try { t = localStorage.getItem('freestyle-quiz:theme'); } catch (e) {}
+    if (t !== 'light' && t !== 'dark') t = matchMedia('(prefers-color-scheme: dark)').matches ? 'dark' : 'light';
+    document.documentElement.dataset.theme = t;
+  })();
+</script>
+</head>
+<body>
+<header class="topbar">
+  <div class="topbar__pill">
+    <span class="topbar__title">
+      <span class="brand-dot" aria-hidden="true"></span>
+      <span>Freestyle</span>
+      <span class="topbar__title-rest">GT Quiz</span>
+    </span>
+    <span class="live-chip" id="progress-chip" aria-live="polite"><span class="pulse-dot"></span><span id="progress-short">…</span></span>
+    <div class="topbar__actions">
+      <button id="undo" class="btn-pill btn-pill--ghost" type="button" title="u" disabled>↩ Undo</button>      <button id="theme" class="icon-btn topbar__theme" type="button" aria-label="Switch color theme">◐</button>
+    </div>
+  </div>
+  <div class="progress" role="progressbar" aria-valuemin="0" aria-valuemax="100" aria-valuenow="0" id="progress-bar">
+    <span class="progress__fill" id="progress-fill"></span>
+  </div>
+</header>
+
+<main id="main" class="main">
+  <p class="status" id="status">Loading queue…</p>
+
+  <section class="card quiz" id="quiz" hidden>
+    <div class="quiz__head">
+      <span class="tag-pill tag-pill--cola" id="q-kind">count</span>
+      <span class="tag-pill" id="q-split">test</span>
+      <span class="quiz__where" id="q-where">0 / 0 · image 1 of 1</span>
+    </div>
+
+    <div id="q-count" class="quiz__body" hidden>
+      <p class="ask" id="count-ask"></p>
+      <div class="framebox">
+        <img id="count-img" data-zoom="" alt="full cabinet frame with the model's numbered boxes" decoding="async" />
+      </div>
+      <div class="fix" id="count-fix" hidden>
+        <div class="stepper">
+          <span class="stepper__label">top shelf</span>
+          <span class="stepper__controls">
+            <button class="icon-btn" type="button" data-step="-1" data-target="top" aria-label="fewer top">−</button>
+            <output class="stepper__value" id="fix-top">0</output>
+            <button class="icon-btn" type="button" data-step="1" data-target="top" aria-label="more top">+</button>
+          </span>
+        </div>
+        <div class="stepper">
+          <span class="stepper__label">bottom shelf</span>
+          <span class="stepper__controls">
+            <button class="icon-btn" type="button" data-step="-1" data-target="bottom" aria-label="fewer bottom">−</button>
+            <output class="stepper__value" id="fix-bottom">0</output>
+            <button class="icon-btn" type="button" data-step="1" data-target="bottom" aria-label="more bottom">+</button>
+          </span>
+        </div>
+        <button class="btn btn--primary" id="fix-save" type="button">Save count</button>
+      </div>
+      <div class="answers" id="count-answers">
+        <button class="btn btn--primary" data-count="correct" type="button">✓ Yes</button>
+        <button class="btn" data-count="fix" type="button">✎ Fix the numbers</button>
+        <button class="btn btn--warn" data-count="not_cabinet" type="button">Not a usable cabinet view</button>
+        <button class="btn btn--ghost" data-count="skip" type="button">Skip →</button>
+      </div>
+    </div>
+
+    <div id="q-crop" class="quiz__body" hidden>
+      <div class="crop__stage">
+        <figure class="crop__figure">
+          <img id="crop-img" data-zoom="" alt="zoomed crop of the cartridge" decoding="async" />
+          <figcaption class="crop__caption" id="crop-caption">box 1 · top shelf</figcaption>
+        </figure>
+        <figure class="context">
+          <img id="context-img" alt="where this box is in the frame" decoding="async" />
+          <figcaption class="context__caption" id="context-caption">frame</figcaption>
+        </figure>
+      </div>
+      <p class="ask">Guess: <strong id="guess-text">unknown</strong> <span class="ask__conf" id="guess-conf">0%</span></p>
+
+      <div class="answers answers--part" id="part-answers" hidden>
+        <button class="btn btn--primary btn--big" data-part="1" type="button">Part 1</button>
+        <button class="btn btn--primary btn--big" data-part="2" type="button">Part 2</button>
+        <button class="btn btn--big" id="part-unknown" type="button">Can't tell</button>
+        <p class="ask__note">Which end face is this? Can't tell shows every class and the box flags.</p>
+      </div>
+
+      <div class="answers" id="crop-answers" hidden>
+        <button class="btn btn--primary" id="btn-correct" type="button">✓ Correct</button>
+        <div class="class-grid" id="class-grid"></div>
+        <button class="btn btn--warn" data-crop="not_cartridge" type="button">Not a cartridge</button>
+        <button class="btn btn--warn" data-crop="two_plus" type="button">Box covers 2+ cartridges</button>
+        <button class="btn btn--warn" data-crop="partial" type="button">Box cuts a cartridge (partial)</button>
+        <button class="btn btn--warn" data-crop="skip" type="button">Skip →</button>
+      </div>
+    </div>
+  </section>
+
+  <section class="card done" id="done" hidden>
+    <h1 class="done__title">Queue finished 🎉</h1>
+    <p class="done__text" id="done-text"></p>
+    <button class="btn btn--primary" id="restart" type="button">Review from the start</button>
+  </section>
+</main>
+
+<div class="lightbox" id="lightbox" hidden>
+  <button class="lightbox__close icon-btn" id="lightbox-close" type="button" aria-label="Close zoom">✕</button>
+  <div class="lightbox__scroll"><img id="lightbox-img" alt="zoomed image" decoding="async" /></div>
+</div>
+
+<p class="hint" id="hint">y correct · 1–9 class · n not a cartridge · u undo · s skip</p>
+<script src="/static/quiz.js"></script>
+</body>
+</html>
