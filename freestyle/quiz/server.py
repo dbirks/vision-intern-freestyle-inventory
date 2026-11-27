@@ -240,15 +240,24 @@ class QuizStore:
         if question is None:
             raise QuizError(f"unknown question id {qid!r}")
         record = self._normalize(question, answer)
-        line = json.dumps(record, separators=(",", ":"), sort_keys=True) + "\n"
         with self._lock:
+            records = [record]
+            if question["kind"] == COUNT and record["answer"]["result"] == "not_cabinet":
+                for crop in self.by_image[question["image_id"]]:
+                    if crop["kind"] == CROP:
+                        implied = self._normalize(crop, {"result": "skip"})
+                        implied["answer"]["result"] = "implied_not_usable"
+                        implied["implied_by"] = qid
+                        records.append(implied)
+            line = "".join(json.dumps(r, separators=(",", ":"), sort_keys=True) + "\n" for r in records)
             self.answers_path.parent.mkdir(parents=True, exist_ok=True)
             with open(self.answers_path, "a", encoding="utf-8") as fh:
                 fh.write(line)
                 fh.flush()
                 os.fsync(fh.fileno())
-            self._answers.append(record)
-            self._answered[record["qid"]] = record
+            self._answers.extend(records)
+            for item in records:
+                self._answered[item["qid"]] = item
         return record
 
     def _normalize(self, question: dict[str, Any], answer: Any) -> dict[str, Any]:
@@ -300,9 +309,14 @@ class QuizStore:
         with self._lock:
             if not self._answers:
                 return None
-            removed = self._answers[-1]
-            self._write_log(self._answers[:-1])
-            self._answers = self._answers[:-1]
+            end = len(self._answers)
+            while end and self._answers[end - 1].get("implied_by"):
+                end -= 1
+            if end:
+                end -= 1
+            removed = self._answers[end]
+            self._write_log(self._answers[:end])
+            self._answers = self._answers[:end]
             self._answered = {}
             for record in self._answers:
                 self._answered[record["qid"]] = record
@@ -312,10 +326,22 @@ class QuizStore:
 
     def next_index(self) -> int:
         with self._lock:
+            skips: dict[str, int] = {}
+            for record in self._answers:
+                if record.get("kind") == COUNT and record.get("answer", {}).get("result") == "skip":
+                    skips[record["image_id"]] = skips.get(record["image_id"], 0) + 1
+            deferred = []
             for i, question in enumerate(self.questions):
+                image_id = question["image_id"]
+                count = next(q for q in self.by_image[image_id] if q["kind"] == COUNT)
+                count_answer = self._answered.get(count["qid"], {}).get("answer", {}).get("result")
+                if count_answer == "skip":
+                    if question["kind"] == COUNT and skips.get(image_id) == 1:
+                        deferred.append(i)
+                    continue
                 if question["qid"] not in self._answered:
                     return i
-            return len(self.questions)
+            return deferred[0] if deferred else len(self.questions)
 
     def state_payload(self) -> dict[str, Any]:
         with self._lock:

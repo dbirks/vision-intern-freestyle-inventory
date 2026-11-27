@@ -198,10 +198,11 @@
         toast(result.body.error || 'not saved', true);
         return;
       }
-      answers[qid] = result.body.record.answer;
+      answers = result.body.state.answers || {};
+      index = result.body.state.next_index;
       busy = false;
       toast(savedLabel(answer));
-      advance();
+      render();
     }).catch(function (error) {
       busy = false;
       toast('offline? ' + error, true);
@@ -255,7 +256,7 @@
       return Math.min(queue.questions.length - 1, Number(jump));
     }
     var n = typeof state.next_index === 'number' ? state.next_index : 0;
-    return n >= queue.questions.length ? queue.questions.length - 1 : n;
+    return n;
   }
 
   function boot() {

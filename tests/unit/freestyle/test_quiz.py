@@ -425,3 +425,48 @@ def test_partial_identity_requires_explicit_class():
     assert _identity(question, {'result': 'partial', 'class': 'sprite'}) == ('sprite', 'human', 'partial')
     with pytest.raises(ValueError):
         _identity(question, {'result': 'unexpected'})
+
+
+def test_unusable_implies_crops_and_undo_restores_them(store):
+    count = store.questions[0]
+    crops = [q for q in store.by_image[count["image_id"]] if q["kind"] == "crop"]
+    store.answer(count["qid"], {"result": "not_cabinet"})
+    answers = store.state_payload()["answers"]
+    assert all(answers[q["qid"]]["result"] == "implied_not_usable" for q in crops)
+    doc, counts = to_coco.build_coco(store.queue, answers, count["split"])
+    image = next(im for im in doc["images"] if im["file_name"] == count["image_id"])
+    assert image["attributes"]["verified"]
+    assert not [ann for ann in doc["annotations"] if ann["image_id"] == image["id"]]
+    assert counts["images"][count["image_id"]]["human_total"] == 0
+    assert store.undo()["qid"] == count["qid"]
+    assert not store.state_payload()["answers"]
+
+
+def test_count_skip_defers_image_once_and_undo(store):
+    count = store.questions[0]
+    store.answer(count["qid"], {"result": "skip"})
+    assert store.questions[store.next_index()]["image_id"] != count["image_id"]
+    assert all(q["qid"] not in store.state_payload()["answers"] for q in store.by_image[count["image_id"]][1:])
+    reloaded = QuizStore(store.queue, store.answers_path, store.images_root)
+    assert reloaded.next_index() == store.next_index()
+    assert reloaded.undo()["qid"] == count["qid"]
+    assert reloaded.next_index() == 0
+    store = reloaded
+    store.answer(count["qid"], {"result": "skip"})
+    for q in store.questions:
+        if q["image_id"] != count["image_id"]:
+            store.answer(q["qid"], {"result": "correct"})
+    assert store.next_index() == 0
+    store.answer(count["qid"], {"result": "skip"})
+    assert store.next_index() == len(store.questions)
+
+
+def test_audit_quality_orders_within_split(proposals):
+    data, splits, root = proposals
+    audit = {"images": [
+        {"image_id": IMAGE_A, "scene_label": "cabinet_partial", "motion_blur": "mild", "sharp_full": 500},
+        {"image_id": IMAGE_B, "scene_label": "cabinet_full", "motion_blur": "none", "sharp_full": 10},
+    ]}
+    same_split = {"images": {IMAGE_A: "test", IMAGE_B: "test"}}
+    queue = bq.build_queue(data, same_split, ["test"], CLASSES, root, audit)
+    assert [im["image_id"] for im in queue["images"]] == [IMAGE_B, IMAGE_A]

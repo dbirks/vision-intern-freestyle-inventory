@@ -58,7 +58,7 @@ def _identity(question: dict[str, Any], answer: dict[str, Any] | None) -> tuple[
     if answer is None or str(answer.get("result") or "") == "skip":
         return guess, MODEL, ""
     result = str(answer.get("result") or "")
-    if result == "not_cartridge":
+    if result in ("not_cartridge", "implied_not_usable"):
         return None, HUMAN, result
     if result in ("class", "part"):
         return _answer_class(question, answer), HUMAN, result

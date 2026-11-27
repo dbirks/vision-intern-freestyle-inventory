@@ -263,6 +263,7 @@ def build_queue(
     splits_order: list[str] | tuple[str, ...] = ("test", "val"),
     classes: list[dict[str, Any]] | None = None,
     images_root: Path = DEFAULT_IMAGES_ROOT,
+    audit: Path | dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     """Assemble the ordered quiz queue from a COCO proposals mapping."""
     data = proposals if isinstance(proposals, dict) else json.loads(Path(proposals).read_text(encoding="utf-8"))
@@ -388,14 +389,24 @@ def build_queue(
         )
         questions.extend(image_questions)
 
-    # stable overall ordering: split rank, then image id, then count-before-crops
+    audit_data = audit if isinstance(audit, dict) else (json.loads(Path(audit).read_text()) if audit else {})
+    audit_images = {im["image_id"]: im for im in audit_data.get("images", [])}
+
+    def image_key(image_id: str) -> tuple:
+        item = audit_images.get(image_id, {})
+        scene, blur = item.get("scene_label"), item.get("motion_blur")
+        tier = 3 if blur == "severe" else (0 if scene == "cabinet_full" and blur in ("none", "mild")
+                                            else 1 if scene == "cabinet_partial" else 2)
+        return (tier, -float(item.get("sharp_full") or 0) if tier == 0 else 0, image_id)
+
+    # Keep each image's count and crops together in audit quality order.
     questions.sort(
-        key=lambda q: (rank.get(q["split"], len(rank)), q["image_id"], q["kind"] != COUNT, q.get("number", 0))
+        key=lambda q: (rank.get(q["split"], len(rank)), image_key(q["image_id"]), q["kind"] != COUNT, q.get("number", 0))
     )
     index = {q["qid"]: i for i, q in enumerate(questions)}
     for image in out_images:
         image["first_index"] = min(index[q] for q in image["qids"])
-    out_images.sort(key=lambda im: (rank.get(im["split"], len(rank)), im["image_id"]))
+    out_images.sort(key=lambda im: (rank.get(im["split"], len(rank)), image_key(im["image_id"])))
 
     return {
         "version": QUEUE_VERSION,
@@ -431,6 +442,7 @@ def make_parser() -> argparse.ArgumentParser:
     p.add_argument("--splits-order", default="test,val", help="comma-separated splits to quiz, in order")
     p.add_argument("--out", type=Path, required=True, help="queue json to write (typically data/gt/quiz_queue.json)")
     p.add_argument("--images-root", type=Path, default=DEFAULT_IMAGES_ROOT)
+    p.add_argument("--audit", type=Path, default=Path("data/derived/audit/audit.json"))
     p.add_argument("--catalog", type=Path, default=DEFAULT_CATALOG)
     return p
 
@@ -444,6 +456,7 @@ def main(argv: list[str] | None = None) -> int:
         [s for s in args.splits_order.split(",") if s.strip()],
         classes,
         args.images_root,
+        args.audit,
     )
     validate_queue(queue)
     out = Path(args.out)
