@@ -33,10 +33,16 @@ def build_human_gt(
 ) -> tuple[dict[str, Any], dict[str, Any], list[dict[str, Any]]]:
     """Build quiz COCO, excluding incomplete images and model identities.
 
-    Skips and missing answers do not count towards the 80% cutoff. A human
-    count is required independently, since it is the primary count target.
+    ``test`` is the eval split: skips and missing answers do not count towards the
+    80% per-image cutoff and a human count is required independently.
+
+    ``val`` is the tuning split and only ever drives threshold selection, which reads
+    the per-image human total (see select_thresholds). So a val image only needs its
+    human COUNT; unanswered val crops never exclude it. Answered val crops are kept and
+    used exactly as before (identity gallery / tuning), they are just optional.
     """
     coco, counts = build_coco(queue, answers, split)
+    requires_crop_coverage = split != 'val'
     questions: dict[str, list[dict[str, Any]]] = {}
     for question in queue['questions']:
         questions.setdefault(question['image_id'], []).append(question)
@@ -51,10 +57,13 @@ def build_human_gt(
             for q in qs
         )
         fraction = answered / len(qs) if qs else 0.0
-        if (fraction < 0.8 and image['attributes'].get('usable', True)) or image['attributes']['human_counts'] is None:
+        short_of_crops = (fraction < 0.8 and image['attributes'].get('usable', True)
+                          and requires_crop_coverage)
+        if short_of_crops or image['attributes']['human_counts'] is None:
             excluded.append({'image_id': image_id, 'answered': answered,
                              'questions': len(qs), 'fraction': fraction,
-                             'reason': 'below_80_percent' if fraction < 0.8 else 'missing_count'})
+                             'reason': 'missing_count' if image['attributes']['human_counts'] is None
+                                       else 'below_80_percent'})
         else:
             kept.append(image)
     ids = {image['id'] for image in kept}
@@ -383,6 +392,7 @@ def markdown(result):
              'Identity accuracy is conditional on a matched human-answered, known-identity crop.',
              'Class inventory and AP exclude incomplete images and count mismatches.',
              'Thresholds minimize validation total count error, then class count error; embedding validation uses held-out groups.',
+             'The validation split needs human count answers only; unanswered validation crops just shrink the identity gallery.',
              'Training-gallery confidence thresholds are selected on validation; +val galleries hold out the query group during validation and use all validation groups at test time. Train and validation may contain near duplicates.',
              'Sharp-full means cabinet_full with no or mild motion blur; partial/blurry means cabinet_partial or severe blur. Other audit cases are omitted from these subsets.',
              '', 'Excluded images:']
@@ -453,7 +463,8 @@ def run(args):
         gt[split], counts[split], excluded[split] = build_human_gt(queue, answers, split)
         validate_groups(gt[split], split, splits)
     if not gt['val']['images']:
-        raise ValueError('no eligible validation images')
+        raise ValueError('no eligible validation images (val needs its per-image count answers; '
+                         'val crop answers are optional)')
     if not gt['test']['images']:
         raise ValueError('no eligible test images')
     result = {'version': 1, 'demo': args.demo, 'excluded': excluded, 'rows': [], 'skipped_runs': [],
@@ -462,6 +473,13 @@ def run(args):
                               'Training and validation splits may include near-duplicate images.',
                               'Validation embeddings use leave-one-group-out gallery; test uses all eligible validation crops.',
                               'Training VLM gallery confidence is selected on validation; test labels are never used.']}
+    # Val crops are optional: with none answered, the val-only embedding galleries are empty
+    # and the identifier variants that depend on them cannot produce meaningful numbers.
+    val_gallery_total = len(gt['val']['annotations'])
+    if not val_gallery_total:
+        result['limitations'].append(
+            'No answered val crops: val-only identity galleries are reported as '
+            '"insufficient val crops"; train-VLM galleries still score normally.')
     for path in sorted(map(Path, glob.glob(args.runs))):
         val_path, test_path = path / 'val/predictions.json', path / 'test/predictions.json'
         if not val_path.is_file() or not test_path.is_file():
@@ -478,6 +496,7 @@ def run(args):
                     pred['proposed_class'] = category_names.get(pred.get('category_id'), 'unknown')
             predictions[split] = grouped_predictions(raw)
         emb = load_embeddings(path / 'embeddings.npz')
+        val_gallery_size = len(gallery(emb, gt['val'])[1]) if emb is not None else 0
         methods = ['none', 'vlm']
         if family.startswith('D_'):
             methods.append('own')
@@ -485,6 +504,12 @@ def run(args):
             methods += ['knn', 'proto', 'knn_trainvlm', 'knn_trainvlm+val',
                         'linear_trainvlm', 'linear_trainvlm+val']
         for method in methods:
+            if method in ('knn', 'proto') and not val_gallery_size:
+                # These galleries are human val crops only; without them the identifiers would
+                # return 'unknown' for every crop and report a huge, meaningless class error.
+                result['skipped_runs'].append({'run': path.name, 'identifier': method,
+                                               'reason': 'insufficient val crops'})
+                continue
             train_variant = 'trainvlm' in method
             candidates = (0., .5, .75, .9) if train_variant else (None,)
             fitted = {}
@@ -524,6 +549,7 @@ def run(args):
                                        'score_thr': score_thr, 'identity_thr': id_thr,
                                        'train_vlm_confidence_thr': confidence,
                                        'train_gallery_size': len(train_items[0]) if train_items else 0,
+                                       'val_gallery_size': val_gallery_size,
                                        'threshold_source': 'val', 'subsets': subsets})
 
     if not result['rows']:

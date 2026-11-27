@@ -5,8 +5,10 @@
 #   0. validate the repo/paths it is about to touch (and `uv`)
 #   1. quiz          — serve freestyle.quiz.server so the remaining questions get answered
 #                      (skippable: --skip-quiz, e.g. when the answers are already in)
-#   2. sufficiency   — HARD GATE: abort unless >= --min-frac (default 0.80) of *each* split's
-#                      questions are answered with a non-`skip` result
+#   2. sufficiency   — HARD GATE: abort unless >= --min-frac (default 0.80) of the test split's
+#                      `purpose: eval` questions are answered with a non-`skip` result AND every
+#                      val COUNT question is answered. Val crops and all train questions are
+#                      optional — score_all only reads val counts to pick its thresholds.
 #   3. to_coco       — export data/gt/test.json + data/gt/val.json (+ *_counts.json mismatches)
 #   4. score_all     — score every run with both val and test predictions, 1000 bootstrap reps
 #                      -> docs/freestyle/RESULTS_GT.md + results_gt.json
@@ -27,6 +29,7 @@
 #
 # --dry-run validates inputs, runs the answer gate against whatever is in the answers file today,
 # prints every command it would run, and mutates nothing (no quiz, no exports, no bundles).
+# A failing gate still aborts the dry run with exit 3, exactly like the real run would.
 
 set -euo pipefail
 
@@ -121,12 +124,23 @@ else
     --queue "$QUEUE" --answers "$ANSWERS" --host "$QUIZ_HOST" --port "$QUIZ_PORT"
 fi
 
-# ------------------------------------------------- step 2: sufficiency gate (< 80% = abort) ---
+# ------------------------- step 2: sufficiency gate (test eval 80% + all val counts = abort) ---
+# What scoring actually needs (see freestyle/experiments/score_all.py):
+#   test / purpose=eval  — the numbers we report: >= --min-frac of these answered (skips don't count),
+#                          and score_all still drops any single image below its own 80% rule.
+#   val  / kind=count    — ALL of them: select_thresholds() picks score/identity thresholds purely
+#                          by minimising val total-count error.
+#   val  / kind=crop     — optional; when answered they feed the identity gallery / train-confidence
+#                          tuning, when missing score_all reports 'insufficient val crops' instead of
+#                          failing the run.
+#   train / purpose=train — VLM-labelled proposals, never quiz GT: nothing is required here.
 # Mirrors freestyle.quiz.to_coco.load_answers (last line per qid wins) and the 'skip' semantics.
 check_answers() {
   local queue="$1" answers="$2" min_frac="$3"
   "${PYENV[@]}" - "$queue" "$answers" "$min_frac" <<'PY'
-import json, sys
+import json
+import math
+import sys
 from collections import defaultdict
 from pathlib import Path
 
@@ -137,49 +151,90 @@ queue_path, answers_path, min_frac = Path(sys.argv[1]), Path(sys.argv[2]), float
 queue = json.loads(queue_path.read_text(encoding='utf-8'))
 answers = load_answers(answers_path) if answers_path.is_file() else {}
 
+questions = queue['questions']
+
+
+def answered(question):
+    result = (answers.get(question['qid']) or {}).get('result')
+    return result not in (None, '', 'skip')
+
+
+def purpose(question):
+    return str(question.get('purpose') or 'eval')
+
+
+eval_test = [q for q in questions if q['split'] == 'test' and purpose(q) == 'eval']
+val_counts = [q for q in questions if q['split'] == 'val' and q.get('kind') == 'count']
+val_crops = [q for q in questions if q['split'] == 'val' and q.get('kind') != 'count']
+train_qs = [q for q in questions if q['split'] == 'train' or purpose(q) == 'train']
+
 # A frame answered 'not_cabinet' on its count question is a finished GT negative: to_coco drops
-# its crops and score_all keeps it without the per-image 80% rule, so its crop questions must not
-# sit in the denominator.
-not_cabinet = {q['image_id'] for q in queue['questions']
+# its crops and score_all keeps it without the per-image 80% rule. Its crop questions stay in the
+# denominator here (a stricter gate is safe: passing this one passes the excluded form too).
+not_cabinet = {q['image_id'] for q in questions
                if q.get('kind') == 'count' and (answers.get(q['qid']) or {}).get('result') == 'not_cabinet'}
 
-per_split_total, per_split_answered = defaultdict(int), defaultdict(int)
-per_image = defaultdict(lambda: [0, 0])            # image_id -> [answered, effective questions]
-for q in queue['questions']:
-    split, image_id = q['split'], q['image_id']
-    if image_id in not_cabinet and q.get('kind') != 'count':
-        continue
-    per_split_total[split] += 1
-    per_image[image_id][1] += 1
-    ans = answers.get(q['qid'])
-    result = (ans or {}).get('result')
-    if result not in (None, '', 'skip'):
-        per_split_answered[split] += 1
-        per_image[image_id][0] += 1
-if not_cabinet:
-    print(f'  negatives (not_cabinet, crops excluded from the denominator): {len(not_cabinet)}')
+eval_total = len(eval_test)
+eval_got = sum(1 for q in eval_test if answered(q))
+eval_need = min(eval_total, max(0, math.ceil(eval_total * min_frac - 1e-9))) if eval_total else 1
+val_total = len(val_counts)
+val_got = sum(1 for q in val_counts if answered(q))
+val_need = val_total or 1
+val_crop_got = sum(1 for q in val_crops if answered(q))
+train_got = sum(1 for q in train_qs if answered(q))
 
 print(f'answers file: {answers_path} ({len(answers)} distinct qids recorded)')
-ok = True
-for split in ('test', 'val'):
-    total = per_split_total.get(split, 0)
-    got = per_split_answered.get(split, 0)
-    frac = (got / total) if total else 0.0
-    flag = 'OK ' if frac >= min_frac else 'LOW'
-    print(f'  [{flag}] {split}: {got}/{total} questions answered ({frac:.0%}; need {min_frac:.0%})')
-    ok = ok and total > 0 and frac >= min_frac
+print(f'test eval {eval_got}/{eval_total} (need {eval_need}) · '
+      f'val counts {val_got}/{val_total} (need {val_need})')
 
-images = [i for i in per_image if i not in not_cabinet] + sorted(i for i in not_cabinet if i in per_image)
-images = sorted(images, key=lambda i: per_image[i][0] / max(per_image[i][1], 1))
+
+def flag(enough):
+    return 'OK ' if enough else 'LOW'
+
+
+if eval_total:
+    print(f'  [{flag(eval_got >= eval_need)}] test eval: {eval_got}/{eval_total} = '
+          f'{eval_got / eval_total:.0%} answered (need {eval_need} = {min_frac:.0%})')
+else:
+    print('  [LOW] test eval: the queue has no purpose=eval test questions')
+if val_total:
+    print(f'  [{flag(val_got >= val_need)}] val count answers (threshold selection): '
+          f'{val_got}/{val_total} (need all)')
+else:
+    print('  [LOW] val: the queue has no count questions')
+print(f'  [opt] val crop answers (identity gallery): {val_crop_got}/{len(val_crops)}'
+      f' — {"complete" if val_crop_got >= len(val_crops) else "insufficient val crops"}')
+print(f'  [opt] train questions: {train_got}/{len(train_qs)} — not required by scoring')
+if not_cabinet:
+    crops = sum(1 for q in eval_test if q.get('kind') != 'count' and q['image_id'] in not_cabinet)
+    print(f'  negatives (not_cabinet): {len(not_cabinet)} frame(s), '
+          f'{crops} crop question(s) kept in the denominator')
+
+val_missing = [q['qid'] for q in val_counts if not answered(q)]
+if val_missing:
+    print(f'  val counts still missing: {", ".join(val_missing)}')
+
+# Informational: score_all excludes individual test images below its own per-image 80% rule.
+per_image = defaultdict(lambda: [0, 0])            # image_id -> [answered, effective questions]
+for q in eval_test:
+    if q['image_id'] in not_cabinet and q.get('kind') != 'count':
+        continue
+    per_image[q['image_id']][1] += 1
+    if answered(q):
+        per_image[q['image_id']][0] += 1
+images = sorted(per_image, key=lambda i: per_image[i][0] / max(per_image[i][1], 1))
 short = [i for i in images if per_image[i][0] / max(per_image[i][1], 1) < 0.8]
-print(f'  images below the per-image 80% rule (score_all excludes these): {len(short)}/{len(images)}')
+print(f'  test images below the per-image 80% rule (score_all excludes these): {len(short)}/{len(images)}')
 for i in short[:5]:
     a, t = per_image[i]
     print(f'    {a}/{t}  {i}')
 if len(short) > 5:
     print(f'    ... and {len(short) - 5} more')
+
+ok = bool(eval_total) and eval_got >= eval_need and bool(val_total) and val_got >= val_need
 if not ok:
-    print('INSUFFICIENT: answer more of the quiz (or pass --min-frac deliberately lower).', file=sys.stderr)
+    print('INSUFFICIENT: answer the test eval questions to the need above AND every val count '
+          'question (val crops and train stay optional).', file=sys.stderr)
     raise SystemExit(3)
 print('sufficiency gate passed.')
 PY
@@ -187,7 +242,11 @@ PY
 
 if [ "$DRY_RUN" = 1 ]; then
   say "answer gate (dry-run, read-only):"
-  check_answers "$QUEUE" "$ANSWERS" "$MIN_FRAC" || say "gate currently FAILS (exit 3) — expected before the quiz is answered"
+  if ! check_answers "$QUEUE" "$ANSWERS" "$MIN_FRAC"; then
+    say "gate currently FAILS — the real run would abort here (exit 3); expected before the quiz is answered"
+    exit 3
+  fi
+  say "gate would PASS — continuing the dry run"
 else
   check_answers "$QUEUE" "$ANSWERS" "$MIN_FRAC"
 fi

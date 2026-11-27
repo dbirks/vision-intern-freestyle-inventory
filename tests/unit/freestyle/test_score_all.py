@@ -36,6 +36,122 @@ def test_human_gt_filters_skips_and_model_labels(monkeypatch):
     assert excluded[0]['answered'] == 3
 
 
+def test_val_images_need_only_the_human_count(monkeypatch):
+    """The val/tune split is only used to pick thresholds, so counts alone are enough."""
+    import copy
+
+    coco = {'images': [
+        {'id': 1, 'file_name': 'valimg', 'attributes': {'human_counts': {'total': 3},
+                                                        'usable': True, 'verified': False}},
+        {'id': 2, 'file_name': 'nocount', 'attributes': {'human_counts': None,
+                                                         'usable': True, 'verified': False}},
+    ], 'annotations': [
+        {'image_id': 1, 'attributes': {'identity_source': 'human'}},
+        {'image_id': 1, 'attributes': {'identity_source': 'model'}},
+    ], 'info': {}}
+    counts = {'images': {'valimg': {}, 'nocount': {}}, 'mismatches': [], 'unverified': []}
+    monkeypatch.setattr('freestyle.experiments.score_all.build_coco',
+                        lambda *args: (copy.deepcopy(coco), copy.deepcopy(counts)))
+    questions = [{'qid': 'count:valimg', 'image_id': 'valimg', 'kind': 'count'},
+                 *[{'qid': f'crop:valimg:{i}', 'image_id': 'valimg', 'kind': 'crop'} for i in range(7)],
+                 {'qid': 'count:nocount', 'image_id': 'nocount', 'kind': 'count'}]
+    answers = {'count:valimg': {'result': 'correct'}, 'crop:valimg:3': {'result': 'skip'}}
+    queue = {'questions': questions}
+
+    result, result_counts, excluded = build_human_gt(queue, answers, 'val')
+    assert [image['file_name'] for image in result['images']] == ['valimg']
+    assert list(result_counts['images']) == ['valimg']
+    assert len(result['annotations']) == 1                    # model identities are never GT
+    assert [(x['image_id'], x['reason']) for x in excluded] == [('nocount', 'missing_count')]
+
+    # the same answers are not enough for the eval split, which keeps the 80% crop rule
+    result, _counts, excluded = build_human_gt(queue, answers, 'test')
+    assert result['images'] == []
+    assert [(x['image_id'], x['reason'], x['answered']) for x in excluded] == [
+        ('valimg', 'below_80_percent', 1), ('nocount', 'missing_count', 0)]
+
+
+def test_count_only_val_scores_and_reports_val_crops(tmp_path):
+    """Answered val counts must score end to end; val-crop galleries degrade, not fail."""
+    import json
+
+    import numpy as np
+
+    def save(path, obj):
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(json.dumps(obj))
+
+    images, questions, records, proposals, audit = [], [], [], [], []
+    predictions = {'val': [], 'test': []}
+    split_images = {'local/train.jpg': 'train'}
+    groups = {'local/train.jpg': 'train'}
+    for idx, (split, name) in enumerate([('val', 'local/val1.jpg'), ('test', 'local/t1.jpg'),
+                                         ('test', 'local/t2.jpg')], 1):
+        images.append({'image_id': name, 'coco_image_id': idx, 'split': split, 'width': 100,
+                       'height': 100, 'model_top': 1, 'model_bottom': 0, 'model_total': 1})
+        split_images[name] = split
+        groups[name] = split
+        audit.append({'image_id': name, 'scene_label': 'cabinet_full', 'motion_blur': 'none'})
+        proposals.append({'id': idx, 'image_id': idx, 'bbox': [10, 10, 10, 20], 'category_id': 1,
+                          'attributes': {'id_mode': 'two_stage', 'id_confidence': .9}})
+        predictions[split].append({'image_id': idx, 'bbox': [10, 10, 10, 20], 'category_id': 1,
+                                   'score': .9, 'proposed_class': 'sprite', 'id_score': .9})
+        purpose = 'tune' if split == 'val' else 'eval'
+        questions.append({'qid': f'count:{name}', 'image_id': name, 'kind': 'count', 'purpose': purpose})
+        records.append({'qid': f'count:{name}', 'answer': {'result': 'correct'}})
+        # val keeps its crops unanswered (2 of them, so coverage is 1/3), test answers everything
+        for crop in range(2 if split == 'val' else 1):
+            qid = f'crop:{name}:{crop}'
+            questions.append({'qid': qid, 'image_id': name, 'kind': 'crop', 'purpose': purpose,
+                              'ann_id': idx * 10 + crop, 'bbox': [10, 10, 20, 30], 'guess': 'sprite'})
+            if split == 'test':
+                records.append({'qid': qid, 'answer': {'result': 'correct'}})
+    proposals.append({'id': 4, 'image_id': 4, 'bbox': [10, 10, 10, 20], 'category_id': 1,
+                      'attributes': {'source': 'vlm:bootstrap', 'id_confidence': .9}})
+    queue = {'version': 1, 'classes': [{'id': 1, 'name': 'sprite'}, {'id': 2, 'name': 'unknown'}],
+             'images': images, 'questions': questions}
+    queue_path = tmp_path / 'queue.json'
+    answer_path = tmp_path / 'answers.jsonl'
+    save(queue_path, queue)
+    answer_path.write_text(''.join(json.dumps(r) + '\n' for r in records))
+    save(tmp_path / 'splits.json', {'images': split_images, 'groups': groups})
+    save(tmp_path / 'audit.json', {'images': audit})
+    save(tmp_path / 'proposals.json', {'images': [{'id': i + 1, 'file_name': im['image_id']}
+                                                  for i, im in enumerate(images)]
+                                                 + [{'id': 4, 'file_name': 'local/train.jpg'}],
+                                       'annotations': proposals, 'categories': queue['classes']})
+    run = tmp_path / 'runs' / 'C_fake'
+    save(run / 'meta.json', {'config': {'family': 'C_det_agnostic'}})
+    for split in predictions:
+        save(run / split / 'predictions.json', predictions[split])
+    np.savez(run / 'embeddings.npz', embeddings=np.ones((4, 2)),
+             file_names=np.array([im['image_id'] for im in images] + ['local/train.jpg']),
+             annotation_ids=np.array(['1', '2', '3', '4']), bboxes=np.array([[10, 10, 10, 20]] * 4))
+    out = tmp_path / 'RESULTS_GT.md'
+    assert main(['--queue', str(queue_path), '--answers', str(answer_path), '--runs', str(run),
+                 '--splits', str(tmp_path / 'splits.json'), '--audit', str(tmp_path / 'audit.json'),
+                 '--proposals', str(tmp_path / 'proposals.json'), '--out', str(out),
+                 '--bootstrap', '20']) == 0
+    data = json.loads((tmp_path / 'results_gt.json').read_text())
+    assert data['excluded']['val'] == []                       # count-only val images are kept
+    assert {r['identifier'] for r in data['rows']} == {'none', 'vlm', 'knn_trainvlm', 'knn_trainvlm+val',
+                                                       'linear_trainvlm', 'linear_trainvlm+val'}
+    assert [{'run': x['run'], 'identifier': x['identifier'], 'reason': x['reason']}
+            for x in data['skipped_runs'] if 'insufficient' in x['reason']] == [
+        {'run': 'C_fake', 'identifier': 'knn', 'reason': 'insufficient val crops'},
+        {'run': 'C_fake', 'identifier': 'proto', 'reason': 'insufficient val crops'}]
+    assert {x.get('identifier') for x in data['skipped_runs']} == {'knn', 'proto'}
+    assert all(x['reason'] == 'insufficient val crops' for x in data['skipped_runs'])
+    assert all(row['val_gallery_size'] == 0 for row in data['rows'])
+    assert any('No answered val crops' in note for note in data['limitations'])
+    for row in data['rows']:
+        assert row['threshold_source'] == 'val'
+        assert row['subsets']['all']['n_images'] == 2
+        assert row['subsets']['all']['metrics']['total_error'] == 0
+        assert row['subsets']['all']['bootstrap_ci95']['n_groups'] == 2
+    assert 'unanswered validation crops just shrink' in out.read_text()
+
+
 def test_full_scoring_with_fake_runs(tmp_path, monkeypatch):
     import json
 
