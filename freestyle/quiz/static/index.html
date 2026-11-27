@@ -73,10 +73,12 @@
         <button class="btn btn--primary" id="fix-save" type="button">Save count</button>
       </div>
       <div class="answers" id="count-answers">
-        <button class="btn btn--primary" data-count="correct" type="button">✓ Yes</button>
-        <button class="btn" data-count="fix" type="button">✎ Fix the numbers</button>
-        <button class="btn btn--warn" data-count="not_cabinet" type="button">Not a usable cabinet view</button>
-        <button class="btn btn--ghost" data-count="skip" type="button">Skip →</button>
+        <button class="btn btn--primary btn--big" data-count="correct" type="button">✓ Count is right</button>
+        <div class="answers-row">
+          <button class="chip-btn" data-count="fix" type="button" title="Fix the numbers">✎ Fix</button>
+          <button class="chip-btn chip-btn--warn" data-count="not_cabinet" type="button" title="Not a usable cabinet view">Not usable</button>
+          <button class="chip-btn chip-btn--ghost" data-count="skip" type="button" title="Skip this frame">Skip →</button>
+        </div>
       </div>
     </div>
 
@@ -96,17 +98,20 @@
       <div class="answers answers--part" id="part-answers" hidden>
         <button class="btn btn--primary btn--big" data-part="1" type="button">Part 1</button>
         <button class="btn btn--primary btn--big" data-part="2" type="button">Part 2</button>
-        <button class="btn btn--big" id="part-unknown" type="button">Can't tell</button>
-        <p class="ask__note">Which end face is this? Can't tell shows every class and the box flags.</p>
+        <button class="btn btn--big" id="part-unknown" type="button">Neither</button>
+        <p class="ask__note">Which end face is this? “Neither” shows every class and the box flags.</p>
       </div>
 
       <div class="answers" id="crop-answers" hidden>
-        <button class="btn btn--primary" id="btn-correct" type="button">✓ Correct</button>
+        <button class="btn btn--primary btn--big" id="btn-correct" type="button">✓ Correct</button>
         <div class="class-grid" id="class-grid"></div>
-        <button class="btn btn--warn" data-crop="not_cartridge" type="button">Not a cartridge</button>
-        <button class="btn btn--warn" data-crop="two_plus" type="button">Box covers 2+ cartridges</button>
-        <button class="btn btn--warn" data-crop="partial" type="button">Box cuts a cartridge (partial)</button>
-        <button class="btn btn--warn" data-crop="skip" type="button">Skip →</button>
+        <div class="answers-row">
+          <button class="chip-btn chip-btn--primary" data-class="unknown" type="button" title="This cartridge is not determinable (unknown)">Can't tell</button>
+          <button class="chip-btn chip-btn--warn" data-crop="not_cartridge" type="button" title="Not a cartridge">Not cart.</button>
+          <button class="chip-btn chip-btn--warn" data-crop="two_plus" type="button" title="Box covers 2 or more cartridges">2+</button>
+          <button class="chip-btn chip-btn--warn" data-crop="partial" type="button" title="Box cuts a cartridge (partial)">Partial</button>
+          <button class="chip-btn chip-btn--ghost" data-crop="skip" type="button" title="Skip this box">Skip →</button>
+        </div>
       </div>
     </div>
   </section>
@@ -120,10 +125,11 @@
 
 <div class="lightbox" id="lightbox" hidden>
   <button class="lightbox__close icon-btn" id="lightbox-close" type="button" aria-label="Close zoom">✕</button>
-  <div class="lightbox__scroll"><img id="lightbox-img" alt="zoomed image" decoding="async" /></div>
+  <div class="lightbox__scroll" id="lightbox-scroll"><img id="lightbox-img" alt="zoomed image" decoding="async" /></div>
+  <p class="lightbox__hint">pinch / drag to zoom · tap to close</p>
 </div>
 
-<p class="hint" id="hint">y correct · 1–9 class · n not a cartridge · u undo · s skip</p>
+<p class="hint" id="hint">tap image to zoom · y correct · 1–9 class · k can't tell · n not a cartridge · u undo · s skip</p>
 <script src="/static/quiz.js"></script>
 </body>
 </html>

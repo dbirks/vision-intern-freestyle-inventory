@@ -29,6 +29,35 @@
   var busy = false;
   var fix = { top: 0, bottom: 0 };
 
+  // Short chip labels for the 3-column class grid (full name stays in the title).
+  var SHORT = {
+    'coca-cola-part1': 'Coke P1',
+    'coca-cola-part2': 'Coke P2',
+    'diet-coke-part1': 'Diet P1',
+    'diet-coke-part2': 'Diet P2',
+    'dr-pepper-part1': 'Dr P P1',
+    'dr-pepper-part2': 'Dr P P2',
+    'coke-zero-part1': 'Zero P1',
+    'coke-zero-part2': 'Zero P2',
+    'nns-sweetener': 'NNS',
+    'ingredient-aa': 'AA',
+    'ingredient-cc': 'CC',
+    'fanta-orange': 'BB/Fanta',
+    'hi-c': 'Hi-C',
+    sprite: 'Sprite',
+    'flavor-orange': 'Orange',
+    'flavor-vanilla': 'Vanilla',
+    'flavor-lemon': 'Lemon',
+    'flavor-cherry': 'Cherry',
+    unknown: "Can't tell"
+  };
+
+  function shortLabel(cls) {
+    if (SHORT[cls.name]) return SHORT[cls.name];
+    var text = String(cls.display || cls.name);
+    return text.length > 11 ? text.slice(0, 10) + '…' : text;
+  }
+
   // ---------------------------------------------------------------- helpers
 
   function toast(text, bad) {
@@ -159,16 +188,19 @@
     els.classGrid.dataset.built = q.qid;
     els.classGrid.innerHTML = '';
     var keys = '123456789';
+    // 'unknown' lives in the secondary row as "Can't tell" to keep the grid to 6 rows
     queue.classes.forEach(function (cls, i) {
+      if (cls.name === 'unknown') return;
       var btn = document.createElement('button');
       btn.type = 'button';
       btn.className = 'class-btn' + (cls.name === q.guess ? ' class-btn--guess' : '');
       btn.dataset.class = cls.name;
+      btn.title = (cls.display || cls.name) + (i < keys.length ? ' (key ' + keys[i] + ')' : '');
       var swatch = document.createElement('span');
       swatch.className = 'class-btn__swatch';
       swatch.style.background = cls.color;
       var label = document.createElement('span');
-      label.textContent = cls.name === 'unknown' ? "Can't tell (unknown)" : cls.display;
+      label.textContent = shortLabel(cls);
       btn.appendChild(swatch);
       btn.appendChild(label);
       if (i < keys.length) {
@@ -289,6 +321,8 @@
       return;
     }
     if (target === $('fix-save')) { send(q.qid, { result: 'fix', top: fix.top, bottom: fix.bottom }); return; }
+    // "Fix the numbers" only opens the stepper panel; the answer is sent by Save.
+    if (target.dataset && target.dataset.count === 'fix') return;
     if (target === $('part-unknown')) {
       partStep = false;
       els.partAnswers.hidden = true;
@@ -332,6 +366,9 @@
     }
     if (key === 'y') { event.preventDefault(); send(q.qid, { result: 'correct' }); return; }
     if (key === 'n') { event.preventDefault(); send(q.qid, { result: 'not_cartridge' }); return; }
+    if (key === 'k') { event.preventDefault(); send(q.qid, { result: 'class', class: 'unknown' }); return; }
+    if (key === 'p') { event.preventDefault(); send(q.qid, { result: 'partial' }); return; }
+    if (key === 'm') { event.preventDefault(); send(q.qid, { result: 'two_plus' }); return; }
     var digits = '123456789';
     var slot = digits.indexOf(key);
     if (slot >= 0 && queue.classes[slot]) {
@@ -347,6 +384,8 @@
       els.lightboxImg.alt = zoom.alt || 'zoomed image';
       els.lightbox.hidden = false;
       document.body.classList.add('scroll-locked');
+      zoomTap.x = null;
+      zoomTap.y = null;
     }
   });
 
@@ -354,12 +393,25 @@
     els.lightbox.hidden = true;
     document.body.classList.remove('scroll-locked');
     els.lightboxImg.removeAttribute('src');
+    zoomTap.x = null;
+    zoomTap.y = null;
   }
 
-  document.addEventListener('click', function (event) {
-    if (!els.lightbox.hidden && (event.target === els.lightbox || event.target.id === 'lightbox-close')) {
-      closeZoom();
-    }
+  // Tap anywhere in the lightbox closes it — but a pinch/drag to zoom must not.
+  var zoomTap = { x: null, y: null };
+
+  els.lightbox.addEventListener('pointerdown', function (event) {
+    zoomTap.x = event.clientX;
+    zoomTap.y = event.clientY;
+  });
+
+  els.lightbox.addEventListener('click', function (event) {
+    var moved = zoomTap.y === null ? 0
+      : Math.max(Math.abs(event.clientY - zoomTap.y), Math.abs(event.clientX - zoomTap.x));
+    zoomTap.x = null;
+    zoomTap.y = null;
+    if (moved > 12) return;
+    closeZoom();
   });
 
   function toggleTheme() {
