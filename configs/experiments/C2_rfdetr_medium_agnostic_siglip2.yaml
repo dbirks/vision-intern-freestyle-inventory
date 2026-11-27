@@ -1,17 +1,32 @@
-# C2 rfdetr medium agnostic siglip2 comparison.
+# C2: RF-DETR Medium at 576 px, class-agnostic + SigLIP2 crop embeddings (C1 upgrade).
+# Model bootstrap labels only: vs-model-labels (NOT GT).
 id: C2_rfdetr_medium_agnostic_siglip2
 family: C_det_agnostic_plus_embed
 compute:
   target: k8s:5090
   vram_mb: 12000
-  timeout: 14400
+  timeout: 3600
+data:
+  train: labels/bootstrap_v2.json
+  val: labels/bootstrap_v2.json
+  test: labels/bootstrap_v2.json
+  bootstrap: labels/bootstrap_v2.json
+  label_source: bootstrap
+  bootstrap_filter:
+    verdicts: [correct]
 localizer:
   type: tiled_detector
+  tile: 1024
+  overlap: 0.25
   training:
     model: RFDETRMedium
     resolution: 576
-    epochs: 50
-    batch_size: 2
+    epochs: 100
+    batch_size: 4
+    early_stopping: true
+    early_stopping_patience: 15
 identifier:
-  type: embedding_knn
+  type: none
+embeddings:
   model: google/siglip2-base-patch16-224
+  batch_size: 64

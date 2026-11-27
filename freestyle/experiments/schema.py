@@ -69,6 +69,19 @@ def resolve(config):
     for key in ('train', 'val', 'test', 'splits', 'images_root', *(['bootstrap'] if 'bootstrap' in data else [])):
         if not isinstance(data[key], str) or not data[key] or Path(data[key]).is_absolute() or '..' in Path(data[key]).parts:
             raise ValueError(f'data.{key} must be a relative path within data root')
+    embeddings = c.get('embeddings')
+    if embeddings is not None:
+        # Crop-embedding artifact for a later identifier fit; not a gallery and not GT.
+        if not isinstance(embeddings, dict):
+            raise ValueError('embeddings must be a mapping')
+        if not isinstance(embeddings.get('model'), str) or not embeddings['model']:
+            raise ValueError('embeddings.model is required')
+        embeddings.setdefault('batch_size', 64)
+        embeddings.setdefault('device', 'cuda')
+        if not isinstance(embeddings.get('batch_size', 64), int) or embeddings.get('batch_size', 64) <= 0:
+            raise ValueError('embeddings.batch_size must be a positive integer')
+        if not isinstance(embeddings.get('device', 'cuda'), str):
+            raise ValueError('embeddings.device must be a string')
     c['identifier'].setdefault('type', 'none')
     c['count'].setdefault('identity_thr', 0.5)
     if c['family'] == 'E_shelf':

@@ -1,17 +1,37 @@
-# C1 rfdetr small agnostic dinov2 comparison.
+# C1: RF-DETR Small, class-agnostic 'cartridge' detector + DINOv2 crop embeddings.
+# Labels are MODEL bootstrap labels (no human GT yet): every metric is vs-model-labels,
+# NOT GT. data.val/test are the combined bootstrap file; freestyle.experiments.entry
+# derives the per-split subsets in the run dir.
 id: C1_rfdetr_small_agnostic_dinov2
 family: C_det_agnostic_plus_embed
 compute:
   target: k8s:5090
   vram_mb: 12000
-  timeout: 14400
+  timeout: 3600
+data:
+  train: labels/bootstrap_v2.json
+  val: labels/bootstrap_v2.json
+  test: labels/bootstrap_v2.json
+  bootstrap: labels/bootstrap_v2.json
+  label_source: bootstrap
+  bootstrap_filter:
+    verdicts: [correct]
 localizer:
   type: tiled_detector
+  tile: 1024
+  overlap: 0.25
   training:
     model: RFDETRSmall
     resolution: 512
-    epochs: 50
-    batch_size: 4
+    epochs: 100
+    batch_size: 8
+    early_stopping: true
+    early_stopping_patience: 15
+# No human-labelled gallery exists, so nothing is identified at inference time; the
+# agnostic detector's boxes are reported as generic 'unknown'.
 identifier:
-  type: embedding_knn
+  type: none
+# DINOv2 embeddings of every bootstrap crop (train+val+test) -> runs/<id>/embeddings.npz
+embeddings:
   model: facebook/dinov2-base
+  batch_size: 64

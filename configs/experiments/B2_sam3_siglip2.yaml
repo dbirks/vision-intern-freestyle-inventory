@@ -1,13 +1,30 @@
-# B2 sam3 siglip2 comparison.
+# B2: SAM 3 text concepts, tiled; predictions only. facebook/sam3 is gated => HF token.
+# Box exemplars are NOT used: Sam3Backend only accepts boxes inside the image being
+# scored, which would leak a train image's own labels into its own predictions.
 id: B2_sam3_siglip2
 family: B_zeroshot_plus_embed
+needs_hf_token: true
 compute:
   target: k8s:5090
   vram_mb: 12000
-  timeout: 14400
+  timeout: 1800
+data:
+  train: labels/bootstrap_v2.json
+  val: labels/bootstrap_v2.json
+  test: labels/bootstrap_v2.json
+  bootstrap: labels/bootstrap_v2.json
+  label_source: bootstrap
+  bootstrap_filter:
+    verdicts: [correct]
 localizer:
   type: zeroshot
   backend: sam3
+  prompts: ["box", "cartridge"]
+  tile: 1024
+  overlap: 0.25
+  score_thr: 0.2
 identifier:
-  type: embedding_knn
+  type: none
+embeddings:
   model: google/siglip2-base-patch16-224
+  batch_size: 64

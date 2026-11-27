@@ -1,13 +1,29 @@
-# B3 gdino dinov2 comparison.
+# B3: zero-shot Grounding DINO base proposals, tiled; predictions only.
+# Same protocol as B1; score_thr raised because GDINO scores are far noisier below 0.25.
 id: B3_gdino_dinov2
 family: B_zeroshot_plus_embed
 compute:
   target: k8s:5090
   vram_mb: 12000
-  timeout: 14400
+  timeout: 1800
+data:
+  train: labels/bootstrap_v2.json
+  val: labels/bootstrap_v2.json
+  test: labels/bootstrap_v2.json
+  bootstrap: labels/bootstrap_v2.json
+  label_source: bootstrap
+  bootstrap_filter:
+    verdicts: [correct]
 localizer:
   type: zeroshot
   backend: grounding_dino
+  model_id: IDEA-Research/grounding-dino-base
+  prompts: ["cartridge box", "narrow cardboard box"]
+  tile: 1024
+  overlap: 0.25
+  score_thr: 0.25
 identifier:
-  type: embedding_knn
+  type: none
+embeddings:
   model: facebook/dinov2-base
+  batch_size: 64

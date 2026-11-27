@@ -72,7 +72,8 @@ def _root():
     manifest = {'categories': [{'id': 1, 'name': 'cartridge'}],
                 'images': [{'id': 1, 'file_name': 'a.jpg', 'width': 4, 'height': 4}],
                 'annotations': []}
-    (root / 'val.json').write_text(json.dumps(manifest))
+    (root / 'gt').mkdir(exist_ok=True)
+    (root / 'gt' / 'val.json').write_text(json.dumps(manifest))
     (root / 'splits.json').write_text(json.dumps({'images': {'a.jpg': 'val'}}))
     (root / 'raw').mkdir()
     return root

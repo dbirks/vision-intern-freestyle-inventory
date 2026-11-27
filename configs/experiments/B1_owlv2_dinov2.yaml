@@ -1,13 +1,29 @@
-# B1 owlv2 dinov2 comparison.
+# B1: zero-shot OWLv2 (large ensemble) proposals, tiled; predictions only.
+# Scored against bootstrap model labels => vs-model-labels (NOT GT).
 id: B1_owlv2_dinov2
 family: B_zeroshot_plus_embed
 compute:
   target: k8s:5090
   vram_mb: 12000
-  timeout: 14400
+  timeout: 1800
+data:
+  train: labels/bootstrap_v2.json
+  val: labels/bootstrap_v2.json
+  test: labels/bootstrap_v2.json
+  bootstrap: labels/bootstrap_v2.json
+  label_source: bootstrap
+  bootstrap_filter:
+    verdicts: [correct]
 localizer:
   type: zeroshot
   backend: owlv2
+  model_id: google/owlv2-large-patch14-ensemble
+  prompts: ["cartridge box", "narrow cardboard box"]
+  tile: 1024
+  overlap: 0.25
+  score_thr: 0.1
 identifier:
-  type: embedding_knn
+  type: none
+embeddings:
   model: facebook/dinov2-base
+  batch_size: 64
