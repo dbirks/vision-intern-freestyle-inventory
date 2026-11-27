@@ -1,0 +1,38 @@
+# Experiment family G — bootstrap FRONT-FACE labels (see freestyle/faces.py).
+#
+# Same Vision Intern shape as configs/bootstrap/default.yaml (inkling label runs
+# -> weighted fusion -> Flash Next crops-mode judge), but the detection target is
+# the cartridge *front face* (the narrow printed end panel: logo + Part number),
+# not the whole cartridge. Bottom-shelf cartridges lean, so whole-cartridge boxes
+# are wide and overlap; faces are small, upright and non-overlapping.
+base_url: https://llm-collective.e-gineering.com/v1
+api_key_env: LLMC_API_KEY
+prompt_variant: v3
+# Fusion threshold for the two inkling runs. Measured on frame.jpg: two *distinct*
+# faces in one run never exceed IoU 0.17 (mean neighbour IoU 0.069), while the same
+# face found by both runs sits at IoU ~0.85 (10th pct 0.46). So 0.35 merges the
+# cross-run duplicates without welding real neighbours together (0.55 left ~8
+# duplicate/loose boxes per cabinet_full frame).
+fusion_iou: 0.35
+# Identity is not asked of the VLM: it is copied from the whole-cartridge
+# proposals when the face box lies inside a whole-cartridge box.
+reference_labels: data/labels/bootstrap_v2.json
+identity_containment: 0.8
+labellers:
+  - name: inkling-full
+    model: david-birks/inkling-2-mini
+    max_tokens: 8192
+  - name: inkling-tiles
+    model: david-birks/inkling-2-mini
+    tile: 1024          # 2x2 tiles on the 2048x1536 server frames
+    tile_overlap: 0.0
+    max_tokens: 8192
+judge:
+  # qwen3-8-flash-next answered every crops-mode bootstrap call (~30 s/image);
+  # if it is out of capacity inside the ~10 min retry budget we fall back to
+  # inkling and record that in info.judge_fallbacks.
+  model: qwen3-8-flash-next
+  fallback: david-birks/inkling-2-mini
+  mode: crops
+  batch_size: 16          # 4x4 numbered crops per call: halves the flash-next round trips
+  max_tokens: 4096
