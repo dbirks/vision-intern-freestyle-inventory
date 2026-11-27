@@ -23,7 +23,13 @@ STATUS_PATH = SITE_DIR / "status.json"
 PYTEST_CACHE_PATH = SITE_DIR / ".pytest_cache.json"
 
 PI_ORCH_SCRIPT = Path.home() / ".claude/skills/pi-orch/scripts/pi-orch"
-EXT_LOGS_DIR = Path.home() / ".cache/pi-orch/vision-intern/ext"
+PI_ORCH_HOME = Path(os.environ.get("PIORCH_HOME", str(Path.home() / ".cache/pi-orch/vision-intern")))
+PI_LOGS_DIR = PI_ORCH_HOME / "logs"
+EXT_LOGS_DIR = PI_ORCH_HOME / "ext"
+DEAD_RECENT_WINDOW_S = 30 * 60
+QUIZ_QUEUE_PATH = REPO_ROOT / "data/gt/quiz_queue.json"
+QUIZ_ANSWERS_PATH = REPO_ROOT / "data/gt/quiz_answers.jsonl"
+QUIZ_URL = "http://100.89.241.57:8766"
 
 
 def _now_utc() -> datetime:
@@ -104,6 +110,7 @@ def collect_pi_workers() -> dict[str, Any]:
             "workers": [],
         }
 
+    now = _now_utc()
     workers: list[dict[str, Any]] = []
     for raw_line in proc.stdout.splitlines():
         line = raw_line.strip()
@@ -119,6 +126,16 @@ def collect_pi_workers() -> dict[str, Any]:
             rep = _run([str(PI_ORCH_SCRIPT), "report", slug], timeout=10)
             if rep.returncode == 0 and rep.stdout.strip():
                 report_block = _extract_last_report_block(rep.stdout)
+
+        log_path = PI_LOGS_DIR / f"{slug}.log"
+        log_mtime_iso: str | None = None
+        log_age_s: int | None = None
+        if log_path.is_file():
+            log_dt = datetime.fromtimestamp(log_path.stat().st_mtime, tz=timezone.utc)
+            log_mtime_iso = log_dt.isoformat()
+            log_age_s = max(0, int((now - log_dt).total_seconds()))
+        log_recent = log_age_s is not None and log_age_s <= DEAD_RECENT_WINDOW_S
+
         workers.append(
             {
                 "slug": slug,
@@ -128,13 +145,17 @@ def collect_pi_workers() -> dict[str, Any]:
                 "session": session,
                 "report_inline": report_inline,
                 "report_block": report_block,
+                "log_mtime": log_mtime_iso,
+                "log_age_s": log_age_s,
+                "log_recent": log_recent,
             }
         )
 
     counts = {
         "running": sum(1 for w in workers if w["state"] == "running"),
         "done": sum(1 for w in workers if w["state"] == "done"),
-        "dead": sum(1 for w in workers if w["state"] == "dead"),
+        "dead": sum(1 for w in workers if w["state"] == "dead" and w["log_recent"]),
+        "stopped": sum(1 for w in workers if w["state"] == "dead" and not w["log_recent"]),
     }
     return {
         "ok": True,
@@ -777,6 +798,133 @@ def collect_experiments() -> dict[str, Any]:
     }
 
 
+def collect_quiz() -> dict[str, Any]:
+    """Collect ground-truth quiz counts from quiz_queue.json and quiz_answers.jsonl."""
+    if not QUIZ_QUEUE_PATH.is_file():
+        return {
+            "ok": False,
+            "status": "unavailable",
+            "error": f"Queue not found: {QUIZ_QUEUE_PATH.relative_to(REPO_ROOT)}",
+            "url": QUIZ_URL,
+        }
+
+    queue = json.loads(QUIZ_QUEUE_PATH.read_text(encoding="utf-8"))
+    questions = queue.get("questions") or []
+    images = queue.get("images") or []
+    by_qid = {str(q["qid"]): q for q in questions if isinstance(q, dict) and q.get("qid")}
+
+    splits_order: list[str] = [str(s) for s in (queue.get("splits_order") or []) if s]
+    split_questions: dict[str, int] = {s: 0 for s in splits_order}
+    split_images_seen: dict[str, set[str]] = {s: set() for s in splits_order}
+
+    for q in questions:
+        if not isinstance(q, dict):
+            continue
+        split = str(q.get("split") or "")
+        if split:
+            if split not in split_questions:
+                splits_order.append(split)
+                split_questions[split] = 0
+                split_images_seen[split] = set()
+            split_questions[split] += 1
+            if q.get("image_id"):
+                split_images_seen[split].add(str(q["image_id"]))
+
+    split_images: dict[str, int] = {}
+    if images:
+        for img in images:
+            if isinstance(img, dict) and img.get("split"):
+                s = str(img["split"])
+                split_images[s] = split_images.get(s, 0) + 1
+    for s in splits_order:
+        if s not in split_images:
+            split_images[s] = len(split_images_seen.get(s, set()))
+
+    answered_by_qid: dict[str, dict[str, Any]] = {}
+    if QUIZ_ANSWERS_PATH.is_file():
+        for raw_line in QUIZ_ANSWERS_PATH.read_text(encoding="utf-8").splitlines():
+            line = raw_line.strip()
+            if not line:
+                continue
+            try:
+                record = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            if (
+                isinstance(record, dict)
+                and record.get("qid") in by_qid
+                and isinstance(record.get("answer"), dict)
+            ):
+                answered_by_qid[str(record["qid"])] = record
+
+    correct = 0
+    corrected = 0
+    cant_tell = 0
+    skipped = 0
+    split_answered: dict[str, int] = {s: 0 for s in splits_order}
+    last_dt: datetime | None = None
+    last_iso: str | None = None
+
+    for qid, record in answered_by_qid.items():
+        q = by_qid[qid]
+        split = str(record.get("split") or q.get("split") or "")
+        if split:
+            split_answered[split] = split_answered.get(split, 0) + 1
+        ans = record["answer"]
+        res = str(ans.get("result") or "")
+        if res == "skip":
+            skipped += 1
+        elif res == "correct":
+            correct += 1
+        elif res in ("class", "part") and str(ans.get("class") or "") == "unknown":
+            cant_tell += 1
+        elif res:
+            corrected += 1
+
+        dt = _parse_iso(ans.get("at"))
+        if dt is not None:
+            if dt.tzinfo is None:
+                dt = dt.replace(tzinfo=timezone.utc)
+            if last_dt is None or dt > last_dt:
+                last_dt = dt
+                last_iso = dt.astimezone(timezone.utc).isoformat()
+
+    answered_count = len(answered_by_qid)
+    if answered_count > 0 and last_iso is None and QUIZ_ANSWERS_PATH.is_file():
+        last_iso = datetime.fromtimestamp(QUIZ_ANSWERS_PATH.stat().st_mtime, tz=timezone.utc).isoformat()
+
+    questions_count = len(questions)
+    images_count = len(images) if images else len({str(q["image_id"]) for q in questions if q.get("image_id")})
+
+    splits = [
+        {
+            "split": s,
+            "questions": split_questions.get(s, 0),
+            "answered": split_answered.get(s, 0),
+            "images": split_images.get(s, 0),
+            "pct": round((split_answered.get(s, 0) / split_questions[s]) * 100) if split_questions.get(s) else 0,
+        }
+        for s in splits_order
+    ]
+
+    return {
+        "ok": True,
+        "status": "ok",
+        "url": QUIZ_URL,
+        "generated_at": queue.get("generated_at"),
+        "questions": questions_count,
+        "images": images_count,
+        "answered": answered_count,
+        "pct": round((answered_count / questions_count) * 100) if questions_count else 0,
+        "correct": correct,
+        "corrected": corrected,
+        "cant_tell": cant_tell,
+        "skipped": skipped,
+        "last_answer_at": last_iso,
+        "splits": splits,
+    }
+
+
 def _safe_step(name: str, fn: Any, *args: Any) -> dict[str, Any]:
     try:
         return fn(*args)
@@ -806,6 +954,7 @@ def collect_all() -> dict[str, Any]:
         "git": git_info,
         "tests": _safe_step("tests", collect_tests, head_sha),
         "experiments": _safe_step("experiments", collect_experiments),
+        "quiz": _safe_step("quiz", collect_quiz),
     }
     return payload
 

@@ -522,6 +522,7 @@ def load_status() -> dict[str, Any]:
         "git": {"ok": False, "status": "unavailable", "commits": [], "oneline": []},
         "tests": {"ok": False, "status": "unavailable"},
         "experiments": {"ok": False, "status": "unavailable", "metrics_runs": [], "smoke_runs": []},
+        "quiz": {"ok": False, "status": "unavailable"},
     }
 
 
@@ -1459,6 +1460,7 @@ html[data-theme='dark'] .theme-icon--moon { display: none; }
 .tag-pill--bad { background: var(--strawberry); color: var(--strawberry-ink); }
 .tag-pill--cola { background: var(--cola-soft); color: var(--cola-ink); }
 .tag-pill--sky { background: var(--sky); color: var(--sky-ink); }
+.tag-pill--muted { background: var(--border); color: var(--ink-muted); }
 
 .btn-pill {
   display: inline-flex;
@@ -1935,6 +1937,17 @@ pre.code-slab code {
   flex: none;
   animation: devlog-pulse 1.8s infinite;
 }
+.stopped-dot {
+  width: 9px;
+  height: 9px;
+  border-radius: 999px;
+  background: var(--ink-muted);
+  opacity: 0.55;
+  flex: none;
+}
+.activity-item--stopped .activity-item__name {
+  color: var(--ink-muted);
+}
 @keyframes devlog-pulse {
   0% { box-shadow: 0 0 0 0 var(--active-ring); }
   70% { box-shadow: 0 0 0 7px transparent; }
@@ -2047,6 +2060,84 @@ pre.code-slab code {
   min-width: 0;
 }
 .milestone-step--todo .milestone-step__title { color: var(--ink-muted); font-weight: 500; }
+
+/* ---------- Ground truth quiz card ---------- */
+
+.quiz-open-link {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  min-height: 32px;
+  padding: 0 12px;
+  border-radius: var(--r-pill);
+  background: var(--cola-soft);
+  color: var(--cola-ink);
+  font-size: 12.5px;
+  font-weight: 700;
+  text-decoration: none;
+  white-space: nowrap;
+}
+.quiz-open-link:hover {
+  background: var(--cola);
+  color: #ffffff;
+  text-decoration: none;
+}
+.quiz-splits {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(140px, 1fr));
+  gap: 8px;
+  margin-bottom: 12px;
+}
+.quiz-split {
+  background: var(--bg-subtle);
+  border-radius: var(--r-sm);
+  padding: 8px 10px;
+  min-width: 0;
+}
+.quiz-split__head {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 6px;
+  flex-wrap: wrap;
+  margin-bottom: 6px;
+}
+.quiz-split__name {
+  font-family: var(--font-mono);
+  font-size: 12px;
+  font-weight: 700;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+  color: var(--ink);
+}
+.quiz-split__meta {
+  font-family: var(--font-mono);
+  font-size: 11.5px;
+  color: var(--ink-muted);
+  font-variant-numeric: tabular-nums;
+}
+.quiz-split__bar {
+  height: 6px;
+  border-radius: var(--r-pill);
+  background: var(--surface);
+  overflow: hidden;
+}
+.quiz-split__fill {
+  display: block;
+  height: 100%;
+  border-radius: var(--r-pill);
+  background: var(--cola);
+  transition: width 250ms ease;
+}
+.quiz-foot {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px 12px;
+  flex-wrap: wrap;
+  margin-top: 10px;
+}
+.quiz-foot .pill-row { margin-top: 0; }
 
 /* ---------- Charts & Scoreboard ---------- */
 
@@ -2231,6 +2322,7 @@ def _pill(text: str, tone: str = "neutral") -> str:
         "bad": "tag-pill tag-pill--bad",
         "cola": "tag-pill tag-pill--cola",
         "sky": "tag-pill tag-pill--sky",
+        "muted": "tag-pill tag-pill--muted",
     }.get(tone, "tag-pill")
     return f'<span class="{cls}">{html.escape(text)}</span>'
 
@@ -2241,9 +2333,32 @@ def _state_tone(state: str) -> str:
         return "warn"
     if any(k in s for k in ("done", "complete", "succeeded", "ok")):
         return "ok"
+    if "stopped" in s:
+        return "muted"
     if any(k in s for k in ("dead", "fail", "error", "backoff", "unavailable")):
         return "bad"
     return "neutral"
+
+
+DEAD_RECENT_WINDOW_S = 30 * 60
+
+
+def _is_dead_recent(worker: dict[str, Any], now_ts: float | None = None) -> bool:
+    """Return True only when a dead worker's log changed within the last 30 minutes."""
+    if worker.get("state") != "dead":
+        return False
+    log_mtime = worker.get("log_mtime")
+    if log_mtime:
+        try:
+            dt = datetime.fromisoformat(str(log_mtime).replace("Z", "+00:00"))
+            now_val = time.time() if now_ts is None else now_ts
+            return (now_val - dt.timestamp()) <= DEAD_RECENT_WINDOW_S
+        except ValueError:
+            pass
+    log_age_s = worker.get("log_age_s")
+    if isinstance(log_age_s, (int, float)):
+        return log_age_s <= DEAD_RECENT_WINDOW_S
+    return bool(worker.get("log_recent"))
 
 
 def render_shell(
@@ -2412,19 +2527,24 @@ def render_shell(
 
 
 def _render_activity_strip_html(status: dict[str, Any]) -> tuple[str, str]:
-    """Render running pi workers, active k8s GPU jobs, and active external agents."""
+    """Render running pi workers, stopped old workers, active k8s GPU jobs, and active external agents."""
     pi = status.get("pi_workers", {})
     k8s = status.get("k8s", {})
     ext = status.get("external_agents", {})
 
+    now_ts = time.time()
     workers = pi.get("workers", []) or []
     running_workers = [w for w in workers if w.get("state") == "running"]
-    counts = pi.get("counts") or {
-        "running": len(running_workers),
-        "done": sum(1 for w in workers if w.get("state") == "done"),
-        "dead": sum(1 for w in workers if w.get("state") == "dead"),
-    }
-    summary_label = f"{counts.get('running', 0)} running · {counts.get('done', 0)} done · {counts.get('dead', 0)} dead"
+    done_count = sum(1 for w in workers if w.get("state") == "done")
+    recent_dead_count = sum(1 for w in workers if _is_dead_recent(w, now_ts))
+    stopped_workers = [w for w in workers if w.get("state") == "dead" and not _is_dead_recent(w, now_ts)]
+
+    summary_parts = [f"{len(running_workers)} running", f"{done_count} done"]
+    if recent_dead_count:
+        summary_parts.append(f"{recent_dead_count} dead")
+    if stopped_workers:
+        summary_parts.append(f"{len(stopped_workers)} stopped")
+    summary_label = " · ".join(summary_parts)
 
     items: list[str] = []
     for w in running_workers:
@@ -2474,11 +2594,115 @@ def _render_activity_strip_html(status: dict[str, Any]) -> tuple[str, str]:
                 f'{_pill(dur_txt, "sky")}</div>'
             )
 
+    for w in stopped_workers:
+        log_sub = f"age {html.escape(str(w.get('age', '-')))}"
+        if w.get("log_mtime"):
+            try:
+                ldt = datetime.fromisoformat(str(w["log_mtime"]).replace("Z", "+00:00"))
+                log_sub = f"last log {_rel_age_html(ldt.timestamp(), ldt.astimezone(NY_TZ).isoformat())}"
+            except ValueError:
+                pass
+        items.append(
+            '<div class="activity-item activity-item--stopped">'
+            '<div class="activity-item__left">'
+            '<span class="stopped-dot" aria-hidden="true"></span>'
+            '<div class="activity-item__body">'
+            f'<div class="activity-item__name">pi worker · {html.escape(str(w.get("slug", "")))}</div>'
+            f'<div class="activity-item__sub">{log_sub} · sess {html.escape(str(w.get("session", "-")))}</div>'
+            "</div></div>"
+            f'{_pill("stopped", "muted")}</div>'
+        )
+
     if not items:
         body_html = '<p class="card__sub" style="margin:0;">No pi workers, external agents, or GPU jobs running right now.</p>'
     else:
         body_html = f'<div class="activity-grid">{"".join(items)}</div>'
     return body_html, summary_label
+
+
+def _render_quiz_inner_html(quiz: dict[str, Any]) -> str:
+    if not quiz.get("ok"):
+        err = quiz.get("error") or "quiz_queue.json unavailable"
+        return f'<p class="card__sub" style="margin:0;">{html.escape(str(err))}</p>'
+
+    questions = int(quiz.get("questions") or 0)
+    images = int(quiz.get("images") or 0)
+    answered = int(quiz.get("answered") or 0)
+    pct = round((answered / questions) * 100) if questions else 0
+    pct_exact = (answered / questions) * 100 if questions else 0.0
+    correct = int(quiz.get("correct") or 0)
+    corrected = int(quiz.get("corrected") or 0)
+    cant_tell = int(quiz.get("cant_tell") or 0)
+    skipped = int(quiz.get("skipped") or 0)
+
+    splits_html: list[str] = []
+    for sp in quiz.get("splits") or []:
+        s_name = str(sp.get("split") or "")
+        s_q = int(sp.get("questions") or 0)
+        s_a = int(sp.get("answered") or 0)
+        s_i = int(sp.get("images") or 0)
+        s_pct = round((s_a / s_q) * 100) if s_q else 0
+        s_pct_exact = (s_a / s_q) * 100 if s_q else 0.0
+        splits_html.append(
+            '<div class="quiz-split">'
+            '<div class="quiz-split__head">'
+            f'<span class="quiz-split__name">{html.escape(s_name)}</span>'
+            f'<span class="quiz-split__meta">{s_a}/{s_q} ({s_pct}%) · {s_i} imgs</span>'
+            "</div>"
+            f'<div class="quiz-split__bar"><span class="quiz-split__fill" style="width:{s_pct_exact:.2f}%"></span></div>'
+            "</div>"
+        )
+
+    last_html = "No answers recorded yet"
+    last_iso = quiz.get("last_answer_at")
+    if last_iso:
+        try:
+            dt = datetime.fromisoformat(str(last_iso).replace("Z", "+00:00"))
+            dt_ny = dt.astimezone(NY_TZ)
+            last_html = f"Last answer: {html.escape(_format_ny_datetime(dt_ny))} · {_rel_age_html(dt.timestamp(), dt_ny.isoformat())}"
+        except ValueError:
+            last_html = f"Last answer: {html.escape(str(last_iso))}"
+
+    pills = [
+        _pill(f"Correct: {correct}", "ok"),
+        _pill(f"Corrected: {corrected}", "sky"),
+        _pill(f"Can't tell: {cant_tell}", "warn"),
+    ]
+    if skipped > 0:
+        pills.append(_pill(f"Skipped: {skipped}", "muted"))
+
+    return (
+        '<div class="milestone-head">'
+        '<div style="display:flex;align-items:center;gap:8px;flex-wrap:wrap;">'
+        f'<strong style="font-size:15px;">{answered} of {questions} questions</strong>'
+        f'<span class="card__sub" style="margin:0;">{images} images</span>'
+        "</div>"
+        f'<span class="milestone-pct">{pct}%</span>'
+        "</div>"
+        f'<div class="progress-bar" role="progressbar" aria-valuenow="{pct}" aria-valuemin="0" aria-valuemax="100" aria-label="Ground truth quiz progress">'
+        f'<span class="progress-bar__done" style="width:{pct_exact:.2f}%"></span>'
+        "</div>"
+        f'<div class="quiz-splits">{"".join(splits_html)}</div>'
+        '<div class="quiz-foot">'
+        f'<div class="pill-row">{"".join(pills)}</div>'
+        f'<span class="card__sub" style="margin:0;">{last_html}</span>'
+        "</div>"
+    )
+
+
+def _render_quiz_card_html(status: dict[str, Any]) -> str:
+    quiz = status.get("quiz") or {}
+    quiz_url = str(quiz.get("url") or "http://100.89.241.57:8766")
+    return (
+        '<section class="card quiz-card" aria-labelledby="card-quiz">'
+        '<div class="card__head">'
+        '<h3 id="card-quiz" class="card__title">Ground truth quiz</h3>'
+        f'<a class="quiz-open-link" href="{html.escape(quiz_url)}" target="_blank" rel="noopener">'
+        f'Open quiz {icon_svg("external", 13)}</a>'
+        "</div>"
+        f'<div id="live-quiz">{_render_quiz_inner_html(quiz)}</div>'
+        "</section>"
+    )
 
 
 def _render_milestones_section(milestones: list[dict[str, Any]]) -> tuple[str, dict[str, int]]:
@@ -2905,7 +3129,9 @@ def _render_status_fragments(status: dict[str, Any]) -> dict[str, Any]:
     tests = status.get("tests", {})
     exps = status.get("experiments", {})
 
-    running_workers = [w["slug"] for w in pi.get("workers", []) if w.get("state") == "running"]
+    now_ts = time.time()
+    workers = pi.get("workers", []) or []
+    running_workers = [w["slug"] for w in workers if w.get("state") == "running"]
     active_jobs = [j["name"] for j in k8s.get("jobs", []) if j.get("phase") == "Running"]
     running_parts = []
     if running_workers:
@@ -2915,7 +3141,7 @@ def _render_status_fragments(status: dict[str, Any]) -> dict[str, Any]:
     running_now = " · ".join(running_parts) if running_parts else "Idle (workspace pods up)"
 
     blockers = []
-    dead_workers = [w["slug"] for w in pi.get("workers", []) if w.get("state") == "dead"]
+    dead_workers = [w["slug"] for w in workers if _is_dead_recent(w, now_ts)]
     if dead_workers:
         blockers.append(f"Dead pi worker(s): {', '.join(dead_workers)}")
     if tests.get("ok") is False and tests.get("status") == "failed":
@@ -2951,18 +3177,19 @@ def _render_status_fragments(status: dict[str, Any]) -> dict[str, Any]:
     # Pi workers HTML
     if pi.get("ok"):
         w_rows = []
-        for w in pi.get("workers", []):
+        for w in workers:
             rep = ""
             if w.get("report_block"):
                 rep = (
                     '<details class="report-box"><summary>Last report</summary>'
                     f"<pre>{html.escape(w['report_block'])}</pre></details>"
                 )
+            display_state = "stopped" if (w.get("state") == "dead" and not _is_dead_recent(w, now_ts)) else w["state"]
             w_rows.append(
                 f'<li class="live-row"><div class="live-row__main">'
                 f'<div class="live-row__title">{html.escape(w["slug"])}</div>'
                 f'<div class="live-row__meta">age {html.escape(w["age"])} · idle {html.escape(w["idle"])} · sess {html.escape(w["session"])}</div>'
-                f"{rep}</div>{_pill(w['state'], _state_tone(w['state']))}</li>"
+                f"{rep}</div>{_pill(display_state, _state_tone(display_state))}</li>"
             )
         pi_html = f'<ul class="live-list">{"".join(w_rows)}</ul>' if w_rows else '<p class="card__sub">No workers recorded.</p>'
     else:
@@ -3099,6 +3326,7 @@ def build_index(
 
     activity_html, activity_summary = _render_activity_strip_html(status)
     milestones_html, ms_stats = _render_milestones_section(milestones)
+    quiz_html = _render_quiz_card_html(status)
     experiments_html = _render_experiments_scoreboard(status)
     jobs_gantt_html = _render_jobs_gantt(status)
     entries_cards = _entry_cards_html(entries, href_prefix="entries/")
@@ -3160,7 +3388,10 @@ def build_index(
 </section>
 
 <h2 id="progress">Progress</h2>
-{milestones_html}
+<div class="card-grid" style="margin-top:14px;">
+  {milestones_html}
+  {quiz_html}
+</div>
 
 <div class="section-bar">
   <h2 id="latest-entries">Latest Entries</h2>
@@ -3265,12 +3496,34 @@ def build_index(
     var s = String(state || '').toLowerCase();
     if (/running|active|pending/.test(s)) return 'warn';
     if (/done|complete|succeeded|ok/.test(s)) return 'ok';
+    if (/stopped/.test(s)) return 'muted';
     if (/dead|fail|error|backoff|unavailable/.test(s)) return 'bad';
     return 'neutral';
+  }
+  function isDeadRecent(w) {
+    if (!w || w.state !== 'dead') return false;
+    if (w.log_mtime) {
+      var ms = Date.parse(w.log_mtime);
+      if (!isNaN(ms)) return (Date.now() - ms) <= 30 * 60 * 1000;
+    }
+    if (typeof w.log_age_s === 'number') return w.log_age_s <= 30 * 60;
+    return !!w.log_recent;
   }
   function pill(txt, t) {
     var cls = t === 'neutral' ? 'tag-pill' : 'tag-pill tag-pill--' + t;
     return '<span class="' + cls + '">' + esc(txt) + '</span>';
+  }
+  function formatNyTime(iso) {
+    if (!iso) return '';
+    var d = new Date(iso);
+    if (isNaN(d.getTime())) return '';
+    try {
+      var datePart = d.toLocaleDateString('en-US', { timeZone: 'America/New_York', month: 'short', day: 'numeric' });
+      var timePart = d.toLocaleTimeString('en-US', { timeZone: 'America/New_York', hour: 'numeric', minute: '2-digit' });
+      return datePart + ' · ' + timePart;
+    } catch (e) {
+      return iso.slice(0, 16).replace('T', ' ');
+    }
   }
   function relAgeHtml(iso) {
     if (!iso) return '';
@@ -3293,7 +3546,11 @@ def build_index(
     var tests = st.tests || {};
     var exps = st.experiments || {};
 
-    var runningWorkers = (pi.workers || []).filter(function (w) { return w.state === 'running'; });
+    var workers = pi.workers || [];
+    var runningWorkers = workers.filter(function (w) { return w.state === 'running'; });
+    var doneCount = workers.filter(function (w) { return w.state === 'done'; }).length;
+    var recentDeadWorkers = workers.filter(isDeadRecent);
+    var stoppedWorkers = workers.filter(function (w) { return w.state === 'dead' && !isDeadRecent(w); });
     var runningJobs = (k8s.jobs || []).filter(function (j) { return j.phase === 'Running'; });
     var rw = runningWorkers.map(function (w) { return w.slug; });
     var aj = runningJobs.map(function (j) { return j.name; });
@@ -3303,9 +3560,25 @@ def build_index(
     var rEl = document.getElementById('strip-running');
     if (rEl) rEl.textContent = rParts.length ? rParts.join(' · ') : 'Idle (workspace pods up)';
 
+    var blockers = [];
+    if (recentDeadWorkers.length) {
+      blockers.push('Dead pi worker(s): ' + recentDeadWorkers.map(function (w) { return w.slug; }).join(', '));
+    }
+    if (tests.ok === false && tests.status === 'failed') blockers.push('Unit tests failing');
+    (gpus.cards || []).forEach(function (card) {
+      if (typeof card.memory_free_mib === 'number' && card.memory_free_mib < 1500) {
+        blockers.push(card.node + ' low free VRAM (' + card.memory_free_mib + ' MiB)');
+      }
+    });
+    var bEl = document.getElementById('strip-blockers');
+    if (bEl) bEl.textContent = blockers.length ? blockers.join('; ') : 'No hard blockers; GT verification in progress';
+
     var actSum = document.getElementById('activity-summary');
-    if (actSum && pi.counts) {
-      actSum.textContent = (pi.counts.running || 0) + ' running · ' + (pi.counts.done || 0) + ' done · ' + (pi.counts.dead || 0) + ' dead';
+    if (actSum) {
+      var sumParts = [runningWorkers.length + ' running', doneCount + ' done'];
+      if (recentDeadWorkers.length) sumParts.push(recentDeadWorkers.length + ' dead');
+      if (stoppedWorkers.length) sumParts.push(stoppedWorkers.length + ' stopped');
+      actSum.textContent = sumParts.join(' · ');
     }
     var actEl = document.getElementById('live-activity-strip');
     if (actEl) {
@@ -3328,9 +3601,60 @@ def build_index(
             + pill('active', 'sky') + '</div>');
         }
       });
+      stoppedWorkers.forEach(function (w) {
+        var sub = w.log_mtime ? ('last log ' + relAgeHtml(w.log_mtime)) : ('age ' + esc(w.age || '-'));
+        actItems.push('<div class="activity-item activity-item--stopped"><div class="activity-item__left"><span class="stopped-dot" aria-hidden="true"></span>'
+          + '<div class="activity-item__body"><div class="activity-item__name">pi worker · ' + esc(w.slug) + '</div>'
+          + '<div class="activity-item__sub">' + sub + ' · sess ' + esc(w.session || '-') + '</div></div></div>'
+          + pill('stopped', 'muted') + '</div>');
+      });
       actEl.innerHTML = actItems.length
         ? '<div class="activity-grid">' + actItems.join('') + '</div>'
         : '<p class="card__sub" style="margin:0;">No pi workers, external agents, or GPU jobs running right now.</p>';
+    }
+
+    var qEl = document.getElementById('live-quiz');
+    var quiz = st.quiz || {};
+    if (qEl) {
+      if (!quiz.ok) {
+        qEl.innerHTML = '<p class="card__sub" style="margin:0;">' + esc(quiz.error || 'quiz_queue.json unavailable') + '</p>';
+      } else {
+        var qTotal = quiz.questions || 0;
+        var qImgs = quiz.images || 0;
+        var qAns = quiz.answered || 0;
+        var qPct = qTotal ? Math.round((qAns / qTotal) * 100) : 0;
+        var qPctExact = qTotal ? ((qAns / qTotal) * 100).toFixed(2) : '0.00';
+        var splitsHtml = (quiz.splits || []).map(function (sp) {
+          var sQ = sp.questions || 0;
+          var sA = sp.answered || 0;
+          var sI = sp.images || 0;
+          var sP = sQ ? Math.round((sA / sQ) * 100) : 0;
+          var sPE = sQ ? ((sA / sQ) * 100).toFixed(2) : '0.00';
+          return '<div class="quiz-split"><div class="quiz-split__head">'
+            + '<span class="quiz-split__name">' + esc(sp.split) + '</span>'
+            + '<span class="quiz-split__meta">' + sA + '/' + sQ + ' (' + sP + '%) · ' + sI + ' imgs</span></div>'
+            + '<div class="quiz-split__bar"><span class="quiz-split__fill" style="width:' + sPE + '%"></span></div></div>';
+        }).join('');
+        var qPills = [
+          pill('Correct: ' + (quiz.correct || 0), 'ok'),
+          pill('Corrected: ' + (quiz.corrected || 0), 'sky'),
+          pill("Can't tell: " + (quiz.cant_tell || 0), 'warn')
+        ];
+        if (quiz.skipped) qPills.push(pill('Skipped: ' + quiz.skipped, 'muted'));
+        var lastTxt = quiz.last_answer_at
+          ? ('Last answer: ' + esc(formatNyTime(quiz.last_answer_at)) + ' · ' + relAgeHtml(quiz.last_answer_at))
+          : 'No answers recorded yet';
+        qEl.innerHTML = '<div class="milestone-head">'
+          + '<div style="display:flex;align-items:center;gap:8px;flex-wrap:wrap;">'
+          + '<strong style="font-size:15px;">' + qAns + ' of ' + qTotal + ' questions</strong>'
+          + '<span class="card__sub" style="margin:0;">' + qImgs + ' images</span></div>'
+          + '<span class="milestone-pct">' + qPct + '%</span></div>'
+          + '<div class="progress-bar" role="progressbar" aria-valuenow="' + qPct + '" aria-valuemin="0" aria-valuemax="100" aria-label="Ground truth quiz progress">'
+          + '<span class="progress-bar__done" style="width:' + qPctExact + '%"></span></div>'
+          + '<div class="quiz-splits">' + splitsHtml + '</div>'
+          + '<div class="quiz-foot"><div class="pill-row">' + qPills.join('') + '</div>'
+          + '<span class="card__sub" style="margin:0;">' + lastTxt + '</span></div>';
+      }
     }
 
     var liveCount = rw.length + aj.length;
@@ -3383,9 +3707,10 @@ def build_index(
       if (pi.ok) {
         var wRows = (pi.workers || []).map(function (w) {
           var rep = w.report_block ? '<details class="report-box"><summary>Last report</summary><pre>' + esc(w.report_block) + '</pre></details>' : '';
+          var dispState = (w.state === 'dead' && !isDeadRecent(w)) ? 'stopped' : w.state;
           return '<li class="live-row"><div class="live-row__main"><div class="live-row__title">' + esc(w.slug) + '</div>'
             + '<div class="live-row__meta">age ' + esc(w.age) + ' · idle ' + esc(w.idle) + ' · sess ' + esc(w.session) + '</div>' + rep + '</div>'
-            + pill(w.state, tone(w.state)) + '</li>';
+            + pill(dispState, tone(dispState)) + '</li>';
         });
         pEl.innerHTML = wRows.length ? '<ul class="live-list">' + wRows.join('') + '</ul>' : '<p class="card__sub">No workers recorded.</p>';
       } else {
