@@ -275,3 +275,325 @@ def test_summarize_splices_judgement(tmp_path):
     markdown = faces.summarize(tmp_path / 'faces.json', {'a.jpg': {'boxes': [], 'names': []}},
                               judgement=tmp_path / 'judge.md')
     assert 'v3 wins' in markdown and '(filled in by the worker' not in markdown
+
+
+# --------------------------------------------------------------- faces_v2 cleaning
+
+
+def _face(index, box, *, support=1.0, verdict='correct', score=0.9, provenance=None,
+          category_id=1, sub_label=''):
+    """One faces_v1-style annotation from an XYXY box."""
+    x, y, w, h = box[0], box[1], box[2] - box[0], box[3] - box[1]
+    return {'id': index, 'image_id': 1, 'category_id': category_id,
+            'bbox': [x, y, w, h], 'area': w * h, 'iscrowd': 0,
+            'attributes': {'source': 'vlm:faces', 'support': support,
+                           'judge_verdict': verdict, 'judge_score': score,
+                           'sub_label': sub_label, 'identity_visible': category_id != 1,
+                           'identity_containment': 1.0 if category_id != 1 else 0.0,
+                           'provenance': provenance if provenance is not None else
+                           [{'run': 'inkling-full', 'boxes': [list(box)]}]}}
+
+
+def _labels(anns, file_name='cab.jpg', width=2048, height=1536):
+    return {'info': {'prompt_variant': 'v3', 'target': faces.FACE_CLASS},
+            'images': [{'id': 1, 'file_name': file_name, 'width': width, 'height': height,
+                        'attributes': {'image_area': width * height, 'verified': False}}],
+            'categories': [{'id': 1, 'name': 'unknown'}, {'id': 2, 'name': 'coca-cola-part1'}],
+            'annotations': list(anns)}
+
+
+def test_parse_part_reads_only_the_two_printed_numerals():
+    assert faces.parse_part('1') == 1 and faces.parse_part('2') == 2
+    assert faces.parse_part('Part 2') == 2 and faces.parse_part('part1') == 1
+    assert faces.parse_part('\u2461') == 2                       # circled two
+    for text in ('', None, 'NNS', 'AA', '4', '0', '1/2', 'part 1 and 2'):
+        assert faces.parse_part(text) is None, text
+
+
+def test_x_columns_groups_by_interval_overlap_and_y_gap():
+    left, right = [100, 800, 145, 865], [300, 800, 345, 865]
+    assert faces.x_columns([left, right], 0.4) == [[0], [1]]     # side by side
+    assert faces.x_overlap_ratio(left, right) == 0.0
+    near = [120, 835, 165, 900]                                  # fanned neighbour
+    assert faces.x_overlap_ratio(left, near) > 0.4
+    assert faces.x_columns([left, near], 0.4) == [[0, 1]]        # chained without a guard
+    assert faces.x_columns([left, near], 0.4, 60.0) == [[0], [1]]   # y-gap guard
+    far_top = [100, 600, 145, 665]                               # the other end of the lean
+    assert faces.x_columns([left, far_top], 0.4, 60.0) == [[0, 1]]
+
+
+def test_lowest_per_column_keeps_the_outward_end():
+    top_end = [500, 600, 545, 665]
+    out_end = [505, 820, 550, 890]
+    anns = [_face(1, top_end), _face(2, out_end)]
+    kept, dropped = faces.lowest_per_column([top_end, out_end], anns, 0.4, 60.0)
+    assert kept == [1] and dropped == {0: 'leaning-column-duplicate'}
+    # the lower face loses only if the evidence for it is weaker
+    weak = _face(2, out_end, support=0.5, score=0.2)
+    kept, _ = faces.lowest_per_column([top_end, out_end], [_face(1, top_end), weak], 0.4, 60.0)
+    assert kept == [1]
+    # no y-gap guard given -> a fanned row would chain into one column
+    kept, dropped = faces.lowest_per_column([top_end, out_end], anns, 0.4)
+    assert len(kept) == 1 and len(dropped) == 1
+
+
+def test_shelf_bands_and_bottom_band():
+    top = [[100 + 100 * i, 150, 140 + 100 * i, 210] for i in range(5)]
+    bottom = [[300 + 60 * i, 800 + 20 * i, 345 + 60 * i, 865 + 20 * i] for i in range(4)]
+    boxes = top + bottom
+    bands, distinct = faces.shelf_bands(boxes)
+    assert distinct == [0, 1] and bands[:5] == [0] * 5 and set(bands[5:]) == {1}
+    assert faces.bottom_band(boxes, bands, distinct) == 1
+    assert faces.bottom_band(top, [0] * 5, [0]) is None          # one band: nothing to collapse
+    inverted = [[100, 100, 140, 160], [100, 800, 140, 860]]      # band 1 is the higher one
+    assert faces.bottom_band(inverted, [1, 0], [0, 1]) is None
+
+
+def test_face_shape_flags_aspect_and_thin_strip():
+    boxes = [[300, 800, 345, 865],            # normal end face
+             [400, 800, 560, 860],            # flat: the long side of a leaning box
+             [600, 800, 612, 865],            # thin strip
+             [100, 150, 260, 210]]            # wide but on the TOP band -> not flat-flagged
+    bands = [1, 1, 1, 0]
+    flags = faces.face_shape_flags(boxes, bands, bottom=1)
+    assert flags == {1: 'flat-aspect', 2: 'thin-strip'}
+    assert faces.face_shape_flags(boxes, bands, bottom=None) == {2: 'thin-strip'}
+
+
+def test_load_reference_carries_family_and_part(tmp_path):
+    coco = {'images': [{'id': 1, 'file_name': 'a/b.jpg'}],
+            'categories': [{'id': 1, 'name': 'coca-cola-part1'}],
+            'annotations': [{'image_id': 1, 'category_id': 1, 'bbox': [10, 20, 30, 40],
+                             'attributes': {'id_family': 'coca cola', 'id_part': 1}}]}
+    path = tmp_path / 'ref.json'
+    path.write_text(json.dumps(coco))
+    reference = faces.load_reference(path)
+    entry = reference['a/b.jpg']
+    assert entry['boxes'] == [[10, 20, 40, 60]] and entry['names'] == ['coca-cola-part1']
+    assert entry['families'] == ['coca cola'] and entry['parts'] == [1]
+    assert faces.best_containing([12, 22, 38, 58], entry['boxes']) == (0, 1.0)
+    assert faces.best_containing([500, 500, 520, 520], entry['boxes'])[0] is None
+    assert faces.reference_identity('a/b.jpg', [12, 22, 38, 58], reference) == {
+        'class': 'coca-cola-part1', 'family': 'coca cola', 'part': 1, 'containment': 1.0}
+    assert faces.reference_identity('a/b.jpg', [900, 900, 940, 960], reference)['class'] == 'unknown'
+    assert faces.reference_identity('missing.jpg', [0, 0, 10, 10], reference)['family'] is None
+
+
+def test_residual_duplicates_reports_pairs_it_will_not_delete():
+    tight = [458, 124, 499, 194]
+    loose = [457, 120, 515, 303]                               # same end, boxy up
+    assert faces.residual_duplicates([tight, loose]) == [(0, 1)]
+    assert faces.residual_duplicates([tight, [600, 120, 650, 200]]) == []
+
+
+def test_face_sub_label_votes_across_runs():
+    box = [10, 20, 40, 80]
+    provenance = [{'run': 'inkling-full', 'boxes': [box]}, {'run': 'inkling-tiles', 'boxes': [box]}]
+    lookup = {('img.jpg', 'inkling-full', faces.box_key(box)): '1',
+              ('img.jpg', 'inkling-tiles', faces.box_key(box)): '1'}
+    assert faces.face_sub_label(lookup, 'img.jpg', provenance) == '1'
+    lookup[('img.jpg', 'inkling-tiles', faces.box_key(box))] = '2'
+    assert faces.face_sub_label(lookup, 'img.jpg', provenance) == '1'      # first run wins ties
+    assert faces.face_sub_label({}, 'img.jpg', provenance) == ''
+    assert faces.face_sub_label(lookup, 'other.jpg', provenance) == ''
+    assert faces.face_sub_label(lookup, 'img.jpg', None) == ''
+
+
+def test_clean_faces_keeps_by_support_or_judge_and_renumbers():
+    anns = [_face(1, [0, 100, 40, 160], support=1.0, verdict='correct'),
+            _face(2, [100, 100, 140, 160], support=1.0, verdict='incorrect'),
+            _face(3, [200, 100, 240, 160], support=0.5, verdict='correct'),
+            _face(4, [300, 100, 340, 160], support=0.5, verdict='imprecise'),
+            _face(5, [400, 100, 440, 160], support=0.5, verdict='incorrect'),
+            _face(6, [500, 100, 540, 160], support=1.0, verdict='imprecise')]
+    coco, drops = faces.clean_faces(_labels(anns))
+    assert [a['bbox'][:2] for a in coco['annotations']] == [[0, 100], [200, 100], [500, 100]]
+    assert [a['id'] for a in coco['annotations']] == [1, 2, 3]
+    assert [a['attributes']['clean_keep'] for a in coco['annotations']] == \
+        ['agreed-support', 'judge-correct', 'agreed-support']
+    assert sorted((drop['reason'], drop['bbox'][:2]) for drop in drops) == \
+        [('judge-incorrect', [100, 100]), ('judge-incorrect', [400, 100]),
+         ('weak-evidence', [300, 100])]
+    assert coco['info']['clean_dropped'] == {'judge-incorrect': 2, 'weak-evidence': 1}
+    assert coco['info']['clean_kept'] == {'agreed-support': 2, 'judge-correct': 1}
+    assert coco['info']['target'] == faces.FACE_TARGET_SLUG
+    assert coco['info']['label_version'] == faces.LABEL_VERSION
+    assert coco['images'][0]['file_name'] == 'cab.jpg'           # image list untouched
+    assert coco['categories'] == _labels([])['categories']
+
+
+def test_clean_faces_collapses_leaning_columns_not_the_fanned_row():
+    top = [_face(i + 1, [100 + 100 * i, 150, 140 + 100 * i, 210]) for i in range(5)]
+    bottom = [_face(6, [300, 800, 345, 865]),                    # two outward ends...
+              _face(7, [320, 835, 365, 900]),
+              _face(8, [500, 600, 545, 665], support=1.0, sub_label='1'),   # ...and both ends
+              _face(9, [505, 820, 550, 890], category_id=2, sub_label='2')]
+    reference = {'cab.jpg': {'boxes': [[500, 590, 560, 900]],
+                            'names': ['coca-cola-part1'],
+                            'families': ['coca cola'], 'parts': [None]}}
+    coco, drops = faces.clean_faces(_labels(top + bottom), reference=reference)
+    boxes = [a['attributes'] for a in coco['annotations']]
+    assert len(coco['annotations']) == 8                          # one face dropped
+    assert [drop['reason'] for drop in drops] == ['leaning-column-duplicate']
+    assert drops[0]['bbox'] == [500, 600, 45, 65]                 # the far end went, not the near
+    kept = coco['annotations'][-1]
+    assert kept['attributes']['bottom_shelf'] is True
+    assert kept['attributes']['id_part'] == 2                     # read from the face text
+    assert kept['attributes']['id_part_source'] == 'face_text'
+    assert kept['attributes']['id_family'] == 'coca cola'         # inherited by containment
+    assert boxes[-1]['shelf_band'] == 1 and boxes[0]['shelf_band'] == 0
+    assert all(not a['bottom_shelf'] for a in boxes[:5])          # top shelf untouched
+
+
+def test_clean_faces_part_falls_back_to_the_whole_cartridge_box():
+    face = _face(1, [505, 820, 550, 890], sub_label='')
+    reference = {'cab.jpg': {'boxes': [[500, 590, 560, 900]], 'names': ['coca-cola-part1'],
+                            'families': ['coca cola'], 'parts': [1]}}
+    coco, _ = faces.clean_faces(_labels([face, _face(2, [0, 800, 60, 900])]),
+                               reference=reference)
+    attributes = coco['annotations'][0]['attributes']
+    assert (attributes['id_part'], attributes['id_part_source']) == (1, 'whole_box')
+    assert attributes['id_family'] == 'coca cola'
+    other = coco['annotations'][1]['attributes']
+    assert (other['id_part'], other['id_family']) == (None, None)   # outside every reference box
+
+
+def test_clean_faces_rules_are_overridable():
+    anns = [_face(1, [0, 100, 40, 160], support=0.5, verdict='correct'),
+            _face(2, [100, 100, 140, 160], support=0.5, verdict='imprecise')]
+    strict, _ = faces.clean_faces(_labels(anns), rules={'support_judged': 1.0})
+    assert [a['id'] for a in strict['annotations']] == []
+    loose, _ = faces.clean_faces(_labels(anns), rules={'support_judged': 0.5,
+                                                      'judge_keep_verdicts': ('correct',
+                                                                              'imprecise')})
+    assert [a['attributes']['clean_keep'] for a in loose['annotations']] == \
+        ['judge-correct', 'judge-correct']
+
+
+def _detect_with_sub_labels(image, **kwargs):
+    """Stand-in labeller: both runs see the same faces and read 'NNS' / '2' on them."""
+    return [{'box': [20, 20, 60, 100], 'label': faces.FACE_CLASS, 'sub_label': 'NNS', 'score': 1.0},
+            {'box': [100, 100, 145, 165], 'label': faces.FACE_CLASS, 'sub_label': '2', 'score': 1.0}]
+
+
+def test_recover_sub_labels_reads_back_what_the_run_cached(tmp_path, monkeypatch):
+    cfg, records, reference = _setup_run_with_codes(tmp_path, monkeypatch)
+    out = tmp_path / 'faces.json'
+    labelled = faces.bootstrap_faces(cfg, records, out, reference=reference)
+    assert all(a['attributes']['sub_label'] == '' for a in labelled['annotations'])  # lost in fusion
+    lookup = faces.recover_sub_labels(labelled, cfg)
+    assert sorted(code for code in lookup.values()) == ['2', '2', 'NNS', 'NNS']    # 2 runs x 2 faces
+    coco, _ = faces.clean_faces(labelled, sub_labels=lookup)
+    codes = [a['attributes']['sub_label'] for a in coco['annotations']]
+    assert codes == ['NNS', '2'] and coco['annotations'][1]['attributes']['id_part'] == 2
+
+
+def _setup_run_with_codes(tmp_path, monkeypatch):
+    Image.new('RGB', (200, 200)).save(tmp_path / 'image.jpg')
+    monkeypatch.setattr(faces.catalog, 'class_names', lambda path: ['sprite', 'unknown'])
+    monkeypatch.setattr(faces, 'detect_faces', _detect_with_sub_labels)
+    monkeypatch.setattr(faces, 'judge_labels', _fake_judge(
+        [], lambda call, n: [{'annotation_id': i + 1, 'verdict': 'correct', 'score': 0.9}
+                            for i in range(n)]))
+    cfg = {'images_root': str(tmp_path), 'cache_dir': str(tmp_path / 'cache'),
+           'base_url': 'http://x/v1', 'prompt_variant': 'v3', 'fusion_iou': 0.35,
+           'labellers': [{'name': 'inkling-full', 'model': 'a'},
+                         {'name': 'inkling-tiles', 'model': 'b', 'tile': 100}],
+           'judge': {'model': 'flash'}}
+    return cfg, [{'image_id': 'image.jpg', 'group_id': 'g'}], {'image.jpg':
+                                                                {'boxes': [], 'names': [],
+                                                                 'families': [], 'parts': []}}
+
+
+def test_select_overlay_images_never_touches_test():
+    labels = _labels([])
+    labels['images'] += [{'id': index + 2, 'file_name': f't{index}.jpg'} for index in range(3)]
+    labels['images'] += [{'id': 6, 'file_name': 'v0.jpg'}, {'id': 7, 'file_name': 'v1.jpg'}]
+    splits = {'cab.jpg': 'test', 't0.jpg': 'train', 't1.jpg': 'train', 't2.jpg': 'train',
+              'v0.jpg': 'val', 'v1.jpg': 'val'}
+    drops = [{'file_name': 't2.jpg', 'reason': 'judge-incorrect'}] * 3
+    drops += [{'file_name': 't0.jpg', 'reason': 'judge-incorrect'}]
+    drops += [{'file_name': 'v1.jpg', 'reason': 'judge-incorrect'}] * 5
+    assert faces.select_overlay_images(labels, drops, splits, per_split=2) == \
+        ['t2.jpg', 't0.jpg', 'v1.jpg', 'v0.jpg']
+    assert faces.select_overlay_images(labels, drops, splits, per_split=1) == ['t2.jpg', 'v1.jpg']
+
+
+def test_render_clean_overlays_writes_png_and_sidecar(tmp_path):
+    Image.new('RGB', (400, 300), 'white').save(tmp_path / 'cab.jpg')
+    face = _face(1, [50, 60, 90, 130], sub_label='1')
+    face['attributes']['id_part'] = 1                             # as clean_faces would set it
+    dropped = {'file_name': 'cab.jpg', 'bbox': [100.0, 60.0, 40.0, 70.0],
+               'reason': 'judge-incorrect', 'support': 1.0, 'judge_verdict': 'incorrect',
+               'judge_score': 0.1, 'area': 2800.0}
+    paths = faces.render_clean_overlays(_labels([face]), [dropped], ['cab.jpg'],
+                                       tmp_path / 'viz', images_root=tmp_path,
+                                       reference={'cab.jpg': {'boxes': [[40, 50, 150, 150]],
+                                                             'names': ['coca-cola-part1']}})
+    png = next(path for path in paths if path.suffix == '.png')
+    sidecar = json.loads(png.with_suffix('.json').read_text())
+    assert png.parent == tmp_path / 'viz' and png.stat().st_size > 0
+    assert sidecar['parts_readable'] == [1]
+    assert sidecar['kept'][0]['sub_label'] == '1' and sidecar['kept'][0]['bbox'][:2] == [50, 60]
+    assert sidecar['dropped'][0]['reason'] == 'judge-incorrect'
+    assert faces.render_clean_overlays(_labels([face]), [], ['missing.jpg'], tmp_path / 'viz2',
+                                      images_root=tmp_path) == []
+
+
+def test_summarize_clean_reports_rules_counts_and_residuals(tmp_path):
+    anns = [_face(1, [0, 100, 40, 160], support=1.0, verdict='correct'),
+            _face(2, [100, 100, 140, 160], support=1.0, verdict='incorrect'),
+            _face(3, [104, 104, 136, 156], support=0.5, verdict='correct'),   # loose duplicate
+            _face(4, [100, 100, 140, 160], support=0.5, verdict='imprecise')]
+    v1 = _labels(anns)
+    coco, drops = faces.clean_faces(v1)
+    markdown = faces.summarize_clean(v1, coco, drops,
+                                   reference={'cab.jpg': {'boxes': [[0, 100, 140, 160]],
+                                                         'names': ['unknown']}},
+                                   splits={'cab.jpg': 'train'},
+                                   overlays=['cab.png'], images_read=4,
+                                   judgement=None)
+    assert 'NOT ground truth' in markdown
+    assert '4 proposals -> 2 faces over 1 images' in markdown
+    assert 'judge-incorrect' in markdown and 'weak-evidence' in markdown
+    assert 'one face per leaning column' in markdown
+    assert '| `cab.jpg` | train | 4 | 2 | 2 |' in markdown
+    assert 'residual duplicates NOT covered by the rules above: 0 pairs' in markdown
+    assert 'images read into the worker context (downscaled): 4' in markdown
+    assert '`cab.png`' in markdown and '(filled in by the worker' in markdown
+    (tmp_path / 'judge.md').write_text('Looked at 4 overlays; the fanned row survives.\n')
+    markdown = faces.summarize_clean(v1, coco, drops, reference={}, splits={},
+                                    judgement=tmp_path / 'judge.md')
+    assert 'fanned row survives' in markdown
+
+
+def test_clean_cli_writes_labels_drops_and_report(tmp_path, monkeypatch, capsys):
+    v1 = _labels([_face(1, [0, 100, 40, 160], support=1.0, verdict='correct'),
+                  _face(2, [100, 100, 140, 160], support=1.0, verdict='incorrect')])
+    labels = tmp_path / 'faces_v1.json'
+    labels.write_text(json.dumps(v1))
+    reference = tmp_path / 'bootstrap.json'
+    reference.write_text(json.dumps({
+        'images': [{'id': 1, 'file_name': 'cab.jpg'}],
+        'categories': [{'id': 2, 'name': 'coca-cola-part1'}],
+        'annotations': [{'image_id': 1, 'category_id': 2, 'bbox': [0, 100, 140, 60],
+                         'attributes': {'id_family': 'coca cola', 'id_part': None}}]}))
+    splits = tmp_path / 'splits.json'
+    splits.write_text(json.dumps({'images': {'cab.jpg': 'train'}}))
+    config = tmp_path / 'faces.yaml'
+    config.write_text('prompt_variant: v3\ncache_dir: %s\nlabellers: []\n' % (tmp_path / 'cache'))
+    argv = ['clean', '--labels', str(labels), '--config', str(config), '--reference',
+            str(reference), '--splits', str(splits), '--out', str(tmp_path / 'faces_v2.json'),
+            '--out-dir', str(tmp_path / 'run'), '--overlays', '0']
+    assert faces.main(argv) == 0
+    out = json.loads((tmp_path / 'faces_v2.json').read_text())
+    report = (tmp_path / 'run' / 'summary.md').read_text()
+    assert [a['bbox'] for a in out['annotations']] == [[0.0, 100.0, 40.0, 60.0]]
+    assert out['annotations'][0]['attributes']['id_family'] == 'coca cola'
+    assert json.loads((tmp_path / 'run' / 'dropped.json').read_text())[0]['reason'] == \
+        'judge-incorrect'
+    assert 'faces_v2' in report and 'judge-incorrect' in report
+    assert 'wrote' in capsys.readouterr().out
+    with pytest.raises(ValueError, match='data/gt'):
+        faces.main(argv[:-2] + ['--out', str(faces.ROOT / 'data/gt/faces_v2.json'),
+                               '--out-dir', str(tmp_path / 'run2')])

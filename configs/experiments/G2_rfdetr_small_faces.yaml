@@ -1,0 +1,40 @@
+# G2: the cheap family-G variant — RF-DETR **Small** at tile 1024 (C1's localizer) on the
+# CLEANED FRONT-FACE labels. Two variables vs C1 at once (label target and tile/epochs are
+# untouched), so it is the small-and-fast sanity arm against G1's Medium/1280.
+# Model bootstrap labels only (vs-model-labels, NOT GT).
+#
+# See configs/experiments/G1_rfdetr_medium_faces.yaml for what the `cartridge_face` target
+# is and why the exported super-class is still called `cartridge`.
+id: G2_rfdetr_small_faces
+family: C_det_agnostic_plus_embed
+compute:
+  target: k8s:5090
+  vram_mb: 12000
+  timeout: 1800
+data:
+  train: labels/faces_v2.json
+  val: labels/faces_v2.json
+  test: labels/faces_v2.json
+  bootstrap: labels/faces_v2.json
+  label_source: bootstrap
+  bootstrap_filter:
+    verdicts: [correct, imprecise]      # faces_v2 is already cleaned; pass-through
+    min_support: 0.5
+localizer:
+  type: tiled_detector
+  tile: 1024
+  overlap: 0.25
+  training:
+    model: RFDETRSmall
+    resolution: 576                     # same input resolution as G1: only model+tiles differ
+    epochs: 100
+    batch_size: 8                       # Small fits a bigger batch on the same 12 GB
+    early_stopping: true
+    early_stopping_patience: 15
+identifier:
+  type: none
+embeddings:
+  model: google/siglip2-base-patch16-224
+  batch_size: 64
+count:
+  identity_thr: 0.5

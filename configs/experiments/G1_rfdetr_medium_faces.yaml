@@ -1,0 +1,50 @@
+# G1: S2 (RF-DETR Medium, tile 1280) trained on the CLEANED FRONT-FACE labels instead of
+# whole-cartridge boxes. Single variable vs S2: data.* labels/bootstrap_v2.json ->
+# labels/faces_v2.json. Model bootstrap labels only (vs-model-labels, NOT GT).
+#
+# Experiment family G (see freestyle/faces.py): bottom-shelf cartridges lean back, so a
+# whole-cartridge box is huge and overlaps its neighbours; the *front face* (the narrow
+# printed end panel: logo + Part number) is small, upright and non-overlapping. The target
+# class is `cartridge_face` (data/labels/faces_v2.json info.target); the shared
+# class-agnostic machinery names that single super-class `cartridge` in the exported tiles
+# and predictions (freestyle/train/export_tiles.py), so G1 stays directly comparable to S2.
+id: G1_rfdetr_medium_faces
+family: C_det_agnostic_plus_embed
+compute:
+  target: k8s:5090
+  vram_mb: 12000
+  timeout: 1800
+data:
+  train: labels/faces_v2.json
+  val: labels/faces_v2.json
+  test: labels/faces_v2.json
+  bootstrap: labels/faces_v2.json
+  label_source: bootstrap
+  bootstrap_filter:
+    # faces_v2 is already cleaned (support 1.0, or judged correct at support >= 0.5, one
+    # face per leaning column), so the filter is a pass-through; 'imprecise' survives only
+    # where both labeller runs agreed. min_support 0.5 keeps those single-run faces.
+    verdicts: [correct, imprecise]
+    min_support: 0.5
+localizer:
+  type: tiled_detector
+  tile: 1280
+  overlap: 0.25
+  training:
+    model: RFDETRMedium
+    resolution: 576
+    epochs: 100
+    batch_size: 4
+    early_stopping: true
+    early_stopping_patience: 15
+# No human-labelled gallery exists, so nothing is identified at inference time; the
+# agnostic face boxes are reported as generic 'unknown'.
+identifier:
+  type: none
+# SigLIP2 embeddings of every face crop (train+val+test) -> runs/<id>/embeddings.npz, the
+# crop set a human will label to fit an identifier on faces (family H).
+embeddings:
+  model: google/siglip2-base-patch16-224
+  batch_size: 64
+count:
+  identity_thr: 0.5
