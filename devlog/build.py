@@ -8,16 +8,19 @@ into ``devlog/site/``.
 
 from __future__ import annotations
 
+import argparse
 import ast
 import html
 import json
 import os
 import re
 import textwrap
+import time
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
+from zoneinfo import ZoneInfo
 
 import yaml
 from PIL import Image, ImageOps
@@ -36,6 +39,8 @@ ENTRIES_DIR = SITE_DIR / "entries"
 STATUS_PATH = SITE_DIR / "status.json"
 MODELS_PATH = DEVLOG_DIR / "models.yaml"
 CODE_TOUR_PATH = DEVLOG_DIR / "code_tour.yaml"
+MILESTONES_PATH = DEVLOG_DIR / "milestones.yaml"
+NY_TZ = ZoneInfo("America/New_York")
 
 # Inline Lucide-style SVG icons (MIT/ISC). No external icon CDNs.
 ICONS: dict[str, str] = {
@@ -96,6 +101,7 @@ class Entry:
     slug: str
     title: str
     date: str
+    iso_date: str
     sort_ts: float
     display_date: str
     tags: list[str]
@@ -103,6 +109,52 @@ class Entry:
     body_html: str
     headings: list[dict[str, Any]]
     reading_min: int
+
+
+def _format_ny_datetime(dt: datetime, *, include_time: bool = True) -> str:
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=NY_TZ)
+    dt_ny = dt.astimezone(NY_TZ)
+    date_part = f"{dt_ny.strftime('%b')} {dt_ny.day}"
+    if not include_time:
+        return date_part
+    time_part = dt_ny.strftime("%I:%M %p").lstrip("0")
+    return f"{date_part} · {time_part}"
+
+
+def _format_rel_age(ts: float, now_ts: float | None = None) -> str:
+    now_val = time.time() if now_ts is None else now_ts
+    diff = max(0, int(now_val - ts))
+    if diff < 60:
+        return "just now"
+    if diff < 3600:
+        return f"{diff // 60} min ago"
+    if diff < 86400:
+        return f"{diff // 3600} hr ago"
+    return f"{diff // 86400}d ago"
+
+
+def _rel_age_html(ts: float, iso_str: str) -> str:
+    return (
+        f'<time class="rel-age" datetime="{html.escape(iso_str)}" '
+        f'data-rel-ts="{int(ts * 1000)}">{html.escape(_format_rel_age(ts))}</time>'
+    )
+
+
+def _format_duration_short(seconds: float | int | None) -> str:
+    if seconds is None or seconds < 0:
+        return "-"
+    secs = int(round(seconds))
+    if secs < 60:
+        return f"{secs}s"
+    mins, secs = divmod(secs, 60)
+    if mins < 60:
+        return f"{mins}m{secs}s"
+    hours, mins = divmod(mins, 60)
+    if hours < 24:
+        return f"{hours}h{mins}m"
+    days, hours = divmod(hours, 24)
+    return f"{days}d{hours}h"
 
 
 def parse_front_matter(raw: str) -> tuple[dict[str, Any], str]:
@@ -332,10 +384,16 @@ def load_entries() -> list[Entry]:
         date_str = str(meta.get("date") or path.stat().st_mtime)
         try:
             dt = datetime.fromisoformat(date_str)
-            sort_ts = dt.timestamp()
-            display_date = dt.strftime("%Y-%m-%d %H:%M") if "T" in date_str else dt.strftime("%Y-%m-%d")
+            if dt.tzinfo is None:
+                dt = dt.replace(tzinfo=NY_TZ)
+            dt_ny = dt.astimezone(NY_TZ)
+            sort_ts = dt_ny.timestamp()
+            iso_date = dt_ny.isoformat()
+            display_date = _format_ny_datetime(dt_ny, include_time=("T" in date_str or " " in date_str))
         except ValueError:
             sort_ts = path.stat().st_mtime
+            dt_ny = datetime.fromtimestamp(sort_ts, tz=NY_TZ)
+            iso_date = dt_ny.isoformat()
             display_date = date_str
         tags = [str(t) for t in (meta.get("tags") or [])]
         body_html, headings, summary = render_markdown(body, root_prefix="../")
@@ -346,6 +404,7 @@ def load_entries() -> list[Entry]:
                 slug=path.stem,
                 title=title,
                 date=date_str,
+                iso_date=iso_date,
                 sort_ts=sort_ts,
                 display_date=display_date,
                 tags=tags,
@@ -436,6 +495,16 @@ def load_models() -> list[dict[str, Any]]:
     return list(data.get("models", []))
 
 
+def load_milestones() -> list[dict[str, Any]]:
+    if not MILESTONES_PATH.exists():
+        return []
+    try:
+        data = yaml.safe_load(MILESTONES_PATH.read_text()) or {}
+        return list(data.get("milestones", []))
+    except Exception:
+        return []
+
+
 def load_status() -> dict[str, Any]:
     if STATUS_PATH.exists():
         try:
@@ -507,6 +576,16 @@ SITE_CSS = r"""/* Freestyle Dev Log — Gelato layout & typography with Coca-Col
   --shadow: 0 8px 28px rgba(80, 50, 40, 0.14);
   --shadow-pill: 0 2px 10px rgba(80, 50, 40, 0.06);
 
+  --chart-ap50: #c8102e;
+  --chart-recall: #2563eb;
+  --chart-track: #efe5dc;
+  --chart-grid: #e3d6ca;
+  --gantt-complete: #2f7a44;
+  --gantt-failed: #c8102e;
+  --gantt-running: #d97706;
+  --active-dot: #d97706;
+  --active-ring: rgba(217, 119, 6, 0.28);
+
   --font-serif: 'Young Serif', Georgia, serif;
   --font-sans: 'Manrope', system-ui, -apple-system, 'Segoe UI', sans-serif;
   --font-mono: 'DM Mono', ui-monospace, 'DejaVu Sans Mono', monospace;
@@ -574,6 +653,16 @@ SITE_CSS = r"""/* Freestyle Dev Log — Gelato layout & typography with Coca-Col
   --backdrop: rgba(20, 18, 24, 0.55);
   --shadow: 0 8px 28px rgba(20, 18, 24, 0.45);
   --shadow-pill: 0 2px 10px rgba(20, 18, 24, 0.3);
+
+  --chart-ap50: #f06474;
+  --chart-recall: #7cb8ff;
+  --chart-track: #322e39;
+  --chart-grid: #524c5c;
+  --gantt-complete: #63cf82;
+  --gantt-failed: #f06474;
+  --gantt-running: #fbbf24;
+  --active-dot: #fbbf24;
+  --active-ring: rgba(251, 191, 36, 0.28);
 }
 
 *, *::before, *::after { box-sizing: border-box; }
@@ -581,7 +670,7 @@ SITE_CSS = r"""/* Freestyle Dev Log — Gelato layout & typography with Coca-Col
 html {
   -webkit-text-size-adjust: 100%;
   text-size-adjust: 100%;
-  scroll-padding-top: calc(var(--topbar-h) + 20px);
+  scroll-padding-top: calc(var(--topbar-h) + 64px);
 }
 
 body {
@@ -594,7 +683,7 @@ body {
   font-weight: 400;
   line-height: 1.65;
   -webkit-font-smoothing: antialiased;
-  overflow-x: hidden;
+  overflow-x: clip;
 }
 
 @media (min-width: 1024px) {
@@ -1725,6 +1814,311 @@ pre.code-slab code {
   place-items: center;
   cursor: pointer;
 }
+
+/* ---------- Home Sticky TOC Chip Row ---------- */
+
+.home-toc {
+  position: sticky;
+  top: calc(var(--topbar-h) + 16px + env(safe-area-inset-top));
+  z-index: 30;
+  margin: 0 0 14px;
+  padding: 5px 6px;
+  border-radius: var(--r-pill);
+  background: var(--surface);
+  box-shadow: var(--shadow-pill);
+  border: 1px solid var(--border);
+  max-width: 100%;
+}
+.home-toc__row {
+  display: flex;
+  align-items: center;
+  gap: 5px;
+  overflow-x: auto;
+  scrollbar-width: none;
+  -ms-overflow-style: none;
+  -webkit-overflow-scrolling: touch;
+}
+.home-toc__row::-webkit-scrollbar { display: none; }
+.home-toc__chip {
+  flex: 0 0 auto;
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  height: 30px;
+  padding: 0 11px;
+  border-radius: var(--r-pill);
+  background: var(--bg-subtle);
+  color: var(--ink);
+  font-size: 12px;
+  font-weight: 700;
+  text-decoration: none;
+  white-space: nowrap;
+  transition: background-color 120ms ease, color 120ms ease;
+}
+.home-toc__chip:hover {
+  background: var(--cola-soft);
+  color: var(--cola-ink);
+  text-decoration: none;
+}
+.home-toc__chip.is-active {
+  background: var(--cola);
+  color: #ffffff;
+}
+.home-toc__chip--ext {
+  background: var(--sky);
+  color: var(--sky-ink);
+}
+@media (min-width: 1024px) {
+  .home-toc { top: calc(var(--topbar-h) + 20px); }
+  .home-toc__row { flex-wrap: wrap; justify-content: flex-start; }
+}
+
+/* ---------- Relative Age & Entry Meta ---------- */
+
+.rel-age {
+  font-size: 11.5px;
+  font-weight: 600;
+  color: var(--ink-muted);
+  font-variant-numeric: tabular-nums;
+}
+.section-head-link {
+  font-size: 12.5px;
+  font-weight: 700;
+  text-decoration: none;
+  color: var(--cola-ink);
+}
+.section-head-link:hover { text-decoration: underline; }
+
+/* ---------- Activity Strip (#now) ---------- */
+
+.activity-grid {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+.activity-item {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+  padding: 10px 12px;
+  border-radius: var(--r-sm);
+  background: var(--bg-subtle);
+  min-width: 0;
+}
+.activity-item__left {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  min-width: 0;
+  flex: 1 1 auto;
+}
+.activity-item__body { min-width: 0; }
+.activity-item__name {
+  font-size: 13.5px;
+  font-weight: 700;
+  color: var(--ink);
+  overflow-wrap: anywhere;
+}
+.activity-item__sub {
+  font-family: var(--font-mono);
+  font-size: 11.5px;
+  color: var(--ink-muted);
+  overflow-wrap: anywhere;
+}
+.live-pulse {
+  width: 9px;
+  height: 9px;
+  border-radius: 999px;
+  background: var(--active-dot);
+  box-shadow: 0 0 0 0 var(--active-ring);
+  flex: none;
+  animation: devlog-pulse 1.8s infinite;
+}
+@keyframes devlog-pulse {
+  0% { box-shadow: 0 0 0 0 var(--active-ring); }
+  70% { box-shadow: 0 0 0 7px transparent; }
+  100% { box-shadow: 0 0 0 0 transparent; }
+}
+@media (prefers-reduced-motion: reduce) {
+  .live-pulse, .milestone-dot__pulse { animation: none !important; }
+}
+
+/* ---------- Milestones Progress & Stepper ---------- */
+
+.milestone-head {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 10px;
+  flex-wrap: wrap;
+  margin-bottom: 10px;
+}
+.milestone-pct {
+  font-family: var(--font-serif);
+  font-size: 26px;
+  line-height: 1;
+  color: var(--cola-ink);
+  font-variant-numeric: tabular-nums;
+}
+.progress-bar {
+  height: 11px;
+  border-radius: var(--r-pill);
+  background: var(--chart-track);
+  overflow: hidden;
+  display: flex;
+  margin-bottom: 16px;
+}
+.progress-bar__done {
+  height: 100%;
+  background: var(--gantt-complete);
+  transition: width 250ms ease;
+}
+.progress-bar__active {
+  height: 100%;
+  background: var(--active-dot);
+  opacity: 0.78;
+}
+.milestone-stepper {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  display: flex;
+  flex-direction: column;
+}
+.milestone-step {
+  position: relative;
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 10px;
+  padding: 6px 0 10px 30px;
+}
+.milestone-step::before {
+  content: '';
+  position: absolute;
+  left: 9px;
+  top: 24px;
+  bottom: -4px;
+  width: 2px;
+  background: var(--border-strong);
+}
+.milestone-step:last-child::before { display: none; }
+.milestone-step--done::before { background: var(--gantt-complete); opacity: 0.45; }
+.milestone-dot {
+  position: absolute;
+  left: 0;
+  top: 6px;
+  width: 20px;
+  height: 20px;
+  border-radius: 999px;
+  display: inline-grid;
+  place-items: center;
+  background: var(--surface);
+  border: 2px solid var(--border-strong);
+  color: var(--ink-muted);
+}
+.milestone-step--done .milestone-dot {
+  background: var(--pistachio);
+  border-color: var(--gantt-complete);
+  color: var(--pistachio-ink);
+}
+.milestone-step--active .milestone-dot {
+  background: var(--butter);
+  border-color: var(--active-dot);
+}
+.milestone-dot__pulse {
+  width: 8px;
+  height: 8px;
+  border-radius: 999px;
+  background: var(--active-dot);
+  animation: devlog-pulse 1.8s infinite;
+}
+.milestone-step--blocked .milestone-dot {
+  background: var(--strawberry);
+  border-color: var(--gantt-failed);
+  color: var(--strawberry-ink);
+}
+.milestone-step__title {
+  font-size: 13.5px;
+  font-weight: 600;
+  line-height: 1.35;
+  color: var(--ink);
+  min-width: 0;
+}
+.milestone-step--todo .milestone-step__title { color: var(--ink-muted); font-weight: 500; }
+
+/* ---------- Charts & Scoreboard ---------- */
+
+.viz-wrap {
+  width: 100%;
+  overflow: hidden;
+}
+.viz-svg {
+  width: 100%;
+  height: auto;
+  display: block;
+}
+.viz-legend {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 8px 14px;
+  font-size: 12px;
+  font-weight: 600;
+  color: var(--ink-muted);
+  margin-bottom: 10px;
+}
+.viz-swatch {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+}
+.viz-swatch__box {
+  width: 10px;
+  height: 10px;
+  border-radius: 3px;
+  display: inline-block;
+  flex: none;
+}
+.exp-cards {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr);
+  gap: 8px;
+  margin-top: 12px;
+}
+@media (min-width: 680px) {
+  .exp-cards { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+}
+.exp-stat-card {
+  background: var(--bg-subtle);
+  border-radius: var(--r-sm);
+  padding: 10px 12px;
+  font-size: 12.5px;
+}
+.exp-stat-card__top {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 6px;
+  flex-wrap: wrap;
+  margin-bottom: 6px;
+}
+.exp-stat-card__id {
+  font-family: var(--font-mono);
+  font-size: 12px;
+  font-weight: 700;
+  color: var(--ink);
+  overflow-wrap: anywhere;
+}
+.exp-stat-card__kv {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px 12px;
+  color: var(--ink-muted);
+  font-variant-numeric: tabular-nums;
+}
+.exp-stat-card__kv strong { color: var(--ink); }
 """
 
 SITE_JS = r"""(function () {
@@ -1739,6 +2133,24 @@ SITE_JS = r"""(function () {
       setTheme(root.dataset.theme === 'dark' ? 'light' : 'dark');
     });
   }
+
+  // Relative age formatter (updates entries, timeline, and live items)
+  function formatRelAge(ms) {
+    var diff = Math.max(0, Math.floor((Date.now() - ms) / 1000));
+    if (diff < 60) return 'just now';
+    if (diff < 3600) return Math.floor(diff / 60) + ' min ago';
+    if (diff < 86400) return Math.floor(diff / 3600) + ' hr ago';
+    return Math.floor(diff / 86400) + 'd ago';
+  }
+  function updateRelAges() {
+    document.querySelectorAll('[data-rel-ts]').forEach(function (el) {
+      var ts = parseInt(el.getAttribute('data-rel-ts'), 10);
+      if (!isNaN(ts)) el.textContent = formatRelAge(ts);
+    });
+  }
+  window.updateRelAges = updateRelAges;
+  updateRelAges();
+  setInterval(updateRelAges, 60000);
 
   // Mobile drawer
   var panel = document.getElementById('toc-panel');
@@ -1783,22 +2195,28 @@ SITE_JS = r"""(function () {
     });
   }
 
-  // On-page heading spy
-  var onpageLinks = Array.from(document.querySelectorAll('[data-onpage-link]'));
-  if (onpageLinks.length && 'IntersectionObserver' in window) {
-    var map = new Map();
-    onpageLinks.forEach(function (a) { map.set(a.dataset.onpageLink, a); });
+  // On-page heading spy + Home TOC chip spy
+  var spyLinks = Array.from(document.querySelectorAll('[data-onpage-link], [data-home-toc]'));
+  if (spyLinks.length && 'IntersectionObserver' in window) {
+    var byId = new Map();
+    spyLinks.forEach(function (a) {
+      var id = a.dataset.onpageLink || a.dataset.homeToc;
+      if (!byId.has(id)) byId.set(id, []);
+      byId.get(id).push(a);
+    });
     var obs = new IntersectionObserver(function (entries) {
       entries.forEach(function (ent) {
         if (ent.isIntersecting) {
-          onpageLinks.forEach(function (a) { a.classList.remove('is-active'); });
-          var active = map.get(ent.target.id);
-          if (active) active.classList.add('is-active');
+          var id = ent.target.id;
+          spyLinks.forEach(function (a) {
+            var targetId = a.dataset.onpageLink || a.dataset.homeToc;
+            a.classList.toggle('is-active', targetId === id);
+          });
         }
       });
-    }, { rootMargin: '-15% 0px -70% 0px' });
-    onpageLinks.forEach(function (a) {
-      var target = document.getElementById(a.dataset.onpageLink);
+    }, { rootMargin: '-18% 0px -68% 0px' });
+    byId.forEach(function (_links, id) {
+      var target = document.getElementById(id);
       if (target) obs.observe(target);
     });
   }
@@ -1845,6 +2263,7 @@ def render_shell(
     full_title = f"{title} · Freestyle Dev Log" if title != "Home" else "Freestyle Dev Log"
     nav_items = [
         ("home", "Overview & Live", f"{root_prefix}index.html", "home"),
+        ("entries", "All Entries", f"{root_prefix}entries/index.html", "book"),
         ("models", "Model Catalogue", f"{root_prefix}models.html", "cpu"),
         ("code", "Code Tour", f"{root_prefix}code.html", "code"),
         ("timeline", "Timeline", f"{root_prefix}timeline.html", "clock"),
@@ -1992,8 +2411,492 @@ def render_shell(
 # ---------------------------------------------------------------------------
 
 
+def _render_activity_strip_html(status: dict[str, Any]) -> tuple[str, str]:
+    """Render running pi workers, active k8s GPU jobs, and active external agents."""
+    pi = status.get("pi_workers", {})
+    k8s = status.get("k8s", {})
+    ext = status.get("external_agents", {})
+
+    workers = pi.get("workers", []) or []
+    running_workers = [w for w in workers if w.get("state") == "running"]
+    counts = pi.get("counts") or {
+        "running": len(running_workers),
+        "done": sum(1 for w in workers if w.get("state") == "done"),
+        "dead": sum(1 for w in workers if w.get("state") == "dead"),
+    }
+    summary_label = f"{counts.get('running', 0)} running · {counts.get('done', 0)} done · {counts.get('dead', 0)} dead"
+
+    items: list[str] = []
+    for w in running_workers:
+        items.append(
+            '<div class="activity-item">'
+            '<div class="activity-item__left">'
+            '<span class="live-pulse" aria-hidden="true"></span>'
+            '<div class="activity-item__body">'
+            f'<div class="activity-item__name">pi worker · {html.escape(str(w.get("slug", "")))}</div>'
+            f'<div class="activity-item__sub">running {html.escape(str(w.get("age", "-")))} · idle {html.escape(str(w.get("idle", "-")))} · sess {html.escape(str(w.get("session", "-")))}</div>'
+            "</div></div>"
+            f'{_pill(str(w.get("age", "running")), "warn")}</div>'
+        )
+
+    for j in k8s.get("jobs", []) or []:
+        if j.get("phase") == "Running":
+            node = j.get("node") or "-"
+            items.append(
+                '<div class="activity-item">'
+                '<div class="activity-item__left">'
+                '<span class="live-pulse" aria-hidden="true"></span>'
+                '<div class="activity-item__body">'
+                f'<div class="activity-item__name">k8s job · {html.escape(str(j.get("name", "")))}</div>'
+                f'<div class="activity-item__sub">gpu {html.escape(str(j.get("gpu", "-")))} · node {html.escape(str(node))} · running {html.escape(str(j.get("duration", "-")))}</div>'
+                "</div></div>"
+                f'{_pill(str(j.get("duration", "running")), "warn")}</div>'
+            )
+
+    for a in ext.get("latest_by_agent", []) or []:
+        if a.get("size_bytes") == 0 and a.get("mtime"):
+            try:
+                dt = datetime.fromisoformat(str(a["mtime"]).replace("Z", "+00:00"))
+                ts = dt.timestamp()
+                rel = _rel_age_html(ts, dt.astimezone(NY_TZ).isoformat())
+                dur_txt = _format_duration_short(time.time() - ts)
+            except Exception:
+                rel = ""
+                dur_txt = "active"
+            items.append(
+                '<div class="activity-item">'
+                '<div class="activity-item__left">'
+                '<span class="live-pulse" aria-hidden="true"></span>'
+                '<div class="activity-item__body">'
+                f'<div class="activity-item__name">agent · {html.escape(str(a.get("agent", "")))} · <code>{html.escape(str(a.get("file", "")))}</code></div>'
+                f'<div class="activity-item__sub">started {rel}</div>'
+                "</div></div>"
+                f'{_pill(dur_txt, "sky")}</div>'
+            )
+
+    if not items:
+        body_html = '<p class="card__sub" style="margin:0;">No pi workers, external agents, or GPU jobs running right now.</p>'
+    else:
+        body_html = f'<div class="activity-grid">{"".join(items)}</div>'
+    return body_html, summary_label
+
+
+def _render_milestones_section(milestones: list[dict[str, Any]]) -> tuple[str, dict[str, int]]:
+    total = len(milestones)
+    done_n = sum(1 for m in milestones if m.get("status") == "done")
+    active_n = sum(1 for m in milestones if m.get("status") == "active")
+    blocked_n = sum(1 for m in milestones if m.get("status") == "blocked")
+    score = sum(
+        1.0 if m.get("status") == "done" else (0.5 if m.get("status") == "active" else 0.0)
+        for m in milestones
+    )
+    pct = round((score / total) * 100) if total else 0
+    done_pct = (done_n / total) * 100 if total else 0.0
+    active_pct = (active_n * 0.5 / total) * 100 if total else 0.0
+
+    steps_html: list[str] = []
+    for m in milestones:
+        st = str(m.get("status") or "todo").lower()
+        if st not in ("done", "active", "todo", "blocked"):
+            st = "todo"
+        if st == "done":
+            marker = icon_svg("check", 11)
+            badge = _pill("done", "ok")
+        elif st == "active":
+            marker = '<span class="milestone-dot__pulse" aria-hidden="true"></span>'
+            badge = _pill("active", "warn")
+        elif st == "blocked":
+            marker = icon_svg("x", 11)
+            badge = _pill("blocked", "bad")
+        else:
+            marker = ""
+            badge = _pill("todo", "neutral")
+
+        steps_html.append(
+            f'<li class="milestone-step milestone-step--{st}">'
+            f'<span class="milestone-dot" aria-hidden="true">{marker}</span>'
+            f'<span class="milestone-step__title">{html.escape(str(m.get("title", m.get("id", ""))))}</span>'
+            f"{badge}</li>"
+        )
+
+    pills = [_pill(f"{active_n} active", "warn")] if active_n else []
+    if blocked_n:
+        pills.append(_pill(f"{blocked_n} blocked", "bad"))
+
+    card_html = (
+        '<section class="card milestone-card" aria-labelledby="progress">'
+        '<div class="milestone-head">'
+        '<div style="display:flex;align-items:center;gap:8px;flex-wrap:wrap;">'
+        f'<strong style="font-size:15px;">{done_n} of {total} milestones</strong>'
+        f'{"".join(pills)}'
+        "</div>"
+        f'<span class="milestone-pct">{pct}%</span>'
+        "</div>"
+        f'<div class="progress-bar" role="progressbar" aria-valuenow="{pct}" aria-valuemin="0" aria-valuemax="100" aria-label="Overall milestone progress">'
+        f'<span class="progress-bar__done" style="width:{done_pct:.2f}%"></span>'
+        f'<span class="progress-bar__active" style="width:{active_pct:.2f}%"></span>'
+        "</div>"
+        f'<ol class="milestone-stepper">{"".join(steps_html)}</ol>'
+        "</section>"
+    )
+    return card_html, {"total": total, "done": done_n, "active": active_n, "blocked": blocked_n, "pct": pct}
+
+
+def _fmt_gpu_mem(m: dict[str, Any]) -> str:
+    mib = m.get("peak_gpu_mib")
+    if isinstance(mib, (int, float)) and mib > 0:
+        if mib >= 1024:
+            return f"{mib / 1024:.2f} GiB ({int(mib):,} MiB)"
+        return f"{int(mib):,} MiB"
+    smi = m.get("nvidia_smi_mib")
+    if isinstance(smi, (int, float)) and smi > 0:
+        return f"{int(smi):,} MiB (smi)"
+    return "-"
+
+
+def _render_experiments_scoreboard(status: dict[str, Any]) -> str:
+    exps = status.get("experiments", {})
+    raw_runs = exps.get("metrics_runs", []) or []
+    runs: list[dict[str, Any]] = []
+    for r in raw_runs:
+        if "error" in r:
+            continue
+        rid = str(r.get("id", "")).lower()
+        rdir = str(r.get("dir", "")).lower()
+        if "chain_check" in rid or "chain-check" in rid or "chain_check" in rdir or "chain-check" in rdir:
+            continue
+        runs.append(r)
+
+    if not runs:
+        return '<section class="card"><p class="card__sub" style="margin:0;">No scored experiment runs yet (chain-check runs excluded).</p></section>'
+
+    runs.sort(key=lambda r: (r.get("ap50") if isinstance(r.get("ap50"), (int, float)) else -1.0), reverse=True)
+
+    svg_w = 360
+    chart_x = 52
+    chart_w = 252
+    top_pad = 24
+    row_h = 74
+    bottom_pad = 14
+    svg_h = top_pad + len(runs) * row_h + bottom_pad
+
+    svg_parts: list[str] = [
+        f'<svg class="viz-svg" viewBox="0 0 {svg_w} {svg_h}" role="img" aria-label="Experiment AP50 and Recall horizontal bar chart">'
+    ]
+
+    # Axis ticks & vertical gridlines
+    for frac in (0.0, 0.25, 0.5, 0.75, 1.0):
+        gx = chart_x + frac * chart_w
+        svg_parts.append(
+            f'<line x1="{gx:.1f}" y1="{top_pad - 4}" x2="{gx:.1f}" y2="{svg_h - bottom_pad}" '
+            f'stroke="var(--chart-grid)" stroke-width="1" stroke-dasharray="2,3" />'
+        )
+        svg_parts.append(
+            f'<text x="{gx:.1f}" y="14" text-anchor="middle" font-size="9.5" font-weight="700" fill="var(--ink-muted)">{frac:.2f}</text>'
+        )
+
+    for idx, r in enumerate(runs):
+        y0 = top_pad + idx * row_h
+        exp_id = str(r.get("id", "run"))
+        ap50 = r.get("ap50") if isinstance(r.get("ap50"), (int, float)) else None
+        recall = r.get("recall") if isinstance(r.get("recall"), (int, float)) else None
+        gt_kind = r.get("gt_kind") or "model_labels"
+        gt_badge = r.get("gt_badge") or ("vs human GT" if gt_kind == "human" else "vs model labels (not GT)")
+        badge_bg = "var(--pistachio)" if gt_kind == "human" else "var(--butter)"
+        badge_fg = "var(--pistachio-ink)" if gt_kind == "human" else "var(--butter-ink)"
+
+        mem_str = _fmt_gpu_mem(r)
+        wall_str = r.get("wall_duration") or "-"
+        meta_line = f"Peak GPU: {mem_str} · Wall: {wall_str}"
+
+        # Badge pill in SVG top-right of row
+        badge_w = min(156, max(78, len(gt_badge) * 5.6 + 18))
+        badge_x = svg_w - 6 - badge_w
+        svg_parts.append(
+            f'<text x="6" y="{y0 + 13}" font-size="11.5" font-weight="700" fill="var(--ink)">{html.escape(exp_id[:26])}</text>'
+        )
+        svg_parts.append(
+            f'<rect x="{badge_x:.1f}" y="{y0 + 2}" width="{badge_w:.1f}" height="15" rx="7.5" fill="{badge_bg}" />'
+            f'<text x="{badge_x + badge_w / 2:.1f}" y="{y0 + 12.5}" text-anchor="middle" font-size="8.5" font-weight="800" fill="{badge_fg}">{html.escape(gt_badge)}</text>'
+        )
+        svg_parts.append(
+            f'<text x="6" y="{y0 + 27}" font-size="9.5" font-weight="600" fill="var(--ink-muted)">{html.escape(meta_line)}</text>'
+        )
+
+        # AP50 bar
+        ap_w = max(2.0, min(1.0, ap50) * chart_w) if ap50 is not None else 0.0
+        ap_txt = f"{ap50:.3f}" if ap50 is not None else "-"
+        svg_parts.append(
+            f'<text x="6" y="{y0 + 42}" font-size="10" font-weight="700" fill="var(--ink-muted)">AP50</text>'
+            f'<rect x="{chart_x}" y="{y0 + 33}" width="{chart_w}" height="11" rx="5.5" fill="var(--chart-track)" />'
+        )
+        if ap_w > 0:
+            svg_parts.append(
+                f'<rect x="{chart_x}" y="{y0 + 33}" width="{ap_w:.1f}" height="11" rx="5.5" fill="var(--chart-ap50)" />'
+            )
+        svg_parts.append(
+            f'<text x="{chart_x + chart_w + 6}" y="{y0 + 42}" font-size="10.5" font-weight="700" fill="var(--ink)">{ap_txt}</text>'
+        )
+
+        # Recall bar
+        rec_w = max(2.0, min(1.0, recall) * chart_w) if recall is not None else 0.0
+        rec_txt = f"{recall:.3f}" if recall is not None else "-"
+        svg_parts.append(
+            f'<text x="6" y="{y0 + 58}" font-size="10" font-weight="700" fill="var(--ink-muted)">Recall</text>'
+            f'<rect x="{chart_x}" y="{y0 + 49}" width="{chart_w}" height="11" rx="5.5" fill="var(--chart-track)" />'
+        )
+        if rec_w > 0:
+            svg_parts.append(
+                f'<rect x="{chart_x}" y="{y0 + 49}" width="{rec_w:.1f}" height="11" rx="5.5" fill="var(--chart-recall)" />'
+            )
+        svg_parts.append(
+            f'<text x="{chart_x + chart_w + 6}" y="{y0 + 58}" font-size="10.5" font-weight="700" fill="var(--ink)">{rec_txt}</text>'
+        )
+
+        if idx + 1 < len(runs):
+            svg_parts.append(
+                f'<line x1="6" y1="{y0 + row_h - 4}" x2="{svg_w - 6}" y2="{y0 + row_h - 4}" stroke="var(--border)" stroke-width="1" />'
+            )
+
+    svg_parts.append("</svg>")
+
+    detail_cards: list[str] = []
+    for r in runs:
+        gt_kind = r.get("gt_kind") or "model_labels"
+        gt_badge = r.get("gt_badge") or ("vs human GT" if gt_kind == "human" else "vs model labels (not GT)")
+        gt_tone = "ok" if gt_kind == "human" else "warn"
+        ap50_s = f"{r['ap50']:.3f}" if isinstance(r.get("ap50"), (int, float)) else "-"
+        rec_s = f"{r['recall']:.3f}" if isinstance(r.get("recall"), (int, float)) else "-"
+        prec_s = f"{r['precision']:.3f}" if isinstance(r.get("precision"), (int, float)) else "-"
+        f1_s = f"{r['f1']:.3f}" if isinstance(r.get("f1"), (int, float)) else "-"
+        top1_s = f"{r['top1_acc']:.3f}" if isinstance(r.get("top1_acc"), (int, float)) else "-"
+        mae_s = f"{r['total_count_mae']:.2f}" if isinstance(r.get("total_count_mae"), (int, float)) else "-"
+        mem_s = _fmt_gpu_mem(r)
+        wall_s = r.get("wall_duration") or "-"
+        detail_cards.append(
+            '<div class="exp-stat-card">'
+            '<div class="exp-stat-card__top">'
+            f'<span class="exp-stat-card__id">{html.escape(str(r.get("id", "")))}</span>'
+            f'{_pill(gt_badge, gt_tone)}'
+            "</div>"
+            '<div class="exp-stat-card__kv">'
+            f'<span>AP50 <strong>{ap50_s}</strong></span>'
+            f'<span>Recall <strong>{rec_s}</strong></span>'
+            f'<span>Prec <strong>{prec_s}</strong></span>'
+            f'<span>F1 <strong>{f1_s}</strong></span>'
+            f'<span>Top-1 <strong>{top1_s}</strong></span>'
+            f'<span>MAE <strong>{mae_s}</strong></span>'
+            f'<span>Peak GPU <strong>{html.escape(mem_s)}</strong></span>'
+            f'<span>Wall <strong>{html.escape(wall_s)}</strong></span>'
+            "</div>"
+            "</div>"
+        )
+
+    return (
+        '<section class="card" aria-labelledby="experiments">'
+        '<div class="viz-legend">'
+        '<span class="viz-swatch"><span class="viz-swatch__box" style="background:var(--chart-ap50);"></span>AP50</span>'
+        '<span class="viz-swatch"><span class="viz-swatch__box" style="background:var(--chart-recall);"></span>Recall</span>'
+        '<span class="tag-pill tag-pill--warn">Model labels ≠ human GT</span>'
+        "</div>"
+        f'<div class="viz-wrap">{"".join(svg_parts)}</div>'
+        f'<div class="exp-cards">{"".join(detail_cards)}</div>'
+        "</section>"
+    )
+
+
+def _shorten_job_name(name: str, limit: int = 24) -> str:
+    if len(name) <= limit:
+        return name
+    parts = name.rsplit("-", 1)
+    if len(parts) == 2 and len(parts[1]) == 8:
+        keep = max(8, limit - 10)
+        return f"{parts[0][:keep]}…{parts[1]}"
+    return name[: limit - 1] + "…"
+
+
+def _render_jobs_gantt(status: dict[str, Any]) -> str:
+    k8s = status.get("k8s", {})
+    if not k8s.get("ok"):
+        return f'<section class="card"><p class="card__sub" style="margin:0;">Kubernetes unavailable: {html.escape(str(k8s.get("error", "no data")))}</p></section>'
+
+    now_ts = time.time()
+    parsed: list[dict[str, Any]] = []
+    for j in k8s.get("jobs", []) or []:
+        s_raw = j.get("start_time")
+        if not s_raw:
+            continue
+        try:
+            s_dt = datetime.fromisoformat(str(s_raw).replace("Z", "+00:00"))
+        except ValueError:
+            continue
+        e_raw = j.get("end_time") or j.get("completion_time")
+        if e_raw:
+            try:
+                e_dt = datetime.fromisoformat(str(e_raw).replace("Z", "+00:00"))
+            except ValueError:
+                e_dt = datetime.fromtimestamp(now_ts, tz=timezone.utc)
+        else:
+            e_dt = datetime.fromtimestamp(now_ts, tz=timezone.utc)
+        s_ts = s_dt.timestamp()
+        e_ts = max(s_ts + 1.0, e_dt.timestamp())
+        parsed.append(
+            {
+                "name": str(j.get("name", "job")),
+                "gpu": str(j.get("gpu", "-")),
+                "node": str(j.get("node", "-")),
+                "phase": str(j.get("phase", "Pending")),
+                "duration": str(j.get("duration", "-")),
+                "start_ts": s_ts,
+                "end_ts": e_ts,
+                "is_running": j.get("phase") == "Running",
+            }
+        )
+
+    if not parsed:
+        return '<section class="card"><p class="card__sub" style="margin:0;">No vision-intern Kubernetes jobs recorded.</p></section>'
+
+    parsed.sort(key=lambda x: (x["start_ts"], x["name"]))
+
+    # Merge overlapping intervals into clusters so large idle gaps (>20m) compress cleanly
+    gap_threshold = 20 * 60.0
+    clusters: list[list[float]] = []
+    for item in parsed:
+        if not clusters or item["start_ts"] > clusters[-1][1] + gap_threshold:
+            clusters.append([item["start_ts"], item["end_ts"]])
+        else:
+            clusters[-1][1] = max(clusters[-1][1], item["end_ts"])
+
+    for c in clusters:
+        span = max(30.0, c[1] - c[0])
+        pad = max(10.0, span * 0.04)
+        c[0] -= pad
+        c[1] += pad
+
+    axis_x0 = 8.0
+    axis_x1 = 352.0
+    axis_w = axis_x1 - axis_x0
+    gap_px = 24.0 if len(clusters) > 1 else 0.0
+    usable_w = axis_w - gap_px * max(0, len(clusters) - 1)
+    raw_durs = [max(30.0, c[1] - c[0]) for c in clusters]
+    total_raw = sum(raw_durs)
+    eff_durs = [max(d, total_raw * 0.14) for d in raw_durs] if len(clusters) > 1 else raw_durs
+    total_eff = sum(eff_durs)
+
+    cluster_ranges: list[tuple[float, float, float, float]] = []
+    cursor_x = axis_x0
+    for c, eff_d in zip(clusters, eff_durs):
+        cw = usable_w * (eff_d / total_eff)
+        cluster_ranges.append((c[0], c[1], cursor_x, cursor_x + cw))
+        cursor_x += cw + gap_px
+
+    def map_x(ts: float) -> float:
+        for cs, ce, x0, x1 in cluster_ranges:
+            if ts <= ce or (cs, ce, x0, x1) == cluster_ranges[-1]:
+                ratio = (ts - cs) / max(1.0, ce - cs)
+                return x0 + max(0.0, min(1.0, ratio)) * (x1 - x0)
+        return axis_x1
+
+    svg_w = 360
+    top_axis_y = 26
+    row_h = 35
+    bottom_pad = 10
+    svg_h = top_axis_y + len(parsed) * row_h + bottom_pad
+
+    svg_parts: list[str] = [
+        f'<svg class="viz-svg" viewBox="0 0 {svg_w} {svg_h}" role="img" aria-label="GPU jobs Gantt timeline">'
+    ]
+
+    # Axis tick marks per cluster + gap break markers (avoid label collisions)
+    last_label_x = -999.0
+    break_xs = [x1 + gap_px / 2.0 for _, _, _, x1 in cluster_ranges[:-1]]
+    for idx, (cs, ce, x0, x1) in enumerate(cluster_ranges):
+        if x1 - x0 >= 120:
+            ticks = [cs, (cs + ce) / 2.0, ce]
+        elif x1 - x0 >= 65:
+            ticks = [cs, ce]
+        else:
+            ticks = [cs]
+        for ti, t_val in enumerate(ticks):
+            tx = map_x(t_val)
+            dt_ny = datetime.fromtimestamp(t_val, tz=NY_TZ)
+            t_lbl = dt_ny.strftime("%I:%M %p").lstrip("0")
+            anchor = "start" if (idx == 0 and ti == 0) else ("end" if (idx == len(cluster_ranges) - 1 and ti == len(ticks) - 1) else "middle")
+            svg_parts.append(
+                f'<line x1="{tx:.1f}" y1="{top_axis_y - 4}" x2="{tx:.1f}" y2="{svg_h - bottom_pad}" stroke="var(--chart-grid)" stroke-width="1" stroke-dasharray="2,3" />'
+            )
+            near_break = any(abs(tx - bx) < 28.0 for bx in break_xs)
+            if tx - last_label_x >= 48.0 and not near_break:
+                svg_parts.append(
+                    f'<text x="{tx:.1f}" y="14" text-anchor="{anchor}" font-size="9" font-weight="700" fill="var(--ink-muted)">{html.escape(t_lbl)}</text>'
+                )
+                last_label_x = tx
+            elif idx > 0 and ti == 0 and x1 - x0 >= 80:
+                # Shift first tick of post-break cluster slightly right so it clears '//'
+                lbl_x = max(tx + 18.0, last_label_x + 48.0)
+                if lbl_x <= x1 - 36.0:
+                    svg_parts.append(
+                        f'<text x="{lbl_x:.1f}" y="14" text-anchor="start" font-size="9" font-weight="700" fill="var(--ink-muted)">{html.escape(t_lbl)}</text>'
+                    )
+                    last_label_x = lbl_x + 18.0
+        if idx + 1 < len(cluster_ranges):
+            bx = x1 + gap_px / 2.0
+            svg_parts.append(
+                f'<line x1="{bx:.1f}" y1="{top_axis_y - 4}" x2="{bx:.1f}" y2="{svg_h - bottom_pad}" stroke="var(--border-strong)" stroke-width="1.2" stroke-dasharray="4,3" />'
+                f'<text x="{bx:.1f}" y="14" text-anchor="middle" font-size="9.5" font-weight="800" fill="var(--ink-muted)">//</text>'
+            )
+            last_label_x = max(last_label_x, bx)
+
+    for idx, j in enumerate(parsed):
+        y0 = top_axis_y + idx * row_h
+        x_start = map_x(j["start_ts"])
+        x_end = map_x(j["end_ts"])
+        bar_w = max(4.0, x_end - x_start)
+        phase = j["phase"]
+        fill = (
+            "var(--gantt-complete)"
+            if phase == "Complete"
+            else ("var(--gantt-failed)" if phase == "Failed" else ("var(--gantt-running)" if phase == "Running" else "var(--ink-muted)"))
+        )
+        short_name = _shorten_job_name(j["name"], 24)
+        node_short = j["node"].replace("talos-", "") if j["node"] != "-" else "-"
+        meta_right = f"{j['gpu']} · {node_short} · {j['duration']}"
+        s_ny = _format_ny_datetime(datetime.fromtimestamp(j["start_ts"], tz=NY_TZ))
+        e_ny = "now" if j["is_running"] else _format_ny_datetime(datetime.fromtimestamp(j["end_ts"], tz=NY_TZ))
+        tooltip = f"{j['name']} | {phase} | GPU {j['gpu']} ({j['node']}) | {s_ny} → {e_ny} ({j['duration']})"
+
+        svg_parts.append(f"<g><title>{html.escape(tooltip)}</title>")
+        svg_parts.append(
+            f'<text x="{axis_x0}" y="{y0 + 11}" font-size="10" font-weight="700" fill="var(--ink)">{html.escape(short_name)}</text>'
+            f'<text x="{axis_x1}" y="{y0 + 11}" text-anchor="end" font-size="9.5" font-weight="600" fill="var(--ink-muted)">{html.escape(meta_right)}</text>'
+        )
+        svg_parts.append(
+            f'<rect x="{axis_x0}" y="{y0 + 16}" width="{axis_w}" height="11" rx="4" fill="var(--chart-track)" />'
+            f'<rect x="{x_start:.1f}" y="{y0 + 16}" width="{bar_w:.1f}" height="11" rx="4" fill="{fill}" />'
+        )
+        if j["is_running"]:
+            cx = min(axis_x1 - 3, x_start + bar_w)
+            svg_parts.append(
+                f'<circle cx="{cx:.1f}" cy="{y0 + 21.5}" r="3.5" fill="var(--gantt-running)" stroke="var(--surface)" stroke-width="1.5" />'
+            )
+        svg_parts.append("</g>")
+
+    svg_parts.append("</svg>")
+
+    return (
+        '<section class="card" aria-labelledby="jobs-timeline">'
+        '<div class="viz-legend">'
+        '<span class="viz-swatch"><span class="viz-swatch__box" style="background:var(--gantt-complete);"></span>Complete</span>'
+        '<span class="viz-swatch"><span class="viz-swatch__box" style="background:var(--gantt-failed);"></span>Failed</span>'
+        '<span class="viz-swatch"><span class="viz-swatch__box" style="background:var(--gantt-running);"></span>Running</span>'
+        '<span class="tag-pill">America/New_York</span>'
+        "</div>"
+        f'<div class="viz-wrap">{"".join(svg_parts)}</div>'
+        "</section>"
+    )
+
+
 def _render_status_fragments(status: dict[str, Any]) -> dict[str, Any]:
-    """Compute initial HTML & summary values for the live status panel."""
     pi = status.get("pi_workers", {})
     ext = status.get("external_agents", {})
     k8s = status.get("k8s", {})
@@ -2171,14 +3074,10 @@ def _render_status_fragments(status: dict[str, Any]) -> dict[str, Any]:
     }
 
 
-def build_index(entries: list[Entry], models: list[dict[str, Any]], code_tour: dict[str, Any], status: dict[str, Any]) -> str:
-    frags = _render_status_fragments(status)
-    live_text = f"{frags['running_count']} running" if frags["running_count"] else frags["test_badge"]
-    badge_tone = "warn" if frags["running_count"] else ("ok" if frags["test_ok"] else "bad")
-
-    entries_cards = "".join(
-        f'<a class="entry-card" href="entries/{e.slug}.html">'
-        f'<div class="entry-card__meta"><span>{html.escape(e.display_date)}</span><span>·</span><span>{e.reading_min} min read</span></div>'
+def _entry_cards_html(entries: list[Entry], href_prefix: str = "entries/") -> str:
+    return "".join(
+        f'<a class="entry-card" href="{href_prefix}{e.slug}.html">'
+        f'<div class="entry-card__meta"><span>{html.escape(e.display_date)}</span><span>·</span>{_rel_age_html(e.sort_ts, e.iso_date)}<span>·</span><span>{e.reading_min} min read</span></div>'
         f'<h3 class="entry-card__title">{html.escape(e.title)}</h3>'
         f'<p class="entry-card__summary">{html.escape(e.summary[:240])}{"…" if len(e.summary) > 240 else ""}</p>'
         f'<div class="pill-row">{"".join(_pill(t, "cola") for t in e.tags)}</div>'
@@ -2186,12 +3085,43 @@ def build_index(entries: list[Entry], models: list[dict[str, Any]], code_tour: d
         for e in entries
     )
 
+
+def build_index(
+    entries: list[Entry],
+    models: list[dict[str, Any]],
+    code_tour: dict[str, Any],
+    milestones: list[dict[str, Any]],
+    status: dict[str, Any],
+) -> str:
+    frags = _render_status_fragments(status)
+    live_text = f"{frags['running_count']} running" if frags["running_count"] else frags["test_badge"]
+    badge_tone = "warn" if frags["running_count"] else ("ok" if frags["test_ok"] else "bad")
+
+    activity_html, activity_summary = _render_activity_strip_html(status)
+    milestones_html, ms_stats = _render_milestones_section(milestones)
+    experiments_html = _render_experiments_scoreboard(status)
+    jobs_gantt_html = _render_jobs_gantt(status)
+    entries_cards = _entry_cards_html(entries, href_prefix="entries/")
+
     main_html = f"""
+<nav class="home-toc" aria-label="Jump to section">
+  <div class="home-toc__row">
+    <a class="home-toc__chip" href="#now" data-home-toc="now">Now</a>
+    <a class="home-toc__chip" href="#progress" data-home-toc="progress">Progress</a>
+    <a class="home-toc__chip" href="#latest-entries" data-home-toc="latest-entries">Latest entries</a>
+    <a class="home-toc__chip" href="#experiments" data-home-toc="experiments">Experiments</a>
+    <a class="home-toc__chip" href="#jobs-timeline" data-home-toc="jobs-timeline">Jobs timeline</a>
+    <a class="home-toc__chip home-toc__chip--ext" href="models.html">Models</a>
+    <a class="home-toc__chip home-toc__chip--ext" href="code.html">Code</a>
+  </div>
+</nav>
+
 <header class="home-head">
   <p class="home-head__eyebrow">Coca-Cola Freestyle · Computer Vision Project Log</p>
   <h1 class="home-head__title">Freestyle Cartridge Recognition</h1>
   <p class="home-head__lede">Live progress from the workstation &amp; home GPU cluster: what we tried, model benchmarks, Python pipeline internals, and real-time worker/job telemetry.</p>
   <ul class="home-head__stats">
+    <li class="home-head__stat">{ms_stats['done']}/{ms_stats['total']} milestones ({ms_stats['pct']}%)</li>
     <li class="home-head__stat">{len(entries)} entries</li>
     <li class="home-head__stat">{len(models)} models</li>
     <li class="home-head__stat">{len(code_tour.get('stops', []))} code stops</li>
@@ -2213,19 +3143,40 @@ def build_index(entries: list[Entry], models: list[dict[str, Any]], code_tour: d
   </div>
 </header>
 
-<h2 id="latest-entries">Latest Entries</h2>
-<div class="card-grid">
-  {entries_cards}
-</div>
-
 <div class="section-bar">
-  <h2 id="live-status">Live Cluster &amp; Worker Status</h2>
+  <h2 id="now">Now · Worker &amp; Agent Activity</h2>
   <div style="display:flex;align-items:center;gap:8px;flex-wrap:wrap;">
     <span class="tag-pill" id="status-updated">Updated: {html.escape(status.get('local_timestamp', '-'))}</span>
     <button type="button" class="btn-pill" id="refresh-status-btn">{icon_svg("refresh", 14)} Refresh</button>
   </div>
 </div>
 
+<section class="card activity-strip-card" aria-labelledby="card-activity">
+  <div class="card__head">
+    <h3 id="card-activity" class="card__title">Active Workers, Agents &amp; Jobs</h3>
+    <span class="tag-pill" id="activity-summary">{html.escape(activity_summary)}</span>
+  </div>
+  <div id="live-activity-strip">{activity_html}</div>
+</section>
+
+<h2 id="progress">Progress</h2>
+{milestones_html}
+
+<div class="section-bar">
+  <h2 id="latest-entries">Latest Entries</h2>
+  <a class="section-head-link" href="entries/index.html">Entries index →</a>
+</div>
+<div class="card-grid">
+  {entries_cards}
+</div>
+
+<h2 id="experiments">Experiments</h2>
+{experiments_html}
+
+<h2 id="jobs-timeline">Jobs Timeline</h2>
+{jobs_gantt_html}
+
+<h2 id="live-status">Cluster &amp; Worker Details</h2>
 <div class="card-grid card-grid--2">
   <section class="card" aria-labelledby="card-gpus">
     <div class="card__head">
@@ -2263,7 +3214,7 @@ def build_index(entries: list[Entry], models: list[dict[str, Any]], code_tour: d
 <div class="card-grid card-grid--2">
   <section class="card" aria-labelledby="card-exps">
     <div class="card__head">
-      <h3 id="card-exps" class="card__title">Experiments &amp; Probes</h3>
+      <h3 id="card-exps" class="card__title">Runs &amp; Probes</h3>
       <span class="tag-pill">runs/</span>
     </div>
     <div id="live-exps">{frags['exp_html']}</div>
@@ -2281,12 +3232,12 @@ def build_index(entries: list[Entry], models: list[dict[str, Any]], code_tour: d
 
 <h2 id="explore">Explore Reference</h2>
 <div class="card-grid card-grid--2">
-  <a class="entry-card" href="models.html">
+  <a class="entry-card" id="models" href="models.html">
     <div class="entry-card__meta"><span>{len(models)} models compared</span></div>
     <h3 class="entry-card__title">Model Catalogue</h3>
     <p class="entry-card__summary">Parameter counts, release dates, licences, input resolutions, and why people reach for each detector, embedder, VLM, and OCR model.</p>
   </a>
-  <a class="entry-card" href="code.html">
+  <a class="entry-card" id="code" href="code.html">
     <div class="entry-card__meta"><span>{len(code_tour.get('stops', []))} AST-extracted stops</span></div>
     <h3 class="entry-card__title">Python Code Tour</h3>
     <p class="entry-card__summary">Walk through the actual tiling, VLM labelling/judging, kNN crop identification, counting metrics, and k8s launcher code.</p>
@@ -2295,9 +3246,13 @@ def build_index(entries: list[Entry], models: list[dict[str, Any]], code_tour: d
 """
 
     on_page = [
+        {"depth": 2, "slug": "now", "text": "Now"},
+        {"depth": 2, "slug": "progress", "text": "Progress"},
         {"depth": 2, "slug": "latest-entries", "text": "Latest Entries"},
-        {"depth": 2, "slug": "live-status", "text": "Live Cluster & Worker Status"},
-        {"depth": 2, "slug": "explore", "text": "Explore Reference"},
+        {"depth": 2, "slug": "experiments", "text": "Experiments"},
+        {"depth": 2, "slug": "jobs-timeline", "text": "Jobs Timeline"},
+        {"depth": 2, "slug": "live-status", "text": "Cluster Details"},
+        {"depth": 2, "slug": "explore", "text": "Models & Code"},
     ]
 
     refresher_js = r"""<script>
@@ -2317,6 +3272,14 @@ def build_index(entries: list[Entry], models: list[dict[str, Any]], code_tour: d
     var cls = t === 'neutral' ? 'tag-pill' : 'tag-pill tag-pill--' + t;
     return '<span class="' + cls + '">' + esc(txt) + '</span>';
   }
+  function relAgeHtml(iso) {
+    if (!iso) return '';
+    var ms = Date.parse(iso);
+    if (isNaN(ms)) return '';
+    var diff = Math.max(0, Math.floor((Date.now() - ms) / 1000));
+    var txt = diff < 60 ? 'just now' : (diff < 3600 ? Math.floor(diff / 60) + ' min ago' : (diff < 86400 ? Math.floor(diff / 3600) + ' hr ago' : Math.floor(diff / 86400) + 'd ago'));
+    return '<time class="rel-age" datetime="' + esc(iso) + '" data-rel-ts="' + ms + '">' + esc(txt) + '</time>';
+  }
   function renderStatus(st) {
     if (!st) return;
     var up = document.getElementById('status-updated');
@@ -2330,13 +3293,45 @@ def build_index(entries: list[Entry], models: list[dict[str, Any]], code_tour: d
     var tests = st.tests || {};
     var exps = st.experiments || {};
 
-    var rw = (pi.workers || []).filter(function (w) { return w.state === 'running'; }).map(function (w) { return w.slug; });
-    var aj = (k8s.jobs || []).filter(function (j) { return j.phase === 'Running'; }).map(function (j) { return j.name; });
+    var runningWorkers = (pi.workers || []).filter(function (w) { return w.state === 'running'; });
+    var runningJobs = (k8s.jobs || []).filter(function (j) { return j.phase === 'Running'; });
+    var rw = runningWorkers.map(function (w) { return w.slug; });
+    var aj = runningJobs.map(function (j) { return j.name; });
     var rParts = [];
     if (rw.length) rParts.push('pi: ' + rw.join(', '));
     if (aj.length) rParts.push('k8s: ' + aj.join(', '));
     var rEl = document.getElementById('strip-running');
     if (rEl) rEl.textContent = rParts.length ? rParts.join(' · ') : 'Idle (workspace pods up)';
+
+    var actSum = document.getElementById('activity-summary');
+    if (actSum && pi.counts) {
+      actSum.textContent = (pi.counts.running || 0) + ' running · ' + (pi.counts.done || 0) + ' done · ' + (pi.counts.dead || 0) + ' dead';
+    }
+    var actEl = document.getElementById('live-activity-strip');
+    if (actEl) {
+      var actItems = runningWorkers.map(function (w) {
+        return '<div class="activity-item"><div class="activity-item__left"><span class="live-pulse" aria-hidden="true"></span>'
+          + '<div class="activity-item__body"><div class="activity-item__name">pi worker · ' + esc(w.slug) + '</div>'
+          + '<div class="activity-item__sub">running ' + esc(w.age) + ' · idle ' + esc(w.idle) + ' · sess ' + esc(w.session) + '</div></div></div>'
+          + pill(w.age || 'running', 'warn') + '</div>';
+      }).concat(runningJobs.map(function (j) {
+        return '<div class="activity-item"><div class="activity-item__left"><span class="live-pulse" aria-hidden="true"></span>'
+          + '<div class="activity-item__body"><div class="activity-item__name">k8s job · ' + esc(j.name) + '</div>'
+          + '<div class="activity-item__sub">gpu ' + esc(j.gpu) + ' · node ' + esc(j.node || '-') + ' · running ' + esc(j.duration) + '</div></div></div>'
+          + pill(j.duration || 'running', 'warn') + '</div>';
+      }));
+      (ext.latest_by_agent || []).forEach(function (a) {
+        if (a.size_bytes === 0 && a.mtime) {
+          actItems.push('<div class="activity-item"><div class="activity-item__left"><span class="live-pulse" aria-hidden="true"></span>'
+            + '<div class="activity-item__body"><div class="activity-item__name">agent · ' + esc(a.agent) + ' · <code>' + esc(a.file) + '</code></div>'
+            + '<div class="activity-item__sub">started ' + relAgeHtml(a.mtime) + '</div></div></div>'
+            + pill('active', 'sky') + '</div>');
+        }
+      });
+      actEl.innerHTML = actItems.length
+        ? '<div class="activity-grid">' + actItems.join('') + '</div>'
+        : '<p class="card__sub" style="margin:0;">No pi workers, external agents, or GPU jobs running right now.</p>';
+    }
 
     var liveCount = rw.length + aj.length;
     var topPill = document.getElementById('topbar-live-pill');
@@ -2423,8 +3418,9 @@ def build_index(entries: list[Entry], models: list[dict[str, Any]], code_tour: d
     }
     var exEl = document.getElementById('live-exps');
     if (exEl && exps.ok && exps.metrics_runs && exps.metrics_runs.length) {
-      // Keep existing server-rendered list or update metrics runs
+      // Server-rendered scoreboard holds full SVG & cards; rebuilds keep it current.
     }
+    if (window.updateRelAges) window.updateRelAges();
   }
 
   function refresh() {
@@ -2453,6 +3449,36 @@ def build_index(entries: list[Entry], models: list[dict[str, Any]], code_tour: d
     )
 
 
+def build_entries_index(entries: list[Entry], status: dict[str, Any]) -> str:
+    frags = _render_status_fragments(status)
+    live_text = f"{frags['running_count']} running" if frags["running_count"] else frags["test_badge"]
+    badge_tone = "warn" if frags["running_count"] else ("ok" if frags["test_ok"] else "bad")
+
+    cards = _entry_cards_html(entries, href_prefix="")
+    main_html = f"""
+<header class="chapter-head">
+  <p class="chapter-head__eyebrow">Dev Log Archive · {len(entries)} entries · America/New_York</p>
+  <h1 class="chapter-head__title">Latest Entries</h1>
+  <p class="chapter-head__lede">All narrative engineering entries in reverse chronological order with local Eastern timestamps and relative ages.</p>
+</header>
+<div class="card-grid">
+  {cards}
+</div>
+"""
+    return render_shell(
+        title="All Entries",
+        description="Index of all Freestyle dev log entries.",
+        section_label="Entries Index",
+        active_nav="entries",
+        root_prefix="../",
+        entries=entries,
+        on_page=[],
+        main_html=main_html,
+        status_badge=(live_text, badge_tone),
+        pager=({"href": "../index.html", "label": "Overview & Live"}, {"href": "../timeline.html", "label": "Timeline"}),
+    )
+
+
 def build_entry_page(
     entry: Entry,
     idx: int,
@@ -2466,7 +3492,7 @@ def build_entry_page(
     tags_html = "".join(_pill(t, "cola") for t in entry.tags)
     main_html = f"""
 <header class="chapter-head">
-  <p class="chapter-head__eyebrow">Dev Log Entry · {html.escape(entry.display_date)} · {entry.reading_min} min read</p>
+  <p class="chapter-head__eyebrow">Dev Log Entry · {html.escape(entry.display_date)} · {_rel_age_html(entry.sort_ts, entry.iso_date)} · {entry.reading_min} min read</p>
   <h1 class="chapter-head__title">{html.escape(entry.title)}</h1>
   <div class="pill-row">{tags_html}</div>
 </header>
@@ -2697,6 +3723,7 @@ def build_timeline_page(entries: list[Entry], status: dict[str, Any]) -> str:
             {
                 "kind": "entry",
                 "sort_ts": e.sort_ts,
+                "iso_date": e.iso_date,
                 "date": e.display_date,
                 "title": e.title,
                 "href": f"entries/{e.slug}.html",
@@ -2708,15 +3735,21 @@ def build_timeline_page(entries: list[Entry], status: dict[str, Any]) -> str:
     for c in status.get("git", {}).get("commits", []):
         try:
             dt = datetime.fromisoformat(c["date"])
-            ts = dt.timestamp()
-            disp = dt.strftime("%Y-%m-%d %H:%M")
+            if dt.tzinfo is None:
+                dt = dt.replace(tzinfo=NY_TZ)
+            dt_ny = dt.astimezone(NY_TZ)
+            ts = dt_ny.timestamp()
+            iso_str = dt_ny.isoformat()
+            disp = _format_ny_datetime(dt_ny)
         except Exception:
             ts = 0.0
+            iso_str = ""
             disp = c.get("date", "")
         events.append(
             {
                 "kind": "commit",
                 "sort_ts": ts,
+                "iso_date": iso_str,
                 "date": disp,
                 "title": c.get("subject", ""),
                 "sha": c.get("short_sha", ""),
@@ -2728,10 +3761,11 @@ def build_timeline_page(entries: list[Entry], status: dict[str, Any]) -> str:
 
     items_html = []
     for ev in events:
+        rel_html = f'<span>·</span>{_rel_age_html(ev["sort_ts"], ev["iso_date"])}' if ev.get("sort_ts") else ""
         if ev["kind"] == "entry":
             items_html.append(
                 f'<li class="timeline__item timeline__item--entry">'
-                f'<div class="entry-card__meta">{_pill("Entry", "cola")}<span>{html.escape(ev["date"])}</span></div>'
+                f'<div class="entry-card__meta">{_pill("Entry", "cola")}<span>{html.escape(ev["date"])}</span>{rel_html}</div>'
                 f'<h3 style="margin:6px 0 4px;font-size:18px;"><a href="{html.escape(ev["href"])}">{html.escape(ev["title"])}</a></h3>'
                 f'<p style="margin:0;font-size:14px;color:var(--ink-muted);">{html.escape(ev["body"])}…</p>'
                 f"</li>"
@@ -2739,14 +3773,14 @@ def build_timeline_page(entries: list[Entry], status: dict[str, Any]) -> str:
         else:
             items_html.append(
                 f'<li class="timeline__item timeline__item--commit">'
-                f'<div class="entry-card__meta">{_pill(ev["sha"], "sky")}<span>{html.escape(ev["date"])}</span><span>·</span><span>{html.escape(ev["author"])}</span></div>'
+                f'<div class="entry-card__meta">{_pill(ev["sha"], "sky")}<span>{html.escape(ev["date"])}</span>{rel_html}<span>·</span><span>{html.escape(ev["author"])}</span></div>'
                 f'<p style="margin:6px 0 0;font-weight:600;font-size:14.5px;">{html.escape(ev["title"])}</p>'
                 f"</li>"
             )
 
     main_html = f"""
 <header class="chapter-head">
-  <p class="chapter-head__eyebrow">Chronological Stream</p>
+  <p class="chapter-head__eyebrow">Chronological Stream · America/New_York</p>
   <h1 class="chapter-head__title">Project Timeline</h1>
   <p class="chapter-head__lede">Narrative dev log entries merged chronologically with the latest 25 commits on branch <code>{html.escape(frags['git_branch'])}</code>.</p>
 </header>
@@ -2788,13 +3822,15 @@ def build_site() -> None:
     entries = load_entries()
     models = load_models()
     code_tour = load_code_tour()
+    milestones = load_milestones()
 
     _write_atomic(ASSETS_DIR / "style.css", SITE_CSS)
     _write_atomic(ASSETS_DIR / "app.js", SITE_JS)
-    _write_atomic(SITE_DIR / "index.html", build_index(entries, models, code_tour, status))
+    _write_atomic(SITE_DIR / "index.html", build_index(entries, models, code_tour, milestones, status))
     _write_atomic(SITE_DIR / "models.html", build_models_page(models, entries, status))
     _write_atomic(SITE_DIR / "code.html", build_code_page(code_tour, entries, status))
     _write_atomic(SITE_DIR / "timeline.html", build_timeline_page(entries, status))
+    _write_atomic(ENTRIES_DIR / "index.html", build_entries_index(entries, status))
 
     for idx, entry in enumerate(entries):
         _write_atomic(
@@ -2804,13 +3840,54 @@ def build_site() -> None:
 
     print(
         f"Built {SITE_DIR}: {len(entries)} entries, {len(models)} models, "
-        f"{len(code_tour.get('stops', []))} code tour stops"
+        f"{len(milestones)} milestones, {len(code_tour.get('stops', []))} code tour stops",
+        flush=True,
     )
 
 
-def main() -> int:
+def _watch_snapshot() -> tuple[Any, ...]:
+    items: list[Any] = []
+    if CONTENT_DIR.exists():
+        for p in sorted(CONTENT_DIR.glob("*.md")):
+            try:
+                st = p.stat()
+                items.append(("content", p.name, st.st_mtime_ns, st.st_size))
+            except OSError:
+                pass
+    for path in (MILESTONES_PATH, MODELS_PATH, CODE_TOUR_PATH, STATUS_PATH):
+        try:
+            st = path.stat()
+            items.append((path.name, st.st_mtime_ns, st.st_size))
+        except OSError:
+            items.append((path.name, None))
+    return tuple(items)
+
+
+def main(argv: list[str] | None = None) -> int:
+    parser = argparse.ArgumentParser(description="Build the Freestyle devlog static site.")
+    parser.add_argument("--watch", action="store_true", help="Poll for content/milestone/status changes and rebuild automatically.")
+    parser.add_argument("--interval", type=float, default=10.0, help="Polling interval in seconds for --watch (default: 10.0).")
+    args = parser.parse_args(argv)
+
     build_site()
-    return 0
+    if not args.watch:
+        return 0
+
+    interval = max(1.0, float(args.interval))
+    last_snap = _watch_snapshot()
+    print(f"Watching devlog/content, milestones.yaml, models.yaml, code_tour.yaml, status.json every {interval:g}s...", flush=True)
+    try:
+        while True:
+            time.sleep(interval)
+            snap = _watch_snapshot()
+            if snap != last_snap:
+                try:
+                    build_site()
+                    last_snap = snap
+                except Exception as exc:
+                    print(f"Watch rebuild error: {exc}", flush=True)
+    except KeyboardInterrupt:
+        return 0
 
 
 if __name__ == "__main__":

@@ -1,0 +1,15 @@
+# Orchestrator-maintained project milestones. status: done | active | todo | blocked
+milestones:
+  - {id: data, title: "Extract & audit data, frozen leakage-safe split", status: done}
+  - {id: tooling, title: "Vision Intern map + dense-scene extensions + freestyle package", status: done}
+  - {id: vlm-probe, title: "Probe Collective VLMs (endpoints, coords, latency)", status: done}
+  - {id: k8s, title: "Kubernetes GPU job infrastructure (5090 + PRO 6000)", status: done}
+  - {id: bootstrap, title: "Auto-label all cabinet frames with Vision Intern (label -> judge -> identify)", status: done}
+  - {id: web-refs, title: "Web reference research (placement maps, Part 1/2 rule)", status: done}
+  - {id: gpu-window-1, title: "GPU window 1: zero-shot detectors + RF-DETR on model labels", status: active}
+  - {id: quiz, title: "Phone quiz for human ground truth (test + val) — live at :8766", status: done}
+  - {id: gt, title: "Human ground truth collected (waiting on David: phone quiz)", status: active}
+  - {id: eval, title: "Score every architecture against ground truth", status: todo}
+  - {id: iterate, title: "Iterate on failures (identity, bottom shelf, pairs)", status: todo}
+  - {id: select, title: "Select architecture + export model bundle", status: todo}
+  - {id: report, title: "Final report + how-to-run", status: todo}

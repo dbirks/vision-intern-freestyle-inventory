@@ -252,8 +252,9 @@ def collect_k8s() -> dict[str, Any]:
 
     payload = json.loads(proc.stdout)
     now = _now_utc()
-    jobs: list[dict[str, Any]] = []
+    raw_jobs: list[dict[str, Any]] = []
     pods: list[dict[str, Any]] = []
+    pod_by_job: dict[str, dict[str, Any]] = {}
 
     for item in payload.get("items", []):
         kind = item.get("kind", "")
@@ -265,31 +266,10 @@ def collect_k8s() -> dict[str, Any]:
         gpu = labels.get("vision-intern/gpu") or labels.get("gpu") or ""
 
         if kind == "Job":
-            start = _parse_iso(st.get("startTime"))
-            comp = _parse_iso(st.get("completionTime"))
-            end = comp or now
-            dur = _format_duration((end - start).total_seconds()) if start else "-"
-            if st.get("succeeded"):
-                phase = "Complete"
-            elif st.get("failed"):
-                phase = "Failed"
-            elif st.get("active"):
-                phase = "Running"
-            else:
-                phase = "Pending"
-            jobs.append(
-                {
-                    "name": name,
-                    "gpu": gpu or "-",
-                    "phase": phase,
-                    "duration": dur,
-                    "start_time": st.get("startTime"),
-                    "completion_time": st.get("completionTime"),
-                }
-            )
+            raw_jobs.append(item)
         elif kind == "Pod":
+            node_name = spec.get("nodeName", "-")
             if not gpu:
-                node_name = spec.get("nodeName", "")
                 if "8me-tcy" in node_name:
                     gpu = "5090"
                 elif "210-73x" in node_name:
@@ -302,24 +282,93 @@ def collect_k8s() -> dict[str, Any]:
                     phase = f"{phase} ({waiting['reason']})"
                     break
             start = _parse_iso(st.get("startTime"))
+            finished_str = None
             term_time = None
             for cs in st.get("containerStatuses", []) or []:
                 finished = ((cs.get("state") or {}).get("terminated") or {}).get("finishedAt")
                 if finished:
+                    finished_str = finished
                     term_time = _parse_iso(finished)
                     break
             end = term_time or now
             dur = _format_duration((end - start).total_seconds()) if start else "-"
-            pods.append(
-                {
-                    "name": name,
-                    "gpu": gpu or "-",
-                    "phase": phase,
-                    "duration": dur,
-                    "node": spec.get("nodeName", "-"),
-                    "start_time": st.get("startTime"),
-                }
-            )
+            pod_entry = {
+                "name": name,
+                "gpu": gpu or "-",
+                "phase": phase,
+                "duration": dur,
+                "node": node_name,
+                "start_time": st.get("startTime"),
+                "finished_at": finished_str,
+            }
+            pods.append(pod_entry)
+
+            job_owner = labels.get("job-name")
+            if not job_owner:
+                for ref in meta.get("ownerReferences", []) or []:
+                    if ref.get("kind") == "Job" and ref.get("name"):
+                        job_owner = ref["name"]
+                        break
+            if job_owner:
+                pod_by_job[job_owner] = pod_entry
+
+    jobs: list[dict[str, Any]] = []
+    for item in raw_jobs:
+        meta = item.get("metadata", {})
+        labels = meta.get("labels", {})
+        st = item.get("status", {})
+        name = meta.get("name", "unknown")
+        pod_info = pod_by_job.get(name) or {}
+        node_name = pod_info.get("node") or "-"
+        gpu = labels.get("vision-intern/gpu") or labels.get("gpu") or ""
+        if not gpu or gpu == "-":
+            if "8me-tcy" in node_name:
+                gpu = "5090"
+            elif "210-73x" in node_name:
+                gpu = "6000"
+            elif pod_info.get("gpu") and pod_info["gpu"] != "-":
+                gpu = pod_info["gpu"]
+
+        if st.get("succeeded"):
+            phase = "Complete"
+        elif st.get("failed"):
+            phase = "Failed"
+        elif st.get("active"):
+            phase = "Running"
+        else:
+            phase = "Pending"
+
+        start_str = st.get("startTime")
+        comp_str = st.get("completionTime")
+        end_str = comp_str
+        if not end_str and phase in ("Failed", "Complete"):
+            conds = st.get("conditions") or []
+            for target_type in (phase, "FailureTarget"):
+                for cond in conds:
+                    if cond.get("type") == target_type and cond.get("status") == "True":
+                        end_str = cond.get("lastTransitionTime")
+                        if end_str:
+                            break
+                if end_str:
+                    break
+            if not end_str:
+                end_str = pod_info.get("finished_at")
+
+        start = _parse_iso(start_str)
+        end_dt = _parse_iso(end_str) or now
+        dur = _format_duration((end_dt - start).total_seconds()) if start else "-"
+        jobs.append(
+            {
+                "name": name,
+                "gpu": gpu or "-",
+                "node": node_name,
+                "phase": phase,
+                "duration": dur,
+                "start_time": start_str,
+                "completion_time": comp_str,
+                "end_time": end_str,
+            }
+        )
 
     return {
         "ok": True,
@@ -549,6 +598,46 @@ def _match_int(text: str, pattern: str) -> int:
     return int(m.group(1)) if m else 0
 
 
+def _is_chain_check(run_dir: Path, metrics_data: dict[str, Any], meta_data: dict[str, Any]) -> bool:
+    if (meta_data.get("config") or {}).get("chain_check") is True:
+        return True
+    if metrics_data.get("chain_check") is True:
+        return True
+    haystack = " ".join(
+        [
+            run_dir.name,
+            str(metrics_data.get("experiment", "")),
+            str(metrics_data.get("gt_path", "")),
+        ]
+    ).lower()
+    return "chain_check" in haystack or "chain-check" in haystack
+
+
+def _classify_gt_source(metrics_data: dict[str, Any], meta_data: dict[str, Any]) -> tuple[str, str]:
+    gt_source = metrics_data.get("gt_source")
+    gt_note = metrics_data.get("gt_note")
+    if gt_source or gt_note:
+        combined = f"{gt_source or ''} {gt_note or ''}".lower()
+        if "human" in combined and "not human" not in combined and "model" not in combined:
+            return "human", "vs human GT"
+        if any(tok in combined for tok in ("model", "bootstrap", "auto")):
+            return "model_labels", "vs model labels (not GT)"
+
+    data_cfg = (meta_data.get("config") or {}).get("data") or {}
+    for candidate in (metrics_data.get("gt_path"), data_cfg.get("test")):
+        if not candidate:
+            continue
+        p = str(candidate).lower()
+        if "labels/" in p or "bootstrap" in p:
+            return "model_labels", "vs model labels (not GT)"
+        if ("data/gt/" in p or p.startswith("gt/")) and "_fake" not in p and "_chaincheck" not in p:
+            return "human", "vs human GT"
+
+    if str(data_cfg.get("label_source") or "").lower() == "gt":
+        return "human", "vs human GT"
+    return "model_labels", "vs model labels (not GT)"
+
+
 def collect_experiments() -> dict[str, Any]:
     """Collect experiment metrics from runs/*/metrics.json, smoke probes, and RESULTS.md."""
     runs_dir = REPO_ROOT / "runs"
@@ -558,29 +647,78 @@ def collect_experiments() -> dict[str, Any]:
 
     if runs_dir.exists():
         for metrics_file in sorted(runs_dir.glob("*/metrics.json")):
+            run_dir = metrics_file.parent
             try:
                 data = json.loads(metrics_file.read_text())
+                meta_file = run_dir / "meta.json"
+                meta: dict[str, Any] = {}
+                if meta_file.exists():
+                    try:
+                        meta = json.loads(meta_file.read_text())
+                    except Exception:
+                        meta = {}
+                if _is_chain_check(run_dir, data, meta):
+                    continue
+
                 loc = data.get("localization", {})
                 ident = data.get("identification", {})
                 cnt = data.get("counting", {})
+                gt_kind, gt_badge = _classify_gt_source(data, meta)
+
+                peak_bytes = meta.get("peak_gpu_bytes")
+                nvidia_smi_raw = meta.get("nvidia_smi")
+                nvidia_smi_mib: int | None = None
+                if isinstance(nvidia_smi_raw, (int, float)):
+                    nvidia_smi_mib = int(nvidia_smi_raw)
+                elif isinstance(nvidia_smi_raw, str) and nvidia_smi_raw.strip().isdigit():
+                    nvidia_smi_mib = int(nvidia_smi_raw.strip())
+
+                peak_gpu_mib: int | None = None
+                if isinstance(peak_bytes, (int, float)) and peak_bytes > 0:
+                    peak_gpu_mib = round(peak_bytes / (1024 * 1024))
+                elif nvidia_smi_mib is not None and nvidia_smi_mib > 0:
+                    peak_gpu_mib = nvidia_smi_mib
+
+                job_wall = meta.get("job_wall") or {}
+                timings = meta.get("timings") or {}
+                wall_seconds: float | None = None
+                if isinstance(job_wall.get("job_total"), (int, float)):
+                    wall_seconds = float(job_wall["job_total"])
+                elif isinstance(job_wall.get("command"), (int, float)):
+                    wall_seconds = float(job_wall["command"])
+                elif timings:
+                    vals = [float(v) for v in timings.values() if isinstance(v, (int, float))]
+                    if vals:
+                        wall_seconds = sum(vals)
+
                 metrics_runs.append(
                     {
-                        "id": data.get("experiment") or metrics_file.parent.name,
-                        "dir": metrics_file.parent.name,
+                        "id": data.get("experiment") or run_dir.name,
+                        "dir": run_dir.name,
                         "ap50": loc.get("ap50"),
                         "ap50_95": loc.get("ap50_95"),
+                        "precision": loc.get("precision"),
+                        "recall": loc.get("recall"),
                         "f1": loc.get("f1"),
                         "top1_acc": ident.get("top1_acc"),
                         "macro_f1": ident.get("macro_f1"),
                         "total_count_mae": cnt.get("total_count_mae"),
                         "exact_inventory_rate": cnt.get("exact_inventory_rate"),
                         "score_thr": data.get("score_thr"),
+                        "gt_path": data.get("gt_path"),
+                        "gt_source": data.get("gt_source"),
+                        "gt_note": data.get("gt_note"),
+                        "gt_kind": gt_kind,
+                        "gt_badge": gt_badge,
+                        "peak_gpu_bytes": peak_bytes,
+                        "peak_gpu_mib": peak_gpu_mib,
+                        "nvidia_smi_mib": nvidia_smi_mib,
+                        "wall_seconds": wall_seconds,
+                        "wall_duration": _format_duration(wall_seconds),
                     }
                 )
             except Exception as exc:
-                metrics_runs.append(
-                    {"id": metrics_file.parent.name, "error": str(exc)}
-                )
+                metrics_runs.append({"id": run_dir.name, "error": str(exc)})
 
         for smoke_file in sorted(runs_dir.glob("*/smoke.json")):
             try:
