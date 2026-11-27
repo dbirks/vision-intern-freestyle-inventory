@@ -67,6 +67,9 @@ def test_rfdetr_maps_training_label_indices_to_category_ids(monkeypatch, tmp_pat
             assert detection["category_id"] == category
             assert predictor.class_names[category] == categories[category]
         model.label = len(categories)
+        if len(categories) == 1:
+            assert predictor.predict(None, 0.3) == []
+            model.label = 2
         with pytest.raises(ValueError, match="Unknown RF-DETR detector class index"):
             predictor.predict(None, 0.3)
     state.clear()

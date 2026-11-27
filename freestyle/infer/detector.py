@@ -33,6 +33,10 @@ class RFDetrPredictor:
         detections = []
         for box, score, cls in zip(result.xyxy, result.confidence, result.class_id, strict=True):
             label = int(cls)
+            # RF-DETR's single-class detection head has a second, no-object
+            # logit. Its postprocessor can return that slot as a detection.
+            if len(self.class_names) == 1 and label == 1 and label not in self.label_to_category:
+                continue
             if label not in self.label_to_category:
                 raise ValueError(f"Unknown RF-DETR detector class index: {label}")
             detections.append({"box": box.tolist(), "score": float(score),
