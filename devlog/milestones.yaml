@@ -11,5 +11,6 @@ milestones:
   - {id: gt, title: "Human ground truth collected (waiting on David: phone quiz)", status: active}
   - {id: eval, title: "Score every architecture against ground truth", status: todo}
   - {id: iterate, title: "Iterate on failures (identity, bottom shelf, pairs)", status: todo}
+  - {id: faces, title: "Front-face detector experiment (family G, your idea)", status: active}
   - {id: select, title: "Select architecture + export model bundle (candidate bundle in progress)", status: active}
   - {id: report, title: "Final report + how-to-run", status: todo}
