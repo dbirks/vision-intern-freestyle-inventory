@@ -11,32 +11,33 @@ from freestyle.geometry import make_tiles, merge_tiled, tile_boxes_to_image
 from freestyle.train.train_detector import metadata
 
 
-def align_class_index(class_names, cls):
-    """Map a predicted class id onto the checkpoint's own class_names space.
-
-    rf-detr reports the *dataset label id* (a class-agnostic tile dataset numbers its one
-    category 1), while ``class_names`` is keyed by detection-head index (0). Passing the raw
-    id through makes the pipeline's index->name lookup miss and every family-C run die at
-    the first val image with 'Unknown detector class index: 1'. Aligning positionally is a
-    no-op whenever ids and keys already agree, so multiclass checkpoints keep their classes.
-    """
-    keys = (list(class_names) if isinstance(class_names, dict)
-            else list(range(len(class_names or []))))
-    return keys[int(cls) % len(keys)] if keys else int(cls)
-
-
 class RFDetrPredictor:
     def __init__(self, checkpoint):
+        import torch
         from rfdetr import RFDETR
 
+        state = torch.load(checkpoint, map_location="cpu", weights_only=False)
+        try:
+            self.class_names = {int(k): v for k, v in state["freestyle_category_names"].items()}
+            self.label_to_category = {int(k): int(v) for k, v in
+                                      state["freestyle_label_to_category"].items()}
+        except KeyError as exc:
+            raise ValueError("RF-DETR checkpoint lacks its training category mapping; "
+                             "retrain or recover the mapping from its training annotations") from exc
+        if not self.class_names or set(self.label_to_category.values()) != set(self.class_names):
+            raise ValueError("Invalid RF-DETR checkpoint category mapping")
         self.model = RFDETR.from_checkpoint(str(checkpoint))
-        self.class_names = self.model.class_names
 
     def predict(self, image, threshold):
         result = self.model.predict(image, threshold=threshold)
-        return [{"box": box.tolist(), "score": float(score),
-                 "category_id": align_class_index(self.class_names, cls)}
-                for box, score, cls in zip(result.xyxy, result.confidence, result.class_id, strict=True)]
+        detections = []
+        for box, score, cls in zip(result.xyxy, result.confidence, result.class_id, strict=True):
+            label = int(cls)
+            if label not in self.label_to_category:
+                raise ValueError(f"Unknown RF-DETR detector class index: {label}")
+            detections.append({"box": box.tolist(), "score": float(score),
+                               "category_id": self.label_to_category[label]})
+        return detections
 
 
 class YoloPredictor:

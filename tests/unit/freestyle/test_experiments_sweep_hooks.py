@@ -163,11 +163,22 @@ def test_prune_keeps_only_best_weights_and_drops_derived_inputs(tmp_path):
     assert (tmp_path / 'augment' / 'contact_sheet.png').is_file()
 
 
-def test_class_ids_align_with_the_checkpoint_class_names():
-    """A class-agnostic head predicts label id 1 while class_names is keyed 0 (window-1 S1/S2)."""
-    from freestyle.infer.detector import align_class_index
+def test_recovered_class_ids_follow_training_categories():
+    from freestyle.train.recover_mapping import category_mapping
 
-    assert align_class_index({0: 'cartridge'}, 1) == 0        # dict keyed by head index
-    assert align_class_index(['cartridge'], 1) == 0           # plain list of names
-    assert align_class_index({1: 'cartridge'}, 1) == 1        # already keyed by label id
-    assert align_class_index(['coke', 'fanta', 'sprite'], 2) == 2   # multiclass untouched
+    annotations = {'categories': [{'id': 2, 'name': 'second'}, {'id': 1, 'name': 'first'}],
+                   'annotations': [{'category_id': 1}, {'category_id': 2}]}
+    assert category_mapping(annotations) == ({1: 'first', 2: 'second'}, {0: 1, 1: 2})
+
+
+def test_recovery_excludes_only_unannotated_parent():
+    from freestyle.train.recover_mapping import category_mapping
+
+    categories = [{'id': 0, 'name': 'root', 'supercategory': 'none'},
+                  {'id': 4, 'name': 'leaf', 'supercategory': 'root'}]
+    names, labels = category_mapping({'categories': categories,
+                                      'annotations': [{'category_id': 4}]})
+    assert names == {4: 'leaf'} and labels == {0: 4}
+    names, labels = category_mapping({'categories': categories,
+                                      'annotations': [{'category_id': 0}]})
+    assert names == {0: 'root', 4: 'leaf'} and labels == {0: 0, 1: 4}

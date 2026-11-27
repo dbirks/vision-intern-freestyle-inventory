@@ -38,8 +38,27 @@ class RFDetrBackend:
         model = getattr(rfdetr, name)(resolution=config["resolution"])
         keys = ("epochs", "batch_size", "grad_accum_steps", "lr", "multi_scale",
                 "aug_config", "early_stopping", "early_stopping_patience", "seed")
+        from rfdetr.datasets.coco import annotated_category_ids, filter_parent_categories
+
+        annotations = json.loads((Path(config["dataset_dir"]) / "train" /
+                                  "_annotations.coco.json").read_text())
+        categories = filter_parent_categories(annotations["categories"],
+                                              annotated_category_ids(annotations))
+        category_names = {int(c["id"]): c["name"] for c in categories}
+        if len(category_names) != len(categories) or not category_names:
+            raise ValueError("Training categories must have unique IDs and cannot be empty")
+        label_to_category = {i: int(c["id"]) for i, c in enumerate(categories)}
         model.train(dataset_dir=config["dataset_dir"], output_dir=str(out),
                     **{k: config[k] for k in keys if k in config})
+
+        # Keep the training label space with the weights, including when a bundle copies them.
+        import torch
+
+        for checkpoint in Path(out).rglob("*.pth"):
+            state = torch.load(checkpoint, map_location="cpu", weights_only=False)
+            state["freestyle_category_names"] = category_names
+            state["freestyle_label_to_category"] = label_to_category
+            torch.save(state, checkpoint)
 
 
 class YoloBackend:

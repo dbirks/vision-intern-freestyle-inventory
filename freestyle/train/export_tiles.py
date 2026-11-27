@@ -43,13 +43,60 @@ def _instance_mask(ann, image_size, rect, size):
     return mask.crop(rect).resize(size, Image.Resampling.NEAREST)
 
 
+def export_annotations(coco, splits, tile=1024, overlap=0.25, min_visible=0.6,
+                       class_agnostic=False, include_full_frame_downscaled=False, resolution=512):
+    """Reconstruct tile annotations from stored dimensions, without reading image pixels."""
+    categories = ([{"id": 1, "name": "cartridge"}] if class_agnostic else coco["categories"])
+    datasets = {s: {"info": {}, "licenses": [], "images": [], "annotations": [],
+                    "categories": categories} for s in ("train", "valid", "test")}
+    annotations = defaultdict(list)
+    for ann in coco["annotations"]:
+        annotations[ann["image_id"]].append(ann)
+    image_id = ann_id = 0
+    for source in coco["images"]:
+        split = splits.get(source["file_name"])
+        if split == "exclude":
+            continue
+        split = {"val": "valid", "train": "train", "test": "test"}.get(split)
+        if split is None:
+            raise ValueError(f"Missing or invalid split for {source['file_name']}")
+        width, height = source["width"], source["height"]
+        samples = [(rect, False) for rect in make_tiles(width, height, tile, overlap)]
+        if include_full_frame_downscaled:
+            samples.append(((0, 0, width, height), True))
+        ds = datasets[split]
+        for (x0, y0, x1, y1), full in samples:
+            image_id += 1
+            sw, sh = (resolution, resolution) if full else (x1 - x0, y1 - y0)
+            sx, sy = sw / (x1 - x0), sh / (y1 - y0)
+            ds["images"].append({"id": image_id, "file_name": f"{image_id:08d}.png",
+                                 "width": sw, "height": sh})
+            for ann in annotations[source["id"]]:
+                x, y, w, h = ann["bbox"]
+                if w <= 0 or h <= 0:
+                    continue
+                left, top = max(x, x0), max(y, y0)
+                cw, ch = max(0, min(x + w, x1) - left), max(0, min(y + h, y1) - top)
+                if not cw or not ch or cw * ch / (w * h) < min_visible:
+                    continue
+                box = [(left - x0) * sx, (top - y0) * sy, cw * sx, ch * sy]
+                ann_id += 1
+                ds["annotations"].append({"id": ann_id, "image_id": image_id,
+                    "category_id": 1 if class_agnostic else ann["category_id"],
+                    "bbox": box, "area": box[2] * box[3], "iscrowd": ann.get("iscrowd", 0)})
+    return datasets
+
+
 def export_tiles(coco_file, images_root, out, split_map, tile=1024, overlap=0.25,
                  min_visible=0.6, class_agnostic=False,
-                 include_full_frame_downscaled=False, resolution=512):
+                 include_full_frame_downscaled=False, resolution=512, annotation_only=False):
     if not 0 <= min_visible <= 1 or resolution <= 0:
         raise ValueError("min_visible must be in [0, 1] and resolution positive")
     coco = json.loads(Path(coco_file).read_text())
     splits = json.loads(Path(split_map).read_text())["images"]
+    if annotation_only:
+        return export_annotations(coco, splits, tile, overlap, min_visible, class_agnostic,
+                                  include_full_frame_downscaled, resolution)
     out, root = Path(out), Path(images_root)
     categories = ([{"id": 1, "name": "cartridge"}] if class_agnostic
                   else coco["categories"])
