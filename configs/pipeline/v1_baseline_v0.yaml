@@ -1,0 +1,40 @@
+# v1 iteration harness: replicate artifacts/rfdetr-m-1280-knn-v0 exactly (tuning baseline).
+images_root: data/raw/freestyle-vision-data/images
+manifest: data/labels/bootstrap_v2.json
+split_map: data/splits.json
+categories:
+  coca-cola-part1: 10
+  coca-cola-part2: 11
+  coke-zero-part1: 16
+  coke-zero-part2: 17
+  diet-coke-part1: 12
+  diet-coke-part2: 13
+  dr-pepper-part1: 14
+  dr-pepper-part2: 15
+  fanta-orange: 3
+  flavor-cherry: 18
+  flavor-lemon: 9
+  flavor-orange: 7
+  flavor-vanilla: 8
+  hi-c: 5
+  ingredient-aa: 2
+  ingredient-cc: 4
+  nns-sweetener: 1
+  sprite: 6
+  unknown: 19
+localizer:
+  type: tiled_detector
+  checkpoint: artifacts/rfdetr-m-1280-knn-v0/detector/checkpoint_best_total.pth
+  tile: 1280
+  overlap: 0.25
+  score_thr: 0.3080451190471649
+identifier:
+  type: embedding_knn
+  gallery: artifacts/rfdetr-m-1280-knn-v0/gallery.npz
+  model: google/siglip2-base-patch16-224
+  k: 5
+  device: cpu
+counting:
+  identity_thr: 0.5
+  neighbour_vote: report
+  max_rows: 4

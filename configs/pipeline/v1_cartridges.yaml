@@ -1,0 +1,60 @@
+# v1 counting configuration (tuned on the 6 val frames only, vs bootstrap model labels
+# as a localisation proxy + unverified visual crop review). Frozen into
+# artifacts/rfdetr-m-1280-v1; the offline fallback is v1_embedding_only.yaml.
+images_root: data/raw/freestyle-vision-data/images
+manifest: data/labels/bootstrap_v2.json
+split_map: data/splits.json
+categories:
+  coca-cola-part1: 10
+  coca-cola-part2: 11
+  coke-zero-part1: 16
+  coke-zero-part2: 17
+  diet-coke-part1: 12
+  diet-coke-part2: 13
+  dr-pepper-part1: 14
+  dr-pepper-part2: 15
+  fanta-orange: 3
+  flavor-cherry: 18
+  flavor-lemon: 9
+  flavor-orange: 7
+  flavor-vanilla: 8
+  hi-c: 5
+  ingredient-aa: 2
+  ingredient-cc: 4
+  nns-sweetener: 1
+  sprite: 6
+  unknown: 19
+localizer:
+  type: tiled_detector
+  checkpoint: artifacts/rfdetr-m-1280-v1/detector/checkpoint_best_total.pth
+  tile: 1280
+  overlap: 0.25
+  # v0 threshold kept: val says 0.15 (AP50 0.625) or 0.10 (AP50 0.691, 0 overlaps) would
+  # localise better once suppression is on, but RFDetrPredictor.predict raises
+  # "Unknown RF-DETR detector class index: 1" below ~0.25 (the class-agnostic head emits a
+  # phantom second index; freestyle/infer/detector.py is outside this task's file list).
+  score_thr: 0.3080451190471649
+identifier:
+  # VLM reads the family (logo/colour), embedding kNN picks the part inside that family;
+  # an unknown family or low family confidence stays unknown.
+  type: hybrid_vlm_knn
+  family_threshold: 0.45   # below this the VLM family is treated as unknown
+  embedding:
+    gallery: artifacts/rfdetr-m-1280-v1/gallery.npz
+    model: google/siglip2-base-patch16-224
+    k: 5
+    max_per_class: 10
+    device: cpu
+  vlm:
+    model: david-birks/inkling-2-mini
+    upscale: 2
+counting:
+  identity_thr: 0.45
+  neighbour_vote: report
+  max_rows: 2                  # two physical shelves; a 2-high stack is a tier
+  suppress_iou: 0.45           # class-agnostic duplicate suppression after tile merge
+  suppress_containment: 0.7    # tile-edge fragment of a taller box
+  suppress_row_iou: 0.3        # looser threshold inside one shelf row
+  suppress_row_x_overlap: 0.5  # ...when the boxes share a column (x-overlap of the narrower one)
+  shelf_hint: true             # pass the top/bottom shelf hint to the identifier
+  pair_rule: report            # report shelf-order part runs; apply is left off pending human GT

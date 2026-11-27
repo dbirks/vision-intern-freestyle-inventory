@@ -1,0 +1,50 @@
+# v1 offline fallback identifier: class-balanced embedding prototypes, no VLM calls.
+# Judged clearly worse than the VLM-family hybrid on val (see runs/v1iter/identity/),
+# but runs without the LLM Collective. Tuned on val only; no human GT involved.
+images_root: data/raw/freestyle-vision-data/images
+manifest: data/labels/bootstrap_v2.json
+split_map: data/splits.json
+categories:
+  coca-cola-part1: 10
+  coca-cola-part2: 11
+  coke-zero-part1: 16
+  coke-zero-part2: 17
+  diet-coke-part1: 12
+  diet-coke-part2: 13
+  dr-pepper-part1: 14
+  dr-pepper-part2: 15
+  fanta-orange: 3
+  flavor-cherry: 18
+  flavor-lemon: 9
+  flavor-orange: 7
+  flavor-vanilla: 8
+  hi-c: 5
+  ingredient-aa: 2
+  ingredient-cc: 4
+  nns-sweetener: 1
+  sprite: 6
+  unknown: 19
+localizer:
+  type: tiled_detector
+  checkpoint: artifacts/rfdetr-m-1280-v1/detector/checkpoint_best_total.pth
+  tile: 1280
+  overlap: 0.25
+  score_thr: 0.3080451190471649
+identifier:
+  # one prototype per class, so a 60-crop NNS gallery cannot outvote 1-crop classes;
+  # max_per_class caps the rows averaged into each prototype.
+  type: embedding_prototype
+  gallery: artifacts/rfdetr-m-1280-v1/gallery.npz
+  model: google/siglip2-base-patch16-224
+  max_per_class: 8
+  device: cpu
+counting:
+  identity_thr: 0.5
+  neighbour_vote: report
+  max_rows: 2
+  suppress_iou: 0.45
+  suppress_containment: 0.7
+  suppress_row_iou: 0.3
+  suppress_row_x_overlap: 0.5
+  shelf_hint: false
+  pair_rule: "off"

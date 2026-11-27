@@ -82,3 +82,36 @@ def test_equal_score_fragment_is_suppressed_before_merge():
     full = {"box": [0, 0, 10, 10], "score": 0.8, "category_id": 1}
     for mode in ("nms", "wbf"):
         assert g.merge_tiled([fragment, full], mode=mode, containment_threshold=0.9) == [full]
+
+
+def test_suppress_duplicates_keeps_higher_score_and_is_class_agnostic():
+    keeper = {'box': [0, 0, 20, 40], 'score': .9, 'category_id': 1}
+    dup = {'box': [3, 1, 23, 41], 'score': .5, 'category_id': 2}
+    other = {'box': [40, 0, 60, 40], 'score': .7, 'category_id': 3}
+    kept = g.suppress_duplicates([dup, other, keeper], iou=0.4, containment=0.7)
+    assert [d['category_id'] for d in kept] == [3, 1]   # input order preserved
+
+
+def test_suppress_duplicates_containment_keeps_higher_score_fragment():
+    big = {'box': [0, 0, 20, 40], 'score': .4}
+    fragment = {'box': [2, 2, 12, 22], 'score': .9}
+    assert g.suppress_duplicates([big, fragment], containment=0.7) == [fragment]
+    assert g.suppress_duplicates([big, fragment]) == [big, fragment]
+
+
+def test_row_rule_catches_shifted_leaning_duplicate_but_keeps_tiers():
+    full = {'box': [0, 0, 20, 40], 'score': .9}
+    leaning = {'box': [10, 0, 30, 40], 'score': .6}   # IoU 1/3, half-width x-shift
+    tier = {'box': [0, 45, 20, 85], 'score': .8}      # stacked below, no y-overlap
+    far = {'box': [60, 0, 80, 40], 'score': .7}
+    dets = [full, leaning, tier, far]
+    rows = [0, 0, 0, 0]
+    assert g.suppress_duplicates(dets, iou=0.4, rows=rows, row_iou=0.3) == [full, tier, far]
+    # without row context the leaning duplicate survives the global threshold
+    assert len(g.suppress_duplicates(dets, iou=0.4)) == 4
+    # a box in another row is judged only by the global threshold
+    assert len(g.suppress_duplicates(dets, iou=0.4, rows=[0, 1, 0, 0], row_iou=0.3)) == 4
+    with pytest.raises(ValueError):
+        g.suppress_duplicates(dets, row_iou=0.3)
+    with pytest.raises(ValueError):
+        g.suppress_duplicates(dets, iou=0.4, rows=[0, 1])

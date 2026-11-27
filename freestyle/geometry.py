@@ -232,6 +232,74 @@ def merge_tiled(dets, iou=0.5, mode="nms", containment_threshold=None, class_agn
     return result
 
 
+def _containment_ratio(a, b):
+    """Intersection over the smaller box area (``containment`` under another name)."""
+    return containment(a, b)
+
+
+def suppress_duplicates(dets, iou=None, containment=None, row_iou=None, rows=None,
+                        row_x_overlap=0.5, score="score"):
+    """Class-agnostic greedy duplicate suppression, keeping the higher score.
+
+    Detections are dictionaries with ``box`` (XYXY) and ``score``. A candidate is
+    dropped when, against any kept box, it overlaps by at least ``iou``, or one box
+    lies at least ``containment`` inside the other (intersection over the smaller
+    area, so a tile-edge fragment of a leaning cartridge never survives next to the
+    full box). Identities are ignored: two boxes are duplicates when they sit on the
+    same physical face, whatever class each side claims.
+
+    ``rows`` optionally gives the shelf-row key of every detection (``shelf_idx`` from
+    :func:`freestyle.count.shelves.assign_shelves`). A leaning cartridge commonly gets
+    one box per overlapping tile with slightly shifted columns, so its IoU stays below
+    the global threshold; ``row_iou`` is the looser threshold used for two boxes that
+    share a row *and* overlap in x by at least ``row_x_overlap`` of the narrower box.
+    Cartridges stacked in the same column keep their own box because a real tier sits
+    above or below its partner, which makes both IoU and y-overlap near zero.
+    """
+    dets = [dict(d) for d in dets]
+    if rows is not None:
+        rows = list(rows)
+        if len(rows) != len(dets):
+            raise ValueError("rows must have one key per detection")
+    for name, value in (("iou", iou), ("containment", containment), ("row_iou", row_iou),
+                        ("row_x_overlap", row_x_overlap if row_iou is not None else None)):
+        if value is not None and not 0 <= value <= 1:
+            raise ValueError(f"{name} must be in [0, 1]")
+    if row_iou is not None and rows is None:
+        raise ValueError("row_iou requires rows")
+    if iou is None and containment is None and row_iou is None:
+        return dets
+
+    boxes = _boxes([d["box"] for d in dets])
+    if len(boxes) and (not np.isfinite(boxes).all() or np.any(boxes[:, 2] <= boxes[:, 0])
+                       or np.any(boxes[:, 3] <= boxes[:, 1])):
+        raise ValueError("duplicate suppression needs finite, nondegenerate boxes")
+
+    def x_overlap(a, b):
+        overlap = min(a[2], b[2]) - max(a[0], b[0])
+        narrowest = min(a[2] - a[0], b[2] - b[0])
+        return overlap / narrowest if narrowest > 0 else 0.0
+
+    order = np.argsort(-np.asarray([d[score] for d in dets], dtype=float), kind="stable")
+    kept = []
+    for index in order:
+        box = boxes[index]
+        duplicate = False
+        for other in kept:
+            j = other["index"]
+            overlap = iou_matrix(box[None], boxes[j][None])[0, 0]
+            same_row = row_iou is not None and rows[index] == rows[j] \
+                and x_overlap(box, boxes[j]) >= row_x_overlap
+            if (iou is not None and overlap >= iou) or \
+               (same_row and overlap >= row_iou) or \
+               (containment is not None and _containment_ratio(box, boxes[j]) >= containment):
+                duplicate = True
+                break
+        if not duplicate:
+            kept.append({"index": int(index), "det": dets[index]})
+    return [k["det"] for k in sorted(kept, key=lambda k: k["index"])]
+
+
 def crop(image_PIL, box_xyxy, pad=0.08, min_size=None):
     """Crop with proportional padding; min_size optionally upsizes the result.
 

@@ -52,6 +52,45 @@ def _format_predictions(
     return out_obj
 
 
+def balance_classes(
+    X: Any,
+    y: Sequence[Any] | np.ndarray,
+    max_per_class: int | None = None,
+    weights: bool = False,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray | None]:
+    """Cap each class's gallery rows and optionally return inverse-frequency weights.
+
+    ``max_per_class`` keeps that many rows per label, spread evenly over the rows a
+    gallery already has (deterministic, no RNG), so a class with 60 crops cannot
+    outvote one with a single crop the way plain k-NN voting lets it.
+
+    Returns ``(X, y, sample_weights)``; ``sample_weights`` is ``None`` unless
+    ``weights`` is set, in which case each retained row weighs ``1/class_count``
+    normalised to average one.
+    """
+    X_arr = _as_2d_float(X)
+    y_arr = _as_1d_labels(y, X_arr.shape[0])
+    if max_per_class is not None and int(max_per_class) <= 0:
+        raise ValueError(f"max_per_class must be positive when set, got {max_per_class}")
+
+    keep: list[int] = []
+    for label in dict.fromkeys(y_arr.tolist()):
+        rows = np.flatnonzero(y_arr == label)
+        if max_per_class is not None and len(rows) > int(max_per_class):
+            stride = len(rows) / int(max_per_class)
+            rows = rows[[int(row * stride) for row in range(int(max_per_class))]]
+        keep.extend(rows.tolist())
+    keep.sort()
+    kept = np.asarray(keep, dtype=np.int64)
+
+    sample_weights: np.ndarray | None = None
+    if weights:
+        counts = {label: int(np.sum(y_arr == label)) for label in dict.fromkeys(y_arr.tolist())}
+        per_row = np.array([1.0 / max(1, counts[label]) for label in y_arr[kept].tolist()])
+        sample_weights = (per_row * (len(per_row) / max(1.0, per_row.sum()))).astype(np.float32)
+    return X_arr[kept], y_arr[kept], sample_weights
+
+
 class _BaseClassifier:
     classes_: np.ndarray
 
@@ -92,16 +131,23 @@ class _BaseClassifier:
 
 
 class PrototypeClassifier(_BaseClassifier):
-    """Per-class L2-normalized mean prototype classifier using cosine similarity."""
+    """Per-class L2-normalized mean prototype classifier using cosine similarity.
 
-    def __init__(self, temperature: float = 0.1) -> None:
+    One prototype per class makes the gallery size irrelevant to the vote: a class
+    with 60 crops and a class with 1 crop each get exactly one candidate vector, so
+    a gallery dominated by one product no longer swallows the rare products. Set
+    ``max_per_class`` to additionally cap the rows averaged into each prototype.
+    """
+
+    def __init__(self, temperature: float = 0.1, max_per_class: int | None = None) -> None:
         if temperature <= 0:
             raise ValueError(f"temperature must be positive, got {temperature}")
         self.temperature = float(temperature)
+        self.max_per_class = max_per_class
 
     def fit(self, X: Any, y: Sequence[Any] | np.ndarray) -> PrototypeClassifier:
-        X_arr = l2_normalize(_as_2d_float(X))
-        y_arr = _as_1d_labels(y, X_arr.shape[0])
+        X_arr, y_arr, _ = balance_classes(X, y, max_per_class=self.max_per_class)
+        X_arr = l2_normalize(X_arr)
         classes = np.unique(y_arr)
         protos = np.stack(
             [X_arr[y_arr == cls].mean(axis=0) for cls in classes],
@@ -109,6 +155,7 @@ class PrototypeClassifier(_BaseClassifier):
         )
         self.classes_ = classes
         self.prototypes_ = l2_normalize(protos)
+        self.n_per_class_ = {str(cls): int(np.sum(y_arr == cls)) for cls in classes}
         return self
 
     def similarity(self, X: Any) -> np.ndarray:
@@ -139,23 +186,44 @@ class PrototypeClassifier(_BaseClassifier):
 
 
 class KNNClassifier(_BaseClassifier):
-    """Cosine k-Nearest-Neighbor classifier over gallery embeddings."""
+    """Cosine k-Nearest-Neighbor classifier over gallery embeddings.
 
-    def __init__(self, k: int = 5, temperature: float | None = None) -> None:
+    ``max_per_class`` caps how many gallery rows each label contributes (an evenly
+    spread deterministic subsample), which stops a 60-crop class from filling every
+    neighbour slot; ``balance`` weights each neighbour by ``1/class_count`` so rare
+    classes are not outvoted in the top-k.
+    """
+
+    def __init__(
+        self,
+        k: int = 5,
+        temperature: float | None = None,
+        max_per_class: int | None = None,
+        balance: bool = False,
+    ) -> None:
         if k <= 0:
             raise ValueError(f"k must be positive, got {k}")
         if temperature is not None and temperature <= 0:
             raise ValueError(f"temperature must be positive when set, got {temperature}")
         self.k = int(k)
         self.temperature = float(temperature) if temperature is not None else None
+        self.max_per_class = max_per_class
+        self.balance = bool(balance)
 
     def fit(self, X: Any, y: Sequence[Any] | np.ndarray) -> KNNClassifier:
-        X_arr = l2_normalize(_as_2d_float(X))
-        y_arr = _as_1d_labels(y, X_arr.shape[0])
+        X_bal, y_bal, _ = balance_classes(X, y, max_per_class=self.max_per_class)
+        X_arr = l2_normalize(X_bal)
+        y_arr = _as_1d_labels(y_bal, X_arr.shape[0])
         classes, y_idx = np.unique(y_arr, return_inverse=True)
         self.classes_ = classes
         self.X_train_ = X_arr
         self.y_train_idx_ = y_idx.astype(np.int64)
+        if self.balance:
+            counts = np.bincount(y_idx, minlength=len(classes)).astype(np.float32)
+            weights = 1.0 / np.maximum(1.0, counts)
+            self.class_weights_ = (weights * float(len(classes)) / float(weights.sum())).astype(np.float32)
+        else:
+            self.class_weights_ = None
         return self
 
     def _top_k(self, X: Any) -> tuple[np.ndarray, np.ndarray]:
@@ -179,6 +247,8 @@ class KNNClassifier(_BaseClassifier):
             weights = np.exp((top_sims - np.max(top_sims, axis=1, keepdims=True)) / self.temperature)
         else:
             weights = np.maximum(top_sims, 0.0)
+        if getattr(self, "class_weights_", None) is not None:
+            weights = weights * self.class_weights_[top_cls]
 
         for i in range(n):
             row_w = weights[i]

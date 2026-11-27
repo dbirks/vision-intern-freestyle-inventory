@@ -32,3 +32,22 @@ def test_aggregate_and_fusion():
     assert fuse_counts(frames, weights=[5, 1, 1], method='weighted_mode') == {'a': 2}
     with pytest.raises(ValueError):
         fuse_counts(frames, weights=[-1, 1, 1])
+
+
+def test_two_shelves_with_a_two_high_stack_stay_two_rows():
+    """A stacked NNS column is a tier, not a third shelf row."""
+    boxes = []
+    for x in (0, 30, 60, 90, 120):                       # bottom shelf
+        boxes.append({'box': [x, 300, x + 25, 380], 'score': 1})
+    for x in (0, 30, 60, 90, 120):                       # top shelf
+        boxes.append({'box': [x, 100, x + 25, 180], 'score': 1})
+    boxes.append({'box': [30, 215, 55, 295], 'score': 1})  # second cartridge stacked up
+    two = assign_shelves(boxes, max_rows=2)
+    assert len({d['shelf_idx'] for d in two}) == 2
+    stacked = [two[1], two[-1]]                          # same column, two tiers
+    assert stacked[0]['shelf_idx'] == stacked[1]['shelf_idx']
+    assert {stacked[0]['tier'], stacked[1]['tier']} == {0, 1}
+    three = assign_shelves(boxes, max_rows=4)
+    assert len({d['shelf_idx'] for d in three}) >= len({d['shelf_idx'] for d in two})
+    with pytest.raises(ValueError):
+        assign_shelves(boxes, max_rows=0)

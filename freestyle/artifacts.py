@@ -256,6 +256,22 @@ def _metrics_summary(metrics: dict[str, Any] | None) -> dict[str, Any] | None:
     }
 
 
+def _identifier_gallery_block(ident: dict[str, Any]) -> dict[str, Any] | None:
+    """Return the dict inside ``ident`` that carries ``gallery``/``model``, or ``None``.
+
+    Embedding identifiers keep their options at the top level; ``hybrid_vlm_knn`` nests
+    them under ``embedding`` (its VLM half has no gallery). ``None`` means there is no
+    embedding gallery to freeze into the bundle.
+    """
+    kind = ident.get("type")
+    if kind in ("embedding_knn", "embedding_prototype"):
+        return ident
+    if kind == "hybrid_vlm_knn":
+        block = ident.get("embedding")
+        return block if isinstance(block, dict) else None
+    return None
+
+
 def export_bundle(
     run_dir: str | Path,
     name: str,
@@ -264,6 +280,8 @@ def export_bundle(
     overwrite: bool = False,
     identifier: dict[str, Any] | None = None,
     counting_override: dict[str, Any] | None = None,
+    localizer_override: dict[str, Any] | None = None,
+    notes: dict[str, Any] | str | None = None,
 ) -> Path:
     """Freeze a completed experiment run directory into ``artifacts/<name>/``.
 
@@ -271,7 +289,12 @@ def export_bundle(
     ``embedding_knn`` to a run that evaluated ``none``). When the requested identifier is
     ``embedding_knn`` and the run has no saved ``gallery.npz``, the gallery is rebuilt from
     the run's cached ``embeddings.npz`` (train-split, known-class crops only). ``counting_override``
-    optionally overrides frozen counting knobs (e.g. ``{"neighbour_vote": "report"}`).
+    optionally overrides frozen counting knobs (e.g. ``{"neighbour_vote": "report"}``).
+    ``localizer_override`` optionally overrides localizer knobs (e.g. ``{"score_thr": 0.1}``) —
+    the detector's own per-tile threshold, which ``counting.score_thr`` cannot raise back up
+    again because those boxes were already dropped while merging tiles.
+    ``notes`` is recorded verbatim under ``provenance['notes']`` — use it to say what was
+    tuned, on which split, and against what (model labels are never ground truth).
     """
     if not name or "/" in name or "\\" in name or name in (".", ".."):
         raise ValueError(f"Invalid bundle name: {name!r}")
@@ -290,6 +313,10 @@ def export_bundle(
 
     loc = dict(pipeline_cfg.get("localizer") or {})
     loc.pop("training", None)
+    if localizer_override:
+        if "type" in localizer_override and localizer_override["type"] != loc.get("type"):
+            raise ValueError("localizer_override may not change the localizer type")
+        loc.update(localizer_override)
     if not loc.get("type"):
         raise ValueError("localizer.type is required to export a bundle")
 
@@ -299,7 +326,7 @@ def export_bundle(
     counting = dict(pipeline_cfg.get("counting") or resolved.get("count") or {})
     counting.setdefault("identity_thr", 0.5)
     counting.setdefault("neighbour_vote", "off")
-    counting.setdefault("max_rows", 4)
+    counting.setdefault("max_rows", 2)
     if isinstance(metrics, dict) and metrics.get("score_thr") is not None:
         counting["score_thr"] = float(metrics["score_thr"])
     else:
@@ -340,10 +367,11 @@ def export_bundle(
             shutil.copy2(prop, stage_dir / "proposals.json")
             loc["path"] = "proposals.json"
 
-        # 2. Identifier gallery npz if embedding_knn.
+        # 2. Identifier gallery npz for embedding-backed identifiers.
         embedder_id: str | None = None
-        if ident.get("type") == "embedding_knn":
-            requested_model = ident.get("model")
+        gallery_block = _identifier_gallery_block(ident)
+        if gallery_block is not None:
+            requested_model = gallery_block.get("model")
             gallery = _resolve_asset(ident.get("gallery"), run_path, ("gallery.npz",))
             if gallery is not None:
                 embedder_id = str(requested_model or "facebook/dinov2-base")
@@ -356,8 +384,10 @@ def export_bundle(
                     stage_dir / "gallery.npz",
                     model=(str(requested_model) if requested_model else None),
                 )
-            ident["model"] = embedder_id
-            ident["gallery"] = "gallery.npz"
+            gallery_block["model"] = embedder_id
+            gallery_block["gallery"] = "gallery.npz"
+            if ident.get("type") == "embedding_prototype":
+                gallery_block.setdefault("classifier", "prototype")
         elif ident.get("type") == "vlm_crop":
             embedder_id = str(ident.get("model") or "") or None
 
@@ -421,6 +451,8 @@ def export_bundle(
             },
             "files": files_manifest,
         }
+        if notes is not None:
+            manifest["provenance"]["notes"] = notes
         (stage_dir / "manifest.json").write_text(
             json.dumps(manifest, indent=2) + "\n", encoding="utf-8"
         )
@@ -535,7 +567,9 @@ def load_bundle(
 
     ident = dict(config.get("identifier") or {"type": "none"})
     ident_type = ident.pop("type")
-    if ident_type == "embedding_knn":
+    if ident_type in ("embedding_knn", "embedding_prototype"):
+        if ident_type == "embedding_prototype":
+            ident.setdefault("classifier", "prototype")
         ident["gallery"] = _resolve_bundle_path(bundle_dir, ident["gallery"])
         if device != "auto":
             ident.setdefault("device", device)
@@ -546,6 +580,15 @@ def load_bundle(
         from freestyle.vlm_ground import CropIdentifier
 
         identifier = CropIdentifier(**ident)
+    elif ident_type == "hybrid_vlm_knn":
+        from freestyle.pipeline import HybridIdentifier
+
+        embedding = dict(ident.get("embedding") or {})
+        embedding["gallery"] = _resolve_bundle_path(bundle_dir, embedding["gallery"])
+        if device != "auto":
+            embedding.setdefault("device", device)
+        identifier = HybridIdentifier(embedding=embedding, vlm=ident.get("vlm") or {},
+                                      family_threshold=ident.get("family_threshold", 0.5))
     else:
         raise ValueError(f"unknown identifier: {ident_type}")
 
@@ -610,6 +653,16 @@ def main(argv: list[str] | None = None) -> int:
         default=None,
         help="JSON counting override, e.g. '{\"neighbour_vote\":\"report\"}'.",
     )
+    exp.add_argument(
+        "--localizer",
+        default=None,
+        help="JSON localizer override, e.g. '{\"score_thr\":0.1}'.",
+    )
+    exp.add_argument(
+        "--notes",
+        default=None,
+        help="Free-form provenance note (what was tuned, on which split) stored in manifest.json.",
+    )
 
     ver = sub.add_parser("verify", help="Verify a bundle's manifest and SHA-256 checksums.")
     ver.add_argument("name", help="Bundle name under artifacts/.")
@@ -619,6 +672,7 @@ def main(argv: list[str] | None = None) -> int:
     if args.command == "export":
         ident_override = json.loads(args.identifier) if args.identifier else None
         counting_override = json.loads(args.counting) if args.counting else None
+        localizer_override = json.loads(args.localizer) if args.localizer else None
         out = export_bundle(
             args.run,
             args.name,
@@ -626,6 +680,8 @@ def main(argv: list[str] | None = None) -> int:
             overwrite=args.overwrite,
             identifier=ident_override,
             counting_override=counting_override,
+            localizer_override=localizer_override,
+            notes=args.notes,
         )
         print(out)
         return 0

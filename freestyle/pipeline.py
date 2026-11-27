@@ -9,7 +9,8 @@ import numpy as np
 from PIL import Image, ImageDraw
 
 from freestyle.count import aggregate_counts, assign_shelves, suspicious_gaps, suspicious_overlaps
-from freestyle.geometry import crop, xywh_to_xyxy, xyxy_to_xywh
+from freestyle.count.pairs import infer_pairs
+from freestyle.geometry import crop, suppress_duplicates, xywh_to_xyxy, xyxy_to_xywh
 
 
 class ProposalLocalizer:
@@ -24,10 +25,20 @@ class ProposalLocalizer:
 
 
 class EmbeddingIdentifier:
-    def __init__(self, gallery, model='facebook/dinov2-base', k=5, **kwargs):
-        from freestyle.identify.classify import KNNClassifier
+    """Identify crops from a train-only embedding gallery.
+
+    ``classifier='knn'`` votes over the top-k gallery rows, ``'prototype'`` compares
+    against one mean vector per class. ``max_per_class`` caps how many rows a class
+    may contribute and ``balance`` (knn) weights each class inversely to its gallery
+    size; both stop a 60-crop class from deciding every vote.
+    """
+
+    def __init__(self, gallery, model='facebook/dinov2-base', k=5, classifier='knn',
+                 max_per_class=None, balance=False, temperature=None, **kwargs):
         from freestyle.identify.embed import Embedder
 
+        if classifier not in ('knn', 'prototype'):
+            raise ValueError(f'unknown classifier: {classifier}')
         with np.load(gallery, allow_pickle=False) as data:
             for key in ('image_ids', 'splits', 'groups'):
                 if key not in data or len(data[key]) != len(data['labels']) or any(not str(v) for v in data[key]):
@@ -35,24 +46,148 @@ class EmbeddingIdentifier:
             if any(str(v) != 'train' for v in data['splits']):
                 raise ValueError('Gallery may contain train rows only')
             self.gallery_groups = set(map(str, data['groups']))
-            self.classifier = KNNClassifier(k=k).fit(data['embeddings'], data['labels'])
+            self.embeddings = np.asarray(data['embeddings'], dtype=np.float32)
+            self.labels = np.asarray(data['labels'], dtype=str)
+        self.classifier_name = classifier
+        self.options = {'k': k, 'max_per_class': max_per_class, 'balance': balance,
+                        'temperature': temperature}
+        self.classifier = self._fit(self.embeddings, self.labels)
         self.embedder = Embedder(name=model, **kwargs)
 
+    def _fit(self, embeddings, labels):
+        from freestyle.identify.classify import KNNClassifier, PrototypeClassifier
+
+        if self.classifier_name == 'prototype':
+            options = {'max_per_class': self.options['max_per_class']}
+            if self.options['temperature'] is not None:
+                options['temperature'] = self.options['temperature']
+            clf = PrototypeClassifier(**options)
+        else:
+            options = {'k': self.options['k'], 'balance': self.options['balance'],
+                       'max_per_class': self.options['max_per_class']}
+            if self.options['temperature'] is not None:
+                options['temperature'] = self.options['temperature']
+            clf = KNNClassifier(**options)
+        return clf.fit(embeddings, labels)
+
+    def restricted(self, classes):
+        """Return a classifier over gallery rows of ``classes`` only (or None)."""
+        keep = np.isin(self.labels, list(classes))
+        if not keep.any():
+            return None
+        return self._fit(self.embeddings[keep], self.labels[keep])
+
+    def embed(self, image, detections):
+        return self.embedder.embed([crop(image, d['box']) for d in detections])
+
     def predict(self, image, detections):
-        embeddings = self.embedder.embed([crop(image, d['box']) for d in detections])
-        if not len(detections):
+        embeddings = self.embed(image, detections)
+        return self.predict_embeddings(embeddings)
+
+    def predict_embeddings(self, embeddings):
+        if len(embeddings) == 0:
             return []
         labels, scores = self.classifier.predict_with_scores(embeddings, unknown_thr=None)
         return [{'class': str(label), 'id_score': float(score)}
                 for label, score in zip(labels, scores)]
 
 
+class HybridIdentifier:
+    """VLM family first, then embedding kNN inside that family to pick the part.
+
+    The VLM two-stage pass is asked for the family only; the part numeral is decided
+    by nearest gallery crops *restricted to that family's classes*, so a misread
+    numeral cannot move the crop to another product. Unknown families stay unknown, and
+    so does any family whose gallery is missing one of its parts (``part_source``
+    ``no_gallery`` / ``gallery_gap``) rather than guessing the part the gallery knows.
+    """
+
+    def __init__(self, embedding, vlm, family_threshold=0.5, **kwargs):
+        """``embedding`` is an :class:`EmbeddingIdentifier` (or its config), ``vlm`` a VLM identifier."""
+        from freestyle.vlm_identify import VLMCropIdentifier
+
+        self.embedding = embedding if hasattr(embedding, 'restricted') \
+            else EmbeddingIdentifier(**embedding)
+        self.vlm = vlm if hasattr(vlm, 'identify_batch') and hasattr(vlm, '_families') else \
+            VLMCropIdentifier(mode='two_stage', **vlm)
+        self.family_threshold = float(family_threshold)
+        self.gallery_groups = self.embedding.gallery_groups
+        self.families = {family: [cls for cls in entry['classes'].values() if cls != 'unknown']
+                        for family, entry in self.vlm._families().items()}
+
+    def predict(self, image, detections):
+        crops = [crop(image, d['box']) for d in detections]
+        if not crops:
+            return []
+        shelves = [d.get('shelf') if d.get('shelf') in ('top', 'bottom') else None
+                   for d in detections]
+        families = self.vlm.identify_batch(crops, shelves)
+        embeddings = self.embedding.embed(image, detections)
+        results = []
+        for crop_index, (family_hit, embedding) in enumerate(zip(families, embeddings)):
+            family = str(family_hit.get('family', 'unknown'))
+            confidence = float(family_hit.get('confidence', 0.0))
+            base = {'family': family, 'part': family_hit.get('part'),
+                    'family_confidence': confidence, 'rationale': family_hit.get('rationale', '')}
+            classes = self.families.get(family, [])
+            if not classes or confidence < self.family_threshold:
+                results.append({**base, 'class': 'unknown', 'id_score': 0.0, 'part_source': 'vlm'})
+                continue
+            if len(classes) == 1:
+                results.append({**base, 'class': classes[0], 'id_score': confidence,
+                                'part_source': 'single'})
+                continue
+            vlm_class = str(family_hit.get('class') or 'unknown')
+            if vlm_class in classes:      # the VLM read the part numeral itself
+                results.append({**base, 'class': vlm_class, 'id_score': confidence,
+                                'part_source': 'vlm'})
+                continue
+            # Part unreadable: let the gallery decide, but only when it actually holds
+            # crops for every part of this family. Otherwise kNN would silently collapse
+            # the choice onto the one part it knows (e.g. coca-cola-part2 alone), which is
+            # the same confident-guessing failure the kNN-only identifier had.
+            classifier = self.embedding.restricted(classes)
+            covered = set(map(str, getattr(classifier, 'classes_', []))) if classifier is not None else set()
+            if classifier is None or not set(classes) <= covered:
+                results.append({**base, 'class': 'unknown', 'id_score': 0.0,
+                                'part_source': 'no_gallery' if classifier is None else 'gallery_gap'})
+                continue
+            label, score = classifier.predict_with_scores(embedding[None], unknown_thr=None)
+            results.append({**base, 'class': str(label[0]), 'part': None,
+                            'id_score': min(confidence, float(score[0])),
+                            'part_confidence': float(score[0]), 'part_source': 'knn'})
+        return results
+
+
 class Pipeline:
+    """Locate, identify, deduplicate and count cartridges in one original-pixel image.
+
+    Counting knobs (all config-settable): ``max_rows`` caps shelf rows so a two-high
+    stack stays a tier, ``suppress_*`` controls the final class-agnostic duplicate
+    suppression (including the looser same-row / same-column threshold), ``shelf_hint``
+    lets the
+    identifier see a top/bottom hint before the final deduplication, and ``pair_rule``
+    reports or applies the shelf-order part rule.
+    """
+
     def __init__(self, localizer, identifier=None, score_thr=0.0, identity_thr=0.5,
-                 neighbour_vote='off', max_rows=4):
+                 neighbour_vote='off', max_rows=2, suppress_iou=None, suppress_containment=None,
+                 suppress_row_iou=None, suppress_row_x_overlap=0.5, shelf_hint=False, pair_rule='off',
+                 pair_family_threshold=0.5, pair_part_threshold=0.5):
+        # YAML 1.1 readers turn an unquoted ``off`` into False; accept that spelling.
+        neighbour_vote = 'off' if neighbour_vote is False else neighbour_vote
+        pair_rule = 'off' if pair_rule is False else pair_rule
+        if neighbour_vote not in ('off', 'report', 'apply') or pair_rule not in ('off', 'report', 'apply'):
+            raise ValueError('neighbour_vote and pair_rule must be off, report, or apply')
         self.localizer, self.identifier = localizer, identifier
         self.score_thr, self.identity_thr = score_thr, identity_thr
         self.neighbour_vote, self.max_rows = neighbour_vote, max_rows
+        self.suppression = {'iou': suppress_iou, 'containment': suppress_containment,
+                            'row_iou': suppress_row_iou, 'row_x_overlap': suppress_row_x_overlap}
+        self.shelf_hint = bool(shelf_hint)
+        self.pair_rule = pair_rule
+        self.pair_thresholds = {'family_threshold': pair_family_threshold,
+                                'part_threshold': pair_part_threshold}
 
     @classmethod
     def from_config(cls, yaml_path):
@@ -71,18 +206,23 @@ class Pipeline:
             localizer = Localizer(**loc)
         else:
             raise ValueError(f'unknown localizer: {kind}')
-        ident = dict(config.get('identifier', {'type': 'none'}))
-        kind = ident.pop('type')
-        if kind == 'embedding_knn':
-            identifier = EmbeddingIdentifier(**ident)
-        elif kind == 'none':
-            identifier = None
-        elif kind == 'vlm_crop':
-            from freestyle.vlm_ground import CropIdentifier
-            identifier = CropIdentifier(**ident)
-        else:
-            raise ValueError(f'unknown identifier: {kind}')
+        identifier = build_identifier(config.get('identifier', {'type': 'none'}))
         return cls(localizer, identifier, **config.get('counting', {}))
+
+    def _shelf_labels(self, detections):
+        """Attach a catalog top/bottom shelf hint to each detection, or None.
+
+        Identifiers read the hint from ``shelf`` (the same key the finished result
+        uses for the numeric row), which is overwritten by the final row assignment.
+        """
+        rows = {d['shelf_idx'] for d in detections}
+        highest, lowest = (min(rows), max(rows)) if rows else (None, None)
+        for d in detections:
+            label = None if not self.shelf_hint or len(rows) < 2 else \
+                ('top' if d['shelf_idx'] == highest else 'bottom' if d['shelf_idx'] == lowest else None)
+            d['shelf_hint'] = label
+            if label is not None:
+                d['shelf'] = label
 
     def run(self, pil_image, image_id, group=None):
         gallery = getattr(self.identifier, "gallery_groups", None)
@@ -99,6 +239,20 @@ class Pipeline:
             detections = self.localizer.predict(pil_image)
         detections = [dict(d) for d in detections if d['score'] >= self.score_thr]
         timings['localize'] = (time.perf_counter() - start) * 1000
+        start = time.perf_counter()
+        duplicates = 0
+        if any(self.suppression[key] is not None
+               for key in ('iou', 'containment', 'row_iou')) and detections:
+            # Row context first: the class-agnostic deduplication uses it, then the
+            # survivors are re-assigned so columns and tiers describe the final set.
+            rows = [d['shelf_idx'] for d in assign_shelves(detections, self.max_rows)]
+            kept = suppress_duplicates(detections, rows=rows, **self.suppression)
+            duplicates = len(detections) - len(kept)
+            detections = kept
+        if detections:
+            detections = assign_shelves(detections, self.max_rows)
+            self._shelf_labels(detections)
+        timings['deduplicate'] = (time.perf_counter() - start) * 1000
         start = time.perf_counter()
         if self.identifier is not None:
             identities = self.identifier.predict(pil_image, detections)
@@ -126,7 +280,6 @@ class Pipeline:
                 d['class'] = 'unknown'
         timings['identify'] = (time.perf_counter() - start) * 1000
         start = time.perf_counter()
-        detections = assign_shelves(detections, self.max_rows)
         flags = []
         for shelf in sorted({d['shelf_idx'] for d in detections}):
             indices = [i for i, d in enumerate(detections) if d['shelf_idx'] == shelf]
@@ -140,12 +293,43 @@ class Pipeline:
             for flag in votes:
                 detections[flag['detection']]['class'] = flag['suggested_class']
                 detections[flag['detection']]['id_score'] = flag['suggested_score']
+        if self.pair_rule != 'off' and detections:
+            annotated = infer_pairs(detections, mode=self.pair_rule, **self.pair_thresholds)
+            for index, (before, after) in enumerate(zip(detections, annotated)):
+                if after['run_id'] is None:
+                    continue
+                flags.append({'type': 'pair_rule', 'detection': index, 'run_id': after['run_id'],
+                              'reason': after['rule_reason'], 'flags': after['flags'],
+                              **({'suggested_class': after['class']} if after['class'] != before['class'] else {})})
+                if self.pair_rule == 'apply':
+                    detections[index].update({k: v for k, v in after.items() if k in
+                                              ('class', 'part_inferred', 'rule_reason', 'run_id')})
+            counts, unknown, _ = aggregate_counts(detections, self.score_thr, self.identity_thr, 'off')
         timings['count'] = (time.perf_counter() - start) * 1000
         for d in detections:
             d['shelf'] = d.pop('shelf_idx')
             d['column'] = d.pop('column_idx')
         return {'detections': detections, 'counts': counts, 'unknown': unknown,
+                'duplicates_removed': duplicates, 'rows': len({d['shelf'] for d in detections}),
                 'flags': flags, 'timings_ms': timings}
+
+
+def build_identifier(spec):
+    """Instantiate an identifier from a config block (``type`` plus its options)."""
+    ident = dict(spec or {'type': 'none'})
+    kind = ident.pop('type')
+    if kind in ('embedding_knn', 'embedding_prototype'):
+        if kind == 'embedding_prototype':
+            ident.setdefault('classifier', 'prototype')
+        return EmbeddingIdentifier(**ident)
+    if kind == 'none':
+        return None
+    if kind == 'vlm_crop':
+        from freestyle.vlm_ground import CropIdentifier
+        return CropIdentifier(**ident)
+    if kind == 'hybrid_vlm_knn':
+        return HybridIdentifier(**ident)
+    raise ValueError(f'unknown identifier: {kind}')
 
 
 def run_images(pipeline, images, out, categories):
