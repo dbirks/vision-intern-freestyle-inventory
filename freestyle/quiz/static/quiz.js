@@ -15,7 +15,8 @@
     contextCaption: $('context-caption'), guessText: $('guess-text'), guessConf: $('guess-conf'),
     chipText: $('progress-short'),
     partAnswers: $('part-answers'), cropAnswers: $('crop-answers'), classGrid: $('class-grid'),
-    correct: $('btn-correct'), undo: $('undo'),
+    correct: $('btn-correct'), next: $('btn-next'), nextPart: $('btn-next-part'), undo: $('undo'),
+    confirm: $('confirm'), confirmText: $('confirm-text'),
     progressFill: $('progress-fill'), progressBar: $('progress-bar'), chip: $('progress-chip'),
     lightbox: $('lightbox'), lightboxImg: $('lightbox-img'),
     theme: $('theme'), restart: $('restart')
@@ -26,8 +27,13 @@
   var index = 0;         // current question index
   var frameOrder = [];   // image ids in queue order (matches /img/frame?i=)
   var partStep = false;  // crop question showing the part chooser first
+  var selected = null;   // picked-but-not-submitted answer for the current question
   var busy = false;
+  var confirming = false;
+  var confirmTimer = 0;
   var fix = { top: 0, bottom: 0 };
+
+  var CONFIRM_MS = 500;  // how long the big ✓ stays up before the answer is posted
 
   // Short chip labels for the 3-column class grid (full name stays in the title).
   var SHORT = {
@@ -96,6 +102,10 @@
     els.undo.disabled = Object.keys(answers).length === 0;
   }
 
+  function currentQuestion() {
+    return queue && index < queue.questions.length ? queue.questions[index] : null;
+  }
+
   function prefetch() {
     // warm the server cache + the browser cache for the next few crops
     var host = location.origin;
@@ -129,8 +139,10 @@
     els.quiz.hidden = false;
     var q = queue.questions[index];
     partStep = false;
+    selected = null;
     window.scrollTo(0, 0);
     if (q.kind === 'count') renderCount(q); else renderCrop(q);
+    syncSelection();
     drawProgress();
     prefetch();
   }
@@ -213,9 +225,101 @@
     });
   }
 
+  // ------------------------------------------------- selection + confirm
+
+  function answerKey(answer) {
+    if (!answer) return '';
+    if (answer.result === 'class') return 'class:' + answer.class;
+    if (answer.result === 'part') return 'part:' + answer.part;
+    return 'crop:' + answer.result;
+  }
+
+  function datasetKey(dataset) {
+    if (dataset.part) return 'part:' + dataset.part;
+    if (dataset.class) return 'class:' + dataset.class;
+    if (dataset.crop) return 'crop:' + dataset.crop;
+    return '';
+  }
+
+  // Tapping a choice only picks it (tap again to clear); Next submits.
+  function toggleSelect(answer) {
+    selected = (selected && answerKey(selected) === answerKey(answer)) ? null : answer;
+    syncSelection();
+  }
+
+  function syncSelection() {
+    var stale = document.querySelectorAll('.is-sel');
+    for (var i = 0; i < stale.length; i++) stale[i].classList.remove('is-sel');
+    var scope = partStep ? els.partAnswers : els.cropAnswers;
+    var selKey = answerKey(selected);
+    if (scope) {
+      var buttons = scope.querySelectorAll('[data-class],[data-crop],[data-part]');
+      for (var j = 0; j < buttons.length; j++) {
+        var on = !!selKey && datasetKey(buttons[j].dataset) === selKey;
+        buttons[j].classList.toggle('is-sel', on);
+        buttons[j].setAttribute('aria-pressed', on ? 'true' : 'false');
+      }
+    }
+    var picked = !!selected;
+    els.next.hidden = !picked || partStep;
+    els.next.disabled = !picked;
+    els.correct.hidden = picked || partStep;
+    els.nextPart.hidden = !(picked && partStep);
+    els.nextPart.disabled = !picked;
+  }
+
+  function pressNext() {
+    var q = currentQuestion();
+    if (!q || !selected) return;
+    confirmThenSend(q.qid, selected, q);
+  }
+
+  // Big centred ✓ for ~500 ms, then post and advance.
+  function confirmThenSend(qid, answer, question) {
+    if (busy || confirming) return;
+    confirming = true;
+    showConfirm(answer, question);
+    setTimeout(function () {
+      confirming = false;
+      send(qid, answer, question);
+    }, CONFIRM_MS);
+  }
+
+  function showConfirm(answer, question) {
+    els.confirmText.textContent = labelFor(answer, question);
+    els.confirm.hidden = false;
+    clearTimeout(confirmTimer);
+    confirmTimer = setTimeout(function () { els.confirm.hidden = true; }, CONFIRM_MS + 200);
+  }
+
+  function classShort(name) {
+    var classes = (queue && queue.classes) || [];
+    for (var i = 0; i < classes.length; i++) {
+      if (classes[i].name === name) return shortLabel(classes[i]);
+    }
+    return SHORT[name] || String(name || '');
+  }
+
+  function labelFor(answer, question) {
+    var result = answer.result;
+    if (result === 'class') return classShort(answer.class);
+    if (result === 'part') return 'Part ' + answer.part;
+    if (result === 'not_cartridge') return 'Not a cartridge';
+    if (result === 'two_plus') return '2+';
+    if (result === 'partial') return 'Partial';
+    if (result === 'skip') return 'Skipped';
+    if (result === 'not_cabinet') return 'Unusable frame';
+    if (result === 'fix') return answer.top + ' top / ' + answer.bottom + ' bottom';
+    if (result === 'correct') {
+      if (question && question.kind === 'count') return 'Count is right';
+      return question ? classShort(question.guess) || question.guess_text || 'Correct' : 'Correct';
+    }
+    return 'Saved';
+  }
+
   // ---------------------------------------------------------------- answers
 
-  function send(qid, answer) {
+  function send(qid, answer, question) {
     if (busy) return;
     busy = true;
     fetch('/api/answer', {
@@ -233,7 +337,7 @@
       answers = result.body.state.answers || {};
       index = result.body.state.next_index;
       busy = false;
-      toast(savedLabel(answer));
+      toast(savedLabel(answer, question));
       render();
     }).catch(function (error) {
       busy = false;
@@ -241,13 +345,11 @@
     });
   }
 
-  function savedLabel(answer) {
-    var map = {
-      correct: '✓ saved', fix: 'count saved', not_cabinet: 'marked unusable',
-      class: 'saved', part: 'saved', not_cartridge: 'not a cartridge',
-      two_plus: '2+ flagged', partial: 'partial flagged', skip: 'skipped'
-    };
-    return map[answer.result] || 'saved';
+  function savedLabel(answer, question) {
+    var label = labelFor(answer, question);
+    if (answer.result === 'skip') return '↷ ' + label;
+    if (answer.result === 'not_cabinet') return '↻ ' + label;
+    return '✓ ' + label;
   }
 
   function advance() {
@@ -272,11 +374,10 @@
     }).catch(function () { busy = false; toast('undo failed', true); });
   }
 
-  function answerFromButton(q, dataset) {
-    if (dataset.count) return { result: dataset.count };
-    if (dataset.crop) return { result: dataset.crop };
+  function answerFromDataset(q, dataset) {
     if (dataset.class) return { result: 'class', class: dataset.class };
-    if (dataset.part) return { result: 'part', part: Number(dataset.part) };
+    if (dataset.crop) return dataset.crop === 'skip' ? { result: 'skip' } : { result: dataset.crop };
+    if (dataset.part && q.ask_part) return { result: 'part', part: Number(dataset.part) };
     return null;
   }
 
@@ -306,32 +407,46 @@
 
   document.addEventListener('click', function (event) {
     var target = event.target.closest ? event.target.closest('button') : null;
-    if (!target || busy) return;
-    var q = queue && index < queue.questions.length ? queue.questions[index] : null;
+    if (!target || busy || confirming) return;
+    var q = currentQuestion();
     if (!q) return;
+    var d = target.dataset || {};
     if (target === els.undo) { undo(); return; }
     if (target === els.theme) { toggleTheme(); return; }
     if (target === els.restart) { index = 0; render(); return; }
-    if (target.dataset && target.dataset.step) {
-      var key = target.dataset.target;
+    if (d.step) {
+      var key = d.target;
       if (key) {
-        fix[key] = Math.max(0, Math.min(500, fix[key] + Number(target.dataset.step)));
+        fix[key] = Math.max(0, Math.min(500, fix[key] + Number(d.step)));
         syncFix();
       }
       return;
     }
-    if (target === $('fix-save')) { send(q.qid, { result: 'fix', top: fix.top, bottom: fix.bottom }); return; }
+    if (target === els.next || target === els.nextPart) { pressNext(); return; }
+    // count question: the only one-tap answers here are Skip and “not usable”
+    if (d.count === 'skip') { send(q.qid, { result: 'skip' }, q); return; }
+    if (d.count === 'not_cabinet') { send(q.qid, { result: 'not_cabinet' }, q); return; }
+    if (d.count === 'correct') { confirmThenSend(q.qid, { result: 'correct' }, q); return; }
     // "Fix the numbers" only opens the stepper panel; the answer is sent by Save.
-    if (target.dataset && target.dataset.count === 'fix') return;
-    if (target === $('part-unknown')) {
-      partStep = false;
-      els.partAnswers.hidden = true;
-      els.cropAnswers.hidden = false;
+    if (d.count === 'fix') return;
+    if (target === $('fix-save')) {
+      confirmThenSend(q.qid, { result: 'fix', top: fix.top, bottom: fix.bottom }, q);
       return;
     }
-    if (target === els.correct) { send(q.qid, { result: 'correct' }); return; }
-    var answer = answerFromButton(q, target.dataset || {});
-    if (answer) send(q.qid, answer);
+    if (target === $('part-unknown')) {
+      partStep = false;
+      selected = null;
+      els.partAnswers.hidden = true;
+      els.cropAnswers.hidden = false;
+      syncSelection();
+      return;
+    }
+    if (target === els.correct) { confirmThenSend(q.qid, { result: 'correct' }, q); return; }
+    // every remaining choice selects only — Next (or Enter) posts it
+    var answer = answerFromDataset(q, d);
+    if (!answer) return;
+    if (answer.result === 'skip') { send(q.qid, answer, q); return; }
+    toggleSelect(answer);
   });
 
   document.addEventListener('click', function (event) {
@@ -342,38 +457,50 @@
 
   document.addEventListener('keydown', function (event) {
     if (event.metaKey || event.ctrlKey || event.altKey) return;
-    if (!queue || busy || index >= queue.questions.length) return;
+    if (!queue || busy || confirming || index >= queue.questions.length) return;
     var q = queue.questions[index];
     var key = event.key;
     if (key === 'Escape' && !els.lightbox.hidden) { event.preventDefault(); closeZoom(); return; }
     if (key === 'u') { event.preventDefault(); undo(); return; }
-    if (key === 's') { event.preventDefault(); send(q.qid, { result: 'skip' }); return; }
-    if (q.kind === 'count') {
-      if (key === 'y') { event.preventDefault(); send(q.qid, { result: 'correct' }); }
-      else if (key === 'f') { event.preventDefault(); els.countFix.hidden = false; }
-      else if (key === 'x') { event.preventDefault(); send(q.qid, { result: 'not_cabinet' }); }
+    if (key === 's') { event.preventDefault(); send(q.qid, { result: 'skip' }, q); return; }
+    if (key === 'Enter') {
+      if (selected) { event.preventDefault(); pressNext(); }
       return;
     }
+    if (q.kind === 'count') {
+      if (key === 'y') { event.preventDefault(); confirmThenSend(q.qid, { result: 'correct' }, q); }
+      else if (key === 'f') { event.preventDefault(); els.countFix.hidden = false; }
+      else if (key === 'x') { event.preventDefault(); send(q.qid, { result: 'not_cabinet' }, q); }
+      return;
+    }
+    var choice = null;
     if (partStep) {
-      if (key === '1' || key === '2') { event.preventDefault(); send(q.qid, { result: 'part', part: Number(key) }); }
+      if (key === '1' || key === '2') choice = { result: 'part', part: Number(key) };
       else if (key === 'y' || key === 'c') {
+        // "Neither": drop down to the full class grid
         event.preventDefault();
         partStep = false;
+        selected = null;
         els.partAnswers.hidden = true;
         els.cropAnswers.hidden = false;
+        syncSelection();
       }
-      return;
-    }
-    if (key === 'y') { event.preventDefault(); send(q.qid, { result: 'correct' }); return; }
-    if (key === 'n') { event.preventDefault(); send(q.qid, { result: 'not_cartridge' }); return; }
-    if (key === 'k') { event.preventDefault(); send(q.qid, { result: 'class', class: 'unknown' }); return; }
-    if (key === 'p') { event.preventDefault(); send(q.qid, { result: 'partial' }); return; }
-    if (key === 'm') { event.preventDefault(); send(q.qid, { result: 'two_plus' }); return; }
-    var digits = '123456789';
-    var slot = digits.indexOf(key);
-    if (slot >= 0 && queue.classes[slot]) {
+    } else if (key === 'y') {
       event.preventDefault();
-      send(q.qid, { result: 'class', class: queue.classes[slot].name });
+      confirmThenSend(q.qid, { result: 'correct' }, q);
+      return;
+    } else {
+      var digits = '123456789';
+      var slot = digits.indexOf(key);
+      if (slot >= 0 && queue.classes[slot]) choice = { result: 'class', class: queue.classes[slot].name };
+      else if (key === 'n') choice = { result: 'not_cartridge' };
+      else if (key === 'k') choice = { result: 'class', class: 'unknown' };
+      else if (key === 'p') choice = { result: 'partial' };
+      else if (key === 'm') choice = { result: 'two_plus' };
+    }
+    if (choice) {
+      event.preventDefault();
+      toggleSelect(choice);
     }
   });
 

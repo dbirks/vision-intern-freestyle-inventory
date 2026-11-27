@@ -96,20 +96,22 @@
       <p class="ask">Guess: <strong id="guess-text">unknown</strong> <span class="ask__conf" id="guess-conf">0%</span></p>
 
       <div class="answers answers--part" id="part-answers" hidden>
-        <button class="btn btn--primary btn--big" data-part="1" type="button">Part 1</button>
-        <button class="btn btn--primary btn--big" data-part="2" type="button">Part 2</button>
+        <button class="btn btn--primary btn--big" data-part="1" type="button" aria-pressed="false">Part 1</button>
+        <button class="btn btn--primary btn--big" data-part="2" type="button" aria-pressed="false">Part 2</button>
         <button class="btn btn--big" id="part-unknown" type="button">Neither</button>
-        <p class="ask__note">Which end face is this? “Neither” shows every class and the box flags.</p>
+        <button class="btn btn--primary btn--big part-next" id="btn-next-part" type="button" hidden disabled>Next →</button>
+        <p class="ask__note">Pick one, then Next. “Neither” shows every class and the box flags.</p>
       </div>
 
       <div class="answers" id="crop-answers" hidden>
         <button class="btn btn--primary btn--big" id="btn-correct" type="button">✓ Correct</button>
+        <button class="btn btn--primary btn--big" id="btn-next" type="button" hidden disabled>Next →</button>
         <div class="class-grid" id="class-grid"></div>
         <div class="answers-row">
-          <button class="chip-btn chip-btn--primary" data-class="unknown" type="button" title="This cartridge is not determinable (unknown)">Can't tell</button>
-          <button class="chip-btn chip-btn--warn" data-crop="not_cartridge" type="button" title="Not a cartridge">Not cart.</button>
-          <button class="chip-btn chip-btn--warn" data-crop="two_plus" type="button" title="Box covers 2 or more cartridges">2+</button>
-          <button class="chip-btn chip-btn--warn" data-crop="partial" type="button" title="Box cuts a cartridge (partial)">Partial</button>
+          <button class="chip-btn chip-btn--primary" data-class="unknown" type="button" aria-pressed="false" title="This cartridge is not determinable (unknown)">Can't tell</button>
+          <button class="chip-btn chip-btn--warn" data-crop="not_cartridge" type="button" aria-pressed="false" title="Not a cartridge">Not cart.</button>
+          <button class="chip-btn chip-btn--warn" data-crop="two_plus" type="button" aria-pressed="false" title="Box covers 2 or more cartridges">2+</button>
+          <button class="chip-btn chip-btn--warn" data-crop="partial" type="button" aria-pressed="false" title="Box cuts a cartridge (partial)">Partial</button>
           <button class="chip-btn chip-btn--ghost" data-crop="skip" type="button" title="Skip this box">Skip →</button>
         </div>
       </div>
@@ -123,13 +125,21 @@
   </section>
 </main>
 
+<!-- big centred ✓ shown for ~500 ms before an answer is posted -->
+<div class="confirm" id="confirm" hidden aria-hidden="true">
+  <div class="confirm__badge">
+    <span class="confirm__mark">✓</span>
+    <span class="confirm__text" id="confirm-text"></span>
+  </div>
+</div>
+
 <div class="lightbox" id="lightbox" hidden>
   <button class="lightbox__close icon-btn" id="lightbox-close" type="button" aria-label="Close zoom">✕</button>
   <div class="lightbox__scroll" id="lightbox-scroll"><img id="lightbox-img" alt="zoomed image" decoding="async" /></div>
   <p class="lightbox__hint">pinch / drag to zoom · tap to close</p>
 </div>
 
-<p class="hint" id="hint">tap image to zoom · y correct · 1–9 class · k can't tell · n not a cartridge · u undo · s skip</p>
+<p class="hint" id="hint">tap image to zoom · 1–9 pick · ⏎ next · y correct · k can't tell · n not a cartridge · u undo · s skip</p>
 <script src="/static/quiz.js"></script>
 </body>
 </html>
