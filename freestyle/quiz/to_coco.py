@@ -12,6 +12,19 @@ human only ever sets identity, count and drop flags. Alongside ``--out`` a
 ``<split>_counts.json`` is written: per image the human-stated total, the
 per-class counts derived from the answered crops, and a flag when the two
 disagree (boxes missed or merged).
+
+"Not a usable cabinet view" (``not_cabinet``, and the ``implied_not_usable`` crop
+answers it writes) is an **exclusion**, never a zero count: the human is saying
+"this frame is too blurry / too partial to count", which says nothing about how many
+cartridges it holds. Such an image gets ``usable = false``, ``exclude_reason =
+"not_usable"`` and ``human_counts = None`` (there is no human total), so no metric can
+read a verified ``0`` out of it. A verified negative would need its own answer type
+("this frame holds no cartridges"); none exists today — see ``NO_CARTRIDGES_RESULTS``.
+
+Crop answers on such a frame are still human statements about that crop (the human did
+name it), so they are exported as identity-labelled GT boxes. Counting and every other
+image-level metric skip the frame (``freestyle/experiments/score_all.py`` excludes
+``usable = false`` images with reason ``not_usable``).
 """
 
 from __future__ import annotations
@@ -33,9 +46,34 @@ CARTRIDGE_SUPER = "cartridge"
 HUMAN = "human"
 MODEL = "model"
 
+# Count answers that mean "this frame cannot be counted" -> exclude the image.
+NOT_USABLE_RESULTS = frozenset({"not_cabinet"})
+# Count answers that would mean "I counted and there are none" -> a verified zero.
+# No such answer type exists in the quiz yet (freestyle.quiz.server.COUNT_RESULTS);
+# the hook is here so a future one cannot silently reuse the not-usable path.
+NO_CARTRIDGES_RESULTS: frozenset[str] = frozenset()
+NOT_USABLE = "not_usable"
+
+
+def is_not_usable(result: Any) -> bool:
+    """True when a count answer excludes the image instead of stating a total."""
+    return str(result or "") in NOT_USABLE_RESULTS
+
+
+def has_human_count(result: Any) -> bool:
+    """True when a count answer states a total the metrics may score against."""
+    result = str(result or "")
+    return result in NO_CARTRIDGES_RESULTS or result in ("fix", "correct")
+
+
+#: Answer payloads that are not answers: a ``revisit`` marker (freestyle.quiz.server)
+#: only re-offers a hidden question, so it must not replace the answer that was there,
+#: and no metric may read a verdict out of it.
+NON_ANSWER_RESULTS = frozenset({"revisit"})
+
 
 def load_answers(path: Path) -> dict[str, dict[str, Any]]:
-    """Question id -> answer payload; the last line for a question wins."""
+    """Question id -> answer payload; the last real answer for a question wins."""
     out: dict[str, dict[str, Any]] = {}
     if not Path(path).is_file():
         return out
@@ -47,8 +85,12 @@ def load_answers(path: Path) -> dict[str, dict[str, Any]]:
             record = json.loads(line)
         except json.JSONDecodeError:
             continue
-        if isinstance(record, dict) and record.get("qid") and isinstance(record.get("answer"), dict):
-            out[str(record["qid"])] = record["answer"]
+        if not (isinstance(record, dict) and record.get("qid")
+                and isinstance(record.get("answer"), dict)):
+            continue
+        if str(record["answer"].get("result") or "") in NON_ANSWER_RESULTS:
+            continue
+        out[str(record["qid"])] = record["answer"]
     return out
 
 
@@ -85,20 +127,31 @@ def _answer_class(question: dict[str, Any], answer: dict[str, Any]) -> str:
 
 
 def _image_counts(image: dict[str, Any], answer: dict[str, Any] | None) -> dict[str, Any]:
-    """human_counts + usability for one image from its count question's answer."""
+    """human_counts + usability for one image from its count question's answer.
+
+    ``exclude_reason`` is ``"not_usable"`` for a frame the human refused to count (no
+    human total exists — it is never ``0``), else ``None``.
+    """
     model = {"top": int(image.get("model_top") or 0), "bottom": int(image.get("model_bottom") or 0)}
     model["total"] = int(image.get("model_total") or 0)
     result = str((answer or {}).get("result") or "")
+
+    def counted(counts: dict[str, int]) -> dict[str, Any]:
+        return {"human_counts": counts, "model_counts": model, "usable": True,
+                "count_answered": True, "exclude_reason": None}
+
+    if is_not_usable(result):
+        return {"human_counts": None, "model_counts": model, "usable": False,
+                "count_answered": True, "exclude_reason": NOT_USABLE}
+    if result in NO_CARTRIDGES_RESULTS:  # a human-verified 'no cartridges' frame
+        return counted({"top": 0, "bottom": 0, "total": 0})
     if result == "fix":
         top, bottom = int(answer.get("top") or 0), int(answer.get("bottom") or 0)
-        return {"human_counts": {"top": top, "bottom": bottom, "total": top + bottom},
-                "model_counts": model, "usable": True, "count_answered": True}
-    if result == "not_cabinet":
-        zero = {"top": 0, "bottom": 0, "total": 0}
-        return {"human_counts": zero, "model_counts": model, "usable": False, "count_answered": True}
+        return counted({"top": top, "bottom": bottom, "total": top + bottom})
     if result == "correct":
-        return {"human_counts": model, "model_counts": model, "usable": True, "count_answered": True}
-    return {"human_counts": None, "model_counts": model, "usable": True, "count_answered": False}
+        return counted(dict(model))
+    return {"human_counts": None, "model_counts": model, "usable": True,
+            "count_answered": False, "exclude_reason": None}
 
 
 def build_coco(
@@ -138,7 +191,8 @@ def build_coco(
             _identity(questions[qid], answers.get(qid))[1] == HUMAN for qid in crop_qids
         )
         count_ok = bool(count_answer) and str(count_answer.get("result") or "") != "skip"
-        verified = bool(qids) and count_ok and (human_crops or not meta["usable"])
+        # an uncountable frame is not usable image-level GT at all, so it is never 'verified'
+        verified = bool(meta["usable"]) and bool(qids) and count_ok and human_crops
 
         coco_image = int(image.get("coco_image_id") or 0) or (len(images) + 1)
         per_class: dict[str, int] = {}
@@ -148,8 +202,13 @@ def build_coco(
             if question["kind"] != CROP:
                 continue
             name, source, result = _identity(question, answers.get(qid))
-            if name is None or not meta["usable"]:
-                continue  # 'not a cartridge', or a frame the human called unusable
+            # 'not a cartridge' (and the implied_not_usable tap of an uncountable frame)
+            # drops the box; an identity the human did name on an uncountable frame stays
+            # as crop-level GT, because it is still a human statement about that crop.
+            if name is None:
+                continue
+            if not meta["usable"] and source != HUMAN:
+                continue  # on an excluded frame, model identities are not GT either
             if source == HUMAN:  # only human-verified boxes count toward the totals
                 crop_total += 1
                 per_class[name] = per_class.get(name, 0) + 1
@@ -182,7 +241,8 @@ def build_coco(
             )
 
         human_total = (meta["human_counts"] or {}).get("total")
-        mismatch = meta["count_answered"] and meta["usable"] and human_total is not None and human_total != crop_total
+        mismatch = (meta["count_answered"] and meta["usable"] and human_total is not None
+                    and human_total != crop_total)
         images.append(
             {
                 "id": coco_image,
@@ -193,8 +253,10 @@ def build_coco(
                 "group_id": group_id_for(image_id),
                 "attributes": {
                     "verified": verified,
-                    "scene": "no_cabinet" if not meta["usable"] else image.get("scene"),
+                    # 'not usable' is not 'no cabinet': the frame keeps its audited scene
+                    "scene": image.get("scene"),
                     "usable": bool(meta["usable"]),
+                    "exclude_reason": meta["exclude_reason"],
                     "human_counts": meta["human_counts"],
                     "model_counts": meta["model_counts"],
                     "quiz": {
@@ -215,15 +277,19 @@ def build_coco(
             "questions": len(qids),
             "verified": verified,
             "usable": bool(meta["usable"]),
+            "exclude_reason": meta["exclude_reason"],
             "counts_mismatch": bool(mismatch),
         }
 
     verified_images = sum(1 for i in images if i["attributes"]["verified"])
+    not_usable_images = sum(1 for i in images if not i["attributes"]["usable"])
     document = {
         "info": {
             "description": f"Freestyle cartridge ground truth — quiz-built, split '{split}'",
             "human_verified_images": verified_images,
             "total_images": len(images),
+            "usable_images": len(images) - not_usable_images,
+            "excluded_not_usable_images": not_usable_images,
             "generated_at": time.strftime("%Y-%m-%dT%H:%M:%S%z"),
             "annotation_contract": "docs/freestyle/ARCHITECTURE.md",
             "source": "freestyle.quiz",
@@ -240,6 +306,7 @@ def build_coco(
         "images": counts,
         "mismatches": sorted(k for k, v in counts.items() if v["counts_mismatch"]),
         "unverified": sorted(k for k, v in counts.items() if not v["verified"]),
+        "not_usable": sorted(k for k, v in counts.items() if not v["usable"]),
     }
     return document, counts_doc
 
@@ -292,6 +359,9 @@ def main(argv: list[str] | None = None) -> int:
     )
     if not answers:
         print("warning: no answers found; everything is identity_source=model", file=sys.stderr)
+    if info["excluded_not_usable_images"]:
+        print(f"excluded as 'not a usable cabinet view' (never zero counts): "
+              f"{info['excluded_not_usable_images']}/{info['total_images']} images", file=sys.stderr)
     return 0
 
 

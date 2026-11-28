@@ -5,10 +5,12 @@
 #   0. validate the repo/paths it is about to touch (and `uv`)
 #   1. quiz          — serve freestyle.quiz.server so the remaining questions get answered
 #                      (skippable: --skip-quiz, e.g. when the answers are already in)
-#   2. sufficiency   — HARD GATE: abort unless >= --min-frac (default 0.80) of the test split's
-#                      `purpose: eval` questions are answered with a non-`skip` result AND every
-#                      val COUNT question is answered. Val crops and all train questions are
-#                      optional — score_all only reads val counts to pick its thresholds.
+#   2. sufficiency   — HARD GATE on USABLE images: abort unless at least MIN_USABLE_TEST (2)
+#                      test images and MIN_USABLE_VAL (1) val images are a frame the human
+#                      actually counted ("not a usable cabinet view" excludes a frame, it is
+#                      never a zero count). Prints a loud `thin evidence` warning below
+#                      THIN_EVIDENCE_TEST (5) usable test images; the --min-frac question
+#                      coverage line is informational only.
 #   3. to_coco       — export data/gt/test.json + data/gt/val.json (+ *_counts.json mismatches)
 #   4. score_all     — score every run with both val and test predictions, 1000 bootstrap reps,
 #                      identifier variants: none/vlm (Inkling identities) and vlm_flash (Flash
@@ -27,7 +29,8 @@
 #
 # Usage:
 #   scripts/finalize_after_gt.sh [--dry-run] [--skip-quiz] [--skip-export] [--bootstrap N]
-#                                [--min-frac 0.80] [--answer-file PATH] [--queue PATH]
+#                                [--min-frac 0.80] [--min-usable-test N] [--min-usable-val N]
+#                                [--thin-evidence N] [--answer-file PATH] [--queue PATH]
 #                                [--runs GLOB] [--proposals PATH] [--proposals-flash PATH]
 #                                [--bundle-name NAME] [--quiz-host H] [--quiz-port P]
 #
@@ -53,7 +56,10 @@ GT_OUT_DIR="data/gt"
 RESULTS_MD="docs/freestyle/RESULTS_GT.md"
 REPORT="docs/freestyle/REPORT.md"
 BUNDLE_NAME="rfdetr-final-v2"
-MIN_FRAC="0.80"
+MIN_FRAC="0.80"          # informational question-coverage line
+MIN_USABLE_TEST=2      # hard: test images with a human count
+MIN_USABLE_VAL=1         # hard: val images with a human count (threshold selection)
+THIN_EVIDENCE_TEST=5     # below this many usable test images -> loud warning
 BOOTSTRAP=1000
 QUIZ_HOST="${QUIZ_HOST:-127.0.0.1}"
 QUIZ_PORT="${QUIZ_PORT:-8766}"
@@ -79,6 +85,9 @@ while [ $# -gt 0 ]; do
     --skip-export) SKIP_EXPORT=1 ;;
     --bootstrap) BOOTSTRAP="${2:?--bootstrap needs a value}"; shift ;;
     --min-frac) MIN_FRAC="${2:?--min-frac needs a value}"; shift ;;
+    --min-usable-test) MIN_USABLE_TEST="${2:?--min-usable-test needs a value}"; shift ;;
+    --min-usable-val) MIN_USABLE_VAL="${2:?--min-usable-val needs a value}"; shift ;;
+    --thin-evidence) THIN_EVIDENCE_TEST="${2:?--thin-evidence needs a value}"; shift ;;
     --queue) QUEUE="${2:?}"; shift ;;
     --answer-file|--answers) ANSWERS="${2:?}"; shift ;;
     --proposals) PROPOSALS="${2:?}"; shift ;;
@@ -87,7 +96,7 @@ while [ $# -gt 0 ]; do
     --bundle-name) BUNDLE_NAME="${2:?}"; shift ;;
     --quiz-host) QUIZ_HOST="${2:?}"; shift ;;
     --quiz-port) QUIZ_PORT="${2:?}"; shift ;;
-    -h|--help) sed -n '2,33p' "${BASH_SOURCE[0]}"; exit 0 ;;
+    -h|--help) sed -n '2,39p' "${BASH_SOURCE[0]}"; exit 0 ;;
     *) die "unknown argument: $1 (try --help)" ;;
   esac
   shift
@@ -101,6 +110,9 @@ case "$MIN_FRAC" in
   ''|*[!0-9.]*|*.*.*) die "--min-frac must be a decimal like 0.80 (got '$MIN_FRAC')" ;;
 esac
 [ "$BOOTSTRAP" -ge 1 ] 2>/dev/null || die "--bootstrap must be a positive integer"
+for n in "$MIN_USABLE_TEST" "$MIN_USABLE_VAL" "$THIN_EVIDENCE_TEST"; do
+  case "$n" in ''|*[!0-9]*) die "usable-image thresholds must be non-negative integers (got '$n')" ;; esac
+done
 
 # ------------------------------------------------------------- step 0: preconditions ---
 say "repo: $REPO_ROOT (branch $(git rev-parse --abbrev-ref HEAD 2>/dev/null || echo '?'))"
@@ -146,20 +158,22 @@ else
     --queue "$QUEUE" --answers "$ANSWERS" --host "$QUIZ_HOST" --port "$QUIZ_PORT"
 fi
 
-# ------------------------- step 2: sufficiency gate (test eval 80% + all val counts = abort) ---
-# What scoring actually needs (see freestyle/experiments/score_all.py):
-#   test / purpose=eval  — the numbers we report: >= --min-frac of these answered (skips don't count),
-#                          and score_all still drops any single image below its own 80% rule.
-#   val  / kind=count    — ALL of them: select_thresholds() picks score/identity thresholds purely
-#                          by minimising val total-count error.
-#   val  / kind=crop     — optional; when answered they feed the identity gallery / train-confidence
-#                          tuning, when missing score_all reports 'insufficient val crops' instead of
-#                          failing the run.
-#   train / purpose=train — VLM-labelled proposals, never quiz GT: nothing is required here.
+# ------------- step 2: sufficiency gate (usable test/val images with a human count) ---
+# What scoring actually needs (see freestyle/experiments/score_all.py + quiz/to_coco.py):
+#   a USABLE image with a human COUNT  — the only frames that exist in the metrics at all.
+#                          'not_cabinet' (and the implied_not_usable crop answers it writes)
+#                          means "too blurry / partial to count", so such a frame is EXCLUDED
+#                          (reason not_usable); it is never a verified zero-cartridge frame.
+#                          Need >= MIN_USABLE_TEST test and >= MIN_USABLE_VAL val of them.
+#   test / purpose=eval    — >= --min-frac of these answered is printed for information;
+#                          score_all still drops a single image below its own 80% rule.
+#   val  / kind=count      — only usable frames drive select_thresholds(); val crops and all
+#                          train questions stay optional (they only feed identity galleries).
 # Mirrors freestyle.quiz.to_coco.load_answers (last line per qid wins) and the 'skip' semantics.
 check_answers() {
   local queue="$1" answers="$2" min_frac="$3"
-  "${PYENV[@]}" - "$queue" "$answers" "$min_frac" <<'PY'
+  "${PYENV[@]}" - "$queue" "$answers" "$min_frac" "$MIN_USABLE_TEST" "$MIN_USABLE_VAL" \
+      "$THIN_EVIDENCE_TEST" <<'PY'
 import json
 import math
 import sys
@@ -167,96 +181,110 @@ from collections import defaultdict
 from pathlib import Path
 
 sys.path.insert(0, '.')
-from freestyle.quiz.to_coco import load_answers  # last-line-wins answer loader
+from freestyle.quiz.to_coco import has_human_count, is_not_usable, load_answers  # answer semantics
 
 queue_path, answers_path, min_frac = Path(sys.argv[1]), Path(sys.argv[2]), float(sys.argv[3])
+min_test, min_val, thin = int(sys.argv[4]), int(sys.argv[5]), int(sys.argv[6])
 queue = json.loads(queue_path.read_text(encoding='utf-8'))
 answers = load_answers(answers_path) if answers_path.is_file() else {}
 
 questions = queue['questions']
 
 
+def answer_result(question):
+    return (answers.get(question['qid']) or {}).get('result')
+
+
 def answered(question):
-    result = (answers.get(question['qid']) or {}).get('result')
-    return result not in (None, '', 'skip')
+    return answer_result(question) not in (None, '', 'skip')
 
 
 def purpose(question):
     return str(question.get('purpose') or 'eval')
 
 
+def kind(question):
+    return str(question.get('kind') or 'crop')
+
+
+counts = {split: [q for q in questions if q['split'] == split and kind(q) == 'count']
+          for split in ('train', 'val', 'test')}
+# usable == the human stated a total; a refused frame is excluded from every metric
+counted = {split: {q['image_id'] for q in qs if has_human_count(answer_result(q))}
+           for split, qs in counts.items()}
+unusable = {split: {q['image_id'] for q in qs if is_not_usable(answer_result(q))}
+            for split, qs in counts.items()}
+
 eval_test = [q for q in questions if q['split'] == 'test' and purpose(q) == 'eval']
-val_counts = [q for q in questions if q['split'] == 'val' and q.get('kind') == 'count']
-val_crops = [q for q in questions if q['split'] == 'val' and q.get('kind') != 'count']
+val_crops = [q for q in questions if q['split'] == 'val' and kind(q) != 'count']
 train_qs = [q for q in questions if q['split'] == 'train' or purpose(q) == 'train']
 
-# A frame answered 'not_cabinet' on its count question is a finished GT negative: to_coco drops
-# its crops and score_all keeps it without the per-image 80% rule. Its crop questions stay in the
-# denominator here (a stricter gate is safe: passing this one passes the excluded form too).
-not_cabinet = {q['image_id'] for q in questions
-               if q.get('kind') == 'count' and (answers.get(q['qid']) or {}).get('result') == 'not_cabinet'}
-
-eval_total = len(eval_test)
-eval_got = sum(1 for q in eval_test if answered(q))
-eval_need = min(eval_total, max(0, math.ceil(eval_total * min_frac - 1e-9))) if eval_total else 1
-val_total = len(val_counts)
-val_got = sum(1 for q in val_counts if answered(q))
-val_need = val_total or 1
-val_crop_got = sum(1 for q in val_crops if answered(q))
-train_got = sum(1 for q in train_qs if answered(q))
-
 print(f'answers file: {answers_path} ({len(answers)} distinct qids recorded)')
-print(f'test eval {eval_got}/{eval_total} (need {eval_need}) · '
-      f'val counts {val_got}/{val_total} (need {val_need})')
+print(f'usable test images with counts: {len(counted["test"])} (need >= {min_test})')
+print(f'usable val images with counts: {len(counted["val"])} (need >= {min_val})')
+print(f'excluded as not usable: {len(unusable["test"])} test, {len(unusable["val"])} val '
+      f'(uncountable frames — never zero-cartridge frames)')
 
 
 def flag(enough):
     return 'OK ' if enough else 'LOW'
 
 
+print(f'  [{flag(len(counted["test"]) >= min_test)}] test: {len(counted["test"])} usable '
+      f'frames with a human count (need >= {min_test})')
+print(f'  [{flag(len(counted["val"]) >= min_val)}] val: {len(counted["val"])} usable frames '
+      f'with a human count for threshold selection (need >= {min_val})')
+if len(counted['test']) < thin:
+    print(f'  *** WARNING: THIN EVIDENCE — only {len(counted["test"])} usable test images '
+          f'with counts (< {thin}); every headline number hangs off them ***')
+
+# informational: question coverage (the 80% rule score_all applies per image)
+eval_total = len(eval_test)
+eval_got = sum(1 for q in eval_test if answered(q))
+eval_need = min(eval_total, max(0, math.ceil(eval_total * min_frac - 1e-9))) if eval_total else 1
 if eval_total:
-    print(f'  [{flag(eval_got >= eval_need)}] test eval: {eval_got}/{eval_total} = '
-          f'{eval_got / eval_total:.0%} answered (need {eval_need} = {min_frac:.0%})')
+    print(f'  [inf] test eval questions: {eval_got}/{eval_total} answered '
+          f'(informational, --min-frac {min_frac:.0%} would need {eval_need})')
 else:
-    print('  [LOW] test eval: the queue has no purpose=eval test questions')
-if val_total:
-    print(f'  [{flag(val_got >= val_need)}] val count answers (threshold selection): '
-          f'{val_got}/{val_total} (need all)')
-else:
-    print('  [LOW] val: the queue has no count questions')
+    print('  [inf] test eval: the queue has no purpose=eval test questions')
+val_count_got = sum(1 for q in counts['val'] if answered(q))
+print(f'  [inf] val count questions answered: {val_count_got}/{len(counts["val"])} '
+      f'({len(counted["val"])} usable with a count)')
+val_crop_got = sum(1 for q in val_crops if answered(q))
 print(f'  [opt] val crop answers (identity gallery): {val_crop_got}/{len(val_crops)}'
       f' — {"complete" if val_crop_got >= len(val_crops) else "insufficient val crops"}')
+train_got = sum(1 for q in train_qs if answered(q))
 print(f'  [opt] train questions: {train_got}/{len(train_qs)} — not required by scoring')
-if not_cabinet:
-    crops = sum(1 for q in eval_test if q.get('kind') != 'count' and q['image_id'] in not_cabinet)
-    print(f'  negatives (not_cabinet): {len(not_cabinet)} frame(s), '
-          f'{crops} crop question(s) kept in the denominator')
 
-val_missing = [q['qid'] for q in val_counts if not answered(q)]
-if val_missing:
-    print(f'  val counts still missing: {", ".join(val_missing)}')
-
-# Informational: score_all excludes individual test images below its own per-image 80% rule.
+# Informational: score_all excludes individual usable test images below its per-image 80% rule,
+# so a frame can hold a count and still drop out of the metrics.
 per_image = defaultdict(lambda: [0, 0])            # image_id -> [answered, effective questions]
 for q in eval_test:
-    if q['image_id'] in not_cabinet and q.get('kind') != 'count':
-        continue
+    if q['image_id'] in unusable['test'] or q['image_id'] not in counted['test']:
+        continue                                   # excluded frames are not scored at all
     per_image[q['image_id']][1] += 1
     if answered(q):
         per_image[q['image_id']][0] += 1
 images = sorted(per_image, key=lambda i: per_image[i][0] / max(per_image[i][1], 1))
 short = [i for i in images if per_image[i][0] / max(per_image[i][1], 1) < 0.8]
-print(f'  test images below the per-image 80% rule (score_all excludes these): {len(short)}/{len(images)}')
+print(f'  usable test images with a count below score_all\'s per-image 80% rule '
+      f'(these get excluded too): {len(short)}/{len(images)}')
 for i in short[:5]:
     a, t = per_image[i]
     print(f'    {a}/{t}  {i}')
 if len(short) > 5:
     print(f'    ... and {len(short) - 5} more')
+scored_test = len(counted['test']) - len(short)
+if scored_test < min_test:
+    print(f'  *** WARNING: only {scored_test} usable test images are expected to survive the '
+          f'per-image 80% rule (< {min_test}) ***')
 
-ok = bool(eval_total) and eval_got >= eval_need and bool(val_total) and val_got >= val_need
+ok = len(counted['test']) >= min_test and len(counted['val']) >= min_val
 if not ok:
-    print('INSUFFICIENT: answer the test eval questions to the need above AND every val count '
-          'question (val crops and train stay optional).', file=sys.stderr)
+    print(f'INSUFFICIENT: need >= {min_test} USABLE test images and >= {min_val} usable val '
+          'image with a human count (a "not a usable cabinet view" tap excludes the frame, it '
+          'does not make it a zero). Answer the count questions on real cabinet views.',
+          file=sys.stderr)
     raise SystemExit(3)
 print('sufficiency gate passed.')
 PY

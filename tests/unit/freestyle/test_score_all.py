@@ -320,14 +320,159 @@ def test_pair_derived_family_and_threshold():
     assert all(r['class'] == 'unknown' for r in prepare_rows(rows, {'height': 100}, 0, .75, True))
 
 
-def test_negative_bypasses_completion_cutoff(monkeypatch):
-    image = {'id': 1, 'file_name': 'negative', 'attributes': {
-        'human_counts': {'total': 0}, 'usable': False, 'verified': True}}
-    coco = {'images': [image], 'annotations': [], 'info': {}}
-    counts = {'images': {'negative': {}}, 'mismatches': [], 'unverified': []}
-    monkeypatch.setattr('freestyle.experiments.score_all.build_coco', lambda *args: (coco, counts))
-    queue = {'questions': [{'qid': str(i), 'image_id': 'negative'} for i in range(6)]}
-    assert build_human_gt(queue, {'0': {'result': 'not_cabinet'}}, 'test')[0]['images'] == [image]
+def test_not_usable_image_is_excluded_not_counted_as_zero(monkeypatch):
+    """"Not a usable cabinet view" drops the frame from every metric, in both splits."""
+    import copy
+
+    images = [
+        {'id': 1, 'file_name': 'counted', 'attributes': {
+            'human_counts': {'total': 3, 'top': 2, 'bottom': 1}, 'usable': True,
+            'exclude_reason': None, 'verified': True}},
+        {'id': 2, 'file_name': 'uncountable', 'attributes': {
+            'human_counts': None, 'usable': False, 'exclude_reason': 'not_usable',
+            'verified': False}},
+    ]
+    coco = {'images': images, 'annotations': [
+        {'image_id': 1, 'attributes': {'identity_source': 'human'}},
+        {'image_id': 2, 'attributes': {'identity_source': 'human'}},   # a named crop
+    ], 'info': {}}
+    counts = {'images': {'counted': {}, 'uncountable': {}}, 'mismatches': [],
+              'unverified': ['uncountable']}
+    monkeypatch.setattr('freestyle.experiments.score_all.build_coco',
+                        lambda *args: (copy.deepcopy(coco), copy.deepcopy(counts)))
+    questions = [{'qid': f'c{i}', 'image_id': 'counted', 'kind': 'count' if not i else 'crop'}
+                 for i in range(5)]
+    questions += [{'qid': f'n{i}', 'image_id': 'uncountable',
+                   'kind': 'count' if not i else 'crop'} for i in range(6)]
+    answers = {f'c{i}': {'result': 'correct'} for i in range(5)}
+    answers['n0'] = {'result': 'not_cabinet'}
+
+    for split in ('test', 'val'):
+        result, result_counts, excluded = build_human_gt({'questions': questions}, answers, split)
+        assert [image['file_name'] for image in result['images']] == ['counted']
+        # the not_usable reason wins over missing_count/below_80_percent
+        assert [(x['image_id'], x['reason']) for x in excluded] == [('uncountable', 'not_usable')]
+        assert [ann['image_id'] for ann in result['annotations']] == [1], 'excluded frame leaves the set'
+        assert list(result_counts['images']) == ['counted']
+
+
+def test_threshold_selection_ignores_not_usable_val_frames():
+    """A frame nobody counted must never act as a zero target for the score threshold."""
+    from freestyle.experiments.score_all import select_thresholds
+
+    usable = {'id': 1, 'file_name': 'counted', 'height': 100, 'attributes': {
+        'usable': True, 'human_counts': {'total': 1}}}
+    uncountable = {'id': 2, 'file_name': 'uncountable', 'height': 100, 'attributes': {
+        'usable': False, 'exclude_reason': 'not_usable', 'human_counts': {'total': 0}}}
+    box = {'bbox': [0, 0, 10, 10], 'score': .9}
+    rows = {1: [dict(box)], 2: [dict(box, bbox=[x, 0, 10, 10]) for x in (0, 20, 40)]}
+    counts = {'images': {'counted': {'classes': {}, 'verified': True, 'counts_mismatch': False}}}
+    # one real cartridge -> the grid middle (.45); the phantom zero would have forced .95
+    assert select_thresholds([usable, uncountable], {}, counts, rows, False, True)[2] == .45
+    with pytest.raises(ValueError):
+        select_thresholds([uncountable], {}, counts, rows, False, True)
+
+
+def _countable_fixture(tmp_path, val_results, score_thr=None, identity_thr=None):
+    """One usable val frame, one val frame the human refused to count, one usable test frame.
+
+    The refused val frame carries three confident predictions: if it were ever scored as a
+    zero-cartridge negative, threshold selection would jump to the top of the grid and every
+    real detection would be thrown away.
+    """
+    import json
+
+    def save(path, obj):
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(json.dumps(obj))
+
+    classes = [{'id': 1, 'name': 'sprite'}, {'id': 2, 'name': 'unknown'}]
+    images, questions, records, audit, splits_map, groups, anns = [], [], [], [], {}, {}, []
+    predictions = {'val': [], 'test': []}
+    for idx, (split, name) in enumerate([('val', 'local/v1.jpg'), ('val', 'local/v2.jpg'),
+                                         ('test', 'local/t1.jpg')], 1):
+        splits_map[name] = split
+        groups[name] = split                        # one group per frame
+        images.append({'image_id': name, 'coco_image_id': idx, 'split': split, 'width': 100,
+                       'height': 100, 'model_top': 1, 'model_bottom': 0, 'model_total': 1})
+        audit.append({'image_id': name, 'scene_label': 'cabinet_full', 'motion_blur': 'none'})
+        count, crop = f'count:{name}', f'crop:{name}:{idx}'
+        questions += [{'qid': count, 'image_id': name, 'kind': 'count'},
+                      {'qid': crop, 'image_id': name, 'kind': 'crop', 'ann_id': idx,
+                       'bbox': [10, 10, 20, 30], 'guess': 'sprite'}]
+        result = val_results[idx] if split == 'val' else 'correct'
+        records.append({'qid': count, 'answer': {'result': result}})
+        if result != 'not_cabinet':
+            records.append({'qid': crop, 'answer': {'result': 'correct'}})
+            anns.append({'id': idx, 'image_id': idx, 'bbox': [10, 10, 10, 20], 'category_id': 1,
+                         'attributes': {'id_mode': 'two_stage', 'id_confidence': .9}})
+        boxes = 3 if result == 'not_cabinet' else 1
+        predictions[split] += [{'image_id': idx, 'bbox': [10 + 20 * b, 10, 10, 20],
+                                'category_id': 1, 'score': .9, 'proposed_class': 'sprite',
+                                'id_score': .9} for b in range(boxes)]
+    queue_path, answer_path = tmp_path / 'queue.json', tmp_path / 'answers.jsonl'
+    save(queue_path, {'version': 1, 'classes': classes, 'images': images,
+                      'questions': questions})
+    answer_path.write_text(''.join(json.dumps(r) + '\n' for r in records))
+    save(tmp_path / 'splits.json', {'images': splits_map, 'groups': groups})
+    save(tmp_path / 'audit.json', {'images': audit})
+    save(tmp_path / 'proposals.json',
+         {'images': [{'id': i + 1, 'file_name': im['image_id']} for i, im in enumerate(images)],
+          'annotations': anns, 'categories': classes})
+    run = tmp_path / 'runs' / 'C_fake'
+    meta = {'config': {'family': 'C_det_agnostic', 'count': {'identity_thr': identity_thr}}}
+    save(run / 'meta.json', meta)
+    if score_thr is not None:
+        save(run / 'metrics.json', {'score_thr': score_thr})
+    for split in predictions:
+        save(run / split / 'predictions.json', predictions[split])
+    return ['--queue', str(queue_path), '--answers', str(answer_path), '--runs', str(run),
+            '--splits', str(tmp_path / 'splits.json'), '--audit', str(tmp_path / 'audit.json'),
+            '--proposals', str(tmp_path / 'proposals.json'), '--bootstrap', '20',
+            '--out', str(tmp_path / 'RESULTS_GT.md')]
+
+
+def test_usable_val_frames_alone_pick_the_threshold(tmp_path):
+    import json
+
+    assert main(_countable_fixture(tmp_path, {1: 'correct', 2: 'not_cabinet'})) == 0
+    data = json.loads((tmp_path / 'results_gt.json').read_text())
+    assert [(x['image_id'], x['reason']) for x in data['excluded']['val']] == [
+        ('local/v2.jpg', 'not_usable')]
+    assert data['rows'], 'the usable frames still score'
+    for row in data['rows']:
+        assert row['threshold_source'] == 'val'
+        assert row['score_thr'] == .45, 'tuned on the one real count, not the phantom zero'
+        subset = row['subsets']['all']
+        assert subset['n_images'] == 1 and subset['images'] == ['local/t1.jpg']
+        assert subset['metrics']['total_error'] == 0
+        assert [r['total_error'] for r in subset['per_image']] == [0]
+    assert any('not_usable' in note for note in data['limitations'])
+
+
+def test_thresholds_fall_back_to_the_run_metrics(tmp_path):
+    """With no usable val count answers each run keeps its own val-selected threshold."""
+    import json
+
+    argv = _countable_fixture(tmp_path, {1: 'not_cabinet', 2: 'not_cabinet'},
+                              score_thr=.42, identity_thr=.33)
+    assert main(argv) == 0
+    data = json.loads((tmp_path / 'results_gt.json').read_text())
+    assert {x['reason'] for x in data['excluded']['val']} == {'not_usable'}
+    assert data['rows'], 'scoring continues without val'
+    for row in data['rows']:
+        assert row['threshold_source'] == 'run_metrics'
+        assert row['score_thr'] == .42 and row['identity_thr'] == .33
+        assert row['subsets']['all']['metrics']['total_error'] == 0
+    assert any('run_metrics' in note for note in data['limitations'])
+    assert 'run_metrics' in (tmp_path / 'RESULTS_GT.md').read_text()
+
+
+def test_no_usable_val_frames_and_no_run_threshold_fails_loud(tmp_path):
+    argv = _countable_fixture(tmp_path, {1: 'not_cabinet', 2: 'not_cabinet'})
+    with pytest.raises(SystemExit):
+        main(argv)                       # nothing to tune on and nothing to fall back to
+    assert not (tmp_path / 'RESULTS_GT.md').exists()
 
 
 def test_incomplete_class_metrics_are_excluded():

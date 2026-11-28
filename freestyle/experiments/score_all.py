@@ -2,6 +2,16 @@
 
 Score human quiz counts and identities against experiment predictions.
 
+Frames the human refused to count ("not a usable cabinet view") are EXCLUDED from every
+metric with reason ``not_usable`` — they are never zero-cartridge frames (see
+``freestyle/quiz/to_coco.py``). Their crop answers stay in the GT export as identity
+labels, but this pass scores identity, counting and AP image by image, so a frame that is
+out of the image list contributes nothing here; ``data/gt/*.json`` keeps those labels for
+gallery/tooling use. Threshold selection therefore only ever sees usable val frames, and
+when no usable val frame has a human count it falls back to each run's own val-selected
+threshold (``runs/<exp>/metrics.json`` ``score_thr``, identity threshold from that run's
+``meta.json``), recorded as ``threshold_source = "run_metrics"``.
+
 Identity variants that read model-labelled proposals (``data/labels/*.json``, never GT):
     ``vlm``       Inkling 2 Mini two-stage identities from ``--proposals``
     ``vlm_flash`` Qwen 3.8 Flash Next two-stage + shelf-hint identities from
@@ -18,6 +28,7 @@ import argparse
 import glob
 import json
 import re
+import sys
 from collections import Counter, defaultdict
 from functools import lru_cache
 from pathlib import Path
@@ -42,6 +53,10 @@ def build_human_gt(
 ) -> tuple[dict[str, Any], dict[str, Any], list[dict[str, Any]]]:
     """Build quiz COCO, excluding incomplete images and model identities.
 
+    Exclusion reasons: ``not_usable`` (the human said the frame is not a usable cabinet
+    view — checked first, and never a zero-count frame), ``missing_count`` (no human
+    total), ``below_80_percent`` (too few crops answered on the eval split).
+
     ``test`` is the eval split: skips and missing answers do not count towards the
     80% per-image cutoff and a human count is required independently.
 
@@ -62,17 +77,24 @@ def build_human_gt(
         qs = questions.get(image_id, [])
         answered = sum(
             bool(answers.get(q['qid']))
-            and answers[q['qid']].get('result') not in (None, '', 'skip')
+            and answers[q['qid']].get('result') not in (None, '', 'skip', 'implied_not_usable')
             for q in qs
         )
         fraction = answered / len(qs) if qs else 0.0
-        short_of_crops = (fraction < 0.8 and image['attributes'].get('usable', True)
-                          and requires_crop_coverage)
-        if short_of_crops or image['attributes']['human_counts'] is None:
+        attributes = image['attributes']
+        if not attributes.get('usable', True):
+            # an uncountable frame is dropped whole: it has no human total and a zero
+            # there would punish every detection the models make on it
+            reason = str(attributes.get('exclude_reason') or 'not_usable')
+        elif attributes['human_counts'] is None:
+            reason = 'missing_count'
+        elif requires_crop_coverage and fraction < 0.8:
+            reason = 'below_80_percent'
+        else:
+            reason = ''
+        if reason:
             excluded.append({'image_id': image_id, 'answered': answered,
-                             'questions': len(qs), 'fraction': fraction,
-                             'reason': 'missing_count' if image['attributes']['human_counts'] is None
-                                       else 'below_80_percent'})
+                             'questions': len(qs), 'fraction': fraction, 'reason': reason})
         else:
             kept.append(image)
     ids = {image['id'] for image in kept}
@@ -370,7 +392,14 @@ def score_subset(images, gt, counts, rows_by_image, score_thr, identity_thr, pai
 
 
 def select_thresholds(images, gt, counts, rows_by_image, pair, none):
+    """Pick the score/identity thresholds on usable validation frames only.
+
+    A frame the human refused to count is never a zero-count target here (it would push the
+    threshold to 1.0 to punish every detection on it); ``build_human_gt`` already excludes
+    those, and this filter is the second lock.
+    """
     # Deterministic grid chosen solely by validation counting error.
+    images = [im for im in images if im['attributes'].get('usable', True)]
     if not images:
         raise ValueError('no eligible validation images for threshold selection')
     candidates = tuple(i / 20 for i in range(20))
@@ -401,6 +430,27 @@ def select_thresholds(images, gt, counts, rows_by_image, pair, none):
     return (*best_error, score, identity)
 
 
+def run_thresholds(path, meta):
+    """Fallback thresholds for a run when no usable val frame carries a human count.
+
+    Each experiment already picked its own score_thr on its val manifest
+    (``freestyle.eval.evaluate`` writes it to ``runs/<exp>/metrics.json``); the identity
+    threshold comes from that run's config. Returns ``(score_thr, identity_thr, source)``
+    or ``None`` when the run recorded nothing to fall back on.
+    """
+    metrics_path = Path(path) / 'metrics.json'
+    if not metrics_path.is_file():
+        return None
+    try:
+        score_thr = read_json(metrics_path).get('score_thr')
+    except (OSError, ValueError):
+        return None
+    if score_thr is None:
+        return None
+    identity_thr = ((meta.get('config') or {}).get('count') or {}).get('identity_thr', 0.)
+    return float(score_thr), float(identity_thr), 'run_metrics'
+
+
 def validate_groups(gt, split, splits):
     groups = load_groups_map(gt, splits)
     for image in gt['images']:
@@ -417,7 +467,9 @@ def markdown(result):
              'AP50 compares with human-filtered boxes that originate from model proposals; it is not independent localization GT.',
              'Identity accuracy is conditional on a matched human-answered, known-identity crop.',
              'Class inventory and AP exclude incomplete images and count mismatches.',
-             'Thresholds minimize validation total count error, then class count error; embedding validation uses held-out groups.',
+             'Frames answered "not a usable cabinet view" are excluded from every metric (reason not_usable); they are never zero-cartridge frames.',
+             'Thresholds minimize validation total count error, then class count error on usable val frames only; embedding validation uses held-out groups.',
+             'When no usable val frame has a human count, each run keeps its own val-selected threshold from runs/<exp>/metrics.json (threshold_source=run_metrics).',
              'The validation split needs human count answers only; unanswered validation crops just shrink the identity gallery.',
              'Training-gallery confidence thresholds are selected on validation; +val galleries hold out the query group during validation and use all validation groups at test time. Train and validation may contain near duplicates.',
              'Sharp-full means cabinet_full with no or mild motion blur; partial/blurry means cabinet_partial or severe blur. Other audit cases are omitted from these subsets.',
@@ -425,8 +477,11 @@ def markdown(result):
     for split in ('val', 'test'):
         lines.append(f"- {split}: " + (', '.join(x['image_id'] + ' (' + x['reason'] + ')'
                                                 for x in result['excluded'][split]) or 'none'))
-    lines += ['', '| Localiser | Identifier | Pair | Train confidence | Train crops | Subset | Images | Total MAE (95% CI) | Top MAE | Bottom MAE | Exact inventory | ID accuracy | AP50 |',
-              '|---|---|---|---:|---:|---|---:|---|---:|---:|---:|---:|---:|']
+    usable = [x['image_id'] for x in result['excluded']['test'] if x['reason'] == 'not_usable']
+    lines.append(f"- not usable (uncountable frames, never counted as zero): {len(usable)} test, "
+                 f"{sum(1 for x in result['excluded']['val'] if x['reason'] == 'not_usable')} val")
+    lines += ['', '| Localiser | Identifier | Pair | Thr source | Score thr | ID thr | Train confidence | Train crops | Subset | Images | Total MAE (95% CI) | Top MAE | Bottom MAE | Exact inventory | ID accuracy | AP50 |',
+              '|---|---|---|---|---:|---:|---:|---:|---|---:|---|---:|---:|---:|---:|---:|']
     def fmt(x):
         return '—' if x is None else f'{x:.3f}'
     def estimate(value, key):
@@ -435,7 +490,9 @@ def markdown(result):
         return fmt(value['metrics'].get(key)) + interval
     for row in result['rows']:
         for subset, value in row['subsets'].items():
-            lines.append(f"| {row['run']} | {row['identifier']} | {row['pair_rule']} | {fmt(row['train_vlm_confidence_thr'])} | "
+            lines.append(f"| {row['run']} | {row['identifier']} | {row['pair_rule']} | {row['threshold_source']} | "
+                         f"{fmt(row['score_thr'])} | {fmt(row['identity_thr'])} | "
+                         f"{fmt(row['train_vlm_confidence_thr'])} | "
                          f"{row['train_gallery_size']} | {subset} | {value['n_images']} | "
                          f"{estimate(value, 'total_error')} | {estimate(value, 'top_error')} | "
                          f"{estimate(value, 'bottom_error')} | {estimate(value, 'exact_inventory')} | "
@@ -453,8 +510,37 @@ def markdown(result):
         best = min(valid, key=lambda r: r['subsets']['all']['metrics']['total_error'])
         lines += ['', f"Best by total count MAE: **{best['run']} / {best['identifier']} / pair {best['pair_rule']}** "
                   f"({best['subsets']['all']['metrics']['total_error']:.3f})."]
+    lines += per_image_table(result)
     lines += ['', 'Thresholds, exclusions and image lists are in results_gt.json.', '']
     return '\n'.join(lines)
+
+
+def fmt_number(value):
+    return '—' if value is None else f'{value:.3f}'
+
+
+def per_image_table(result):
+    """Per-image total-count errors on the usable test images (localiser-only rows).
+
+    With a handful of usable frames the headline MAE hides which frame drives it, so the
+    reference rows (identifier ``none``, pair off) are broken out per image.
+    """
+    rows = [r for r in result['rows'] if r['identifier'] == 'none' and r['pair_rule'] == 'off'
+            and r['subsets']['all']['per_image']]
+    if not rows:
+        return []
+    names = rows[0]['subsets']['all']['images']
+    lines = ['| Localiser | Score thr | Thr source | ' + ' | '.join(Path(n).name for n in names) + ' |',
+             '|---|---:|---|' + '---:|' * len(names)]
+    for row in rows:
+        subset = row['subsets']['all']
+        # per_image keeps the same order as subset['images'] (both follow the image list)
+        cells = [str(record['total_error']) for record in subset['per_image'][:len(names)]]
+        cells += ['—'] * (len(names) - len(cells))
+        lines.append(f"| {row['run']} | {fmt_number(row['score_thr'])} | {row['threshold_source']} | "
+                     + ' | '.join(cells) + ' |')
+    return ['', 'Per-image total-count errors on the usable test images '
+                 '(identifier none, pair off; |predicted - human|):', ''] + lines
 
 
 def audit_subsets(images, audit):
@@ -495,16 +581,26 @@ def run(args):
         gt[split], counts[split], excluded[split] = build_human_gt(queue, answers, split)
         validate_groups(gt[split], split, splits)
     if not gt['val']['images']:
-        raise ValueError('no eligible validation images (val needs its per-image count answers; '
-                         'val crop answers are optional)')
+        # 'not a usable cabinet view' excludes a val frame outright, so a split can end up
+        # with nothing tunable; the runs then keep their own val-selected thresholds.
+        print('warning: no usable val images with human counts — thresholds fall back to '
+              'each run\'s own metrics.json score_thr', file=sys.stderr)
     if not gt['test']['images']:
-        raise ValueError('no eligible test images')
+        raise ValueError('no eligible test images (usable frames with a human count)')
     result = {'version': 1, 'demo': args.demo, 'excluded': excluded, 'rows': [], 'skipped_runs': [],
               'limitations': ['All localization reference boxes originate from model proposals.',
                               'Per-class and AP metrics use fully answered images without count mismatches.',
                               'Training and validation splits may include near-duplicate images.',
                               'Validation embeddings use leave-one-group-out gallery; test uses all eligible validation crops.',
                               'Training VLM gallery confidence is selected on validation; test labels are never used.']}
+    if not gt['val']['images']:
+        result['limitations'].append(
+            'No usable val images with human counts: thresholds are each run\'s own '
+            'val-selected score_thr from runs/<exp>/metrics.json (identity_thr from that '
+            'run\'s meta.json), not a shared human-GT threshold — threshold_source="run_metrics".')
+    result['limitations'].append(
+        'Frames answered "not a usable cabinet view" are excluded from all metrics '
+        '(reason not_usable); they are never scored as zero-cartridge frames.')
     if flash_proposals is not None:
         result['limitations'].append(
             f'vlm_flash identities come from {args.proposals_flash}: model-generated, '
@@ -564,16 +660,29 @@ def run(args):
                                                'reason': 'no VLM-labelled training crop embeddings'})
                 continue
             for pair in (False, True):
-                selections = []
-                for confidence, (train_items, val_rows) in variants.items():
-                    key = select_thresholds(gt['val']['images'], gt['val'], counts['val'],
-                                            val_rows, pair, method == 'none')
-                    selections.append((key, confidence, train_items))
-                best_error = min(item[0][:2] for item in selections)
-                tied = [item for item in selections if item[0][:2] == best_error]
-                tied.sort(key=lambda item: item[1] if item[1] is not None else -1.)
-                key, confidence, train_items = tied[(len(tied) - 1) // 2]
-                score_thr, id_thr = key[2:4]
+                if gt['val']['images']:
+                    selections = []
+                    for confidence, (train_items, val_rows) in variants.items():
+                        key = select_thresholds(gt['val']['images'], gt['val'], counts['val'],
+                                                val_rows, pair, method == 'none')
+                        selections.append((key, confidence, train_items))
+                    best_error = min(item[0][:2] for item in selections)
+                    tied = [item for item in selections if item[0][:2] == best_error]
+                    tied.sort(key=lambda item: item[1] if item[1] is not None else -1.)
+                    key, confidence, train_items = tied[(len(tied) - 1) // 2]
+                    score_thr, id_thr, threshold_source = key[2], key[3], 'val'
+                else:
+                    fallback = run_thresholds(path, meta)
+                    if fallback is None:
+                        result['skipped_runs'].append({
+                            'run': path.name, 'identifier': method,
+                            'reason': 'no usable val counts and no score_thr in metrics.json'})
+                        continue
+                    # nothing to tune on: keep this run's own thresholds and, for the
+                    # train-VLM galleries, the loosest confidence that has any crops
+                    score_thr, id_thr, threshold_source = fallback
+                    confidence = min((c for c in variants if c is not None), default=None)
+                    train_items = variants[confidence][0] if confidence in variants else None
                 test_rows = {im['id']: identify((predictions['test'].get(im['id']) or predictions['test'].get(im['file_name'], [])), im, method, proposals, emb, gt['val'], train_items=train_items, fitted=fitted, flash_proposals=flash_proposals)
                              for im in gt['test']['images']}
                 images = gt['test']['images']
@@ -586,7 +695,8 @@ def run(args):
                                        'train_vlm_confidence_thr': confidence,
                                        'train_gallery_size': len(train_items[0]) if train_items else 0,
                                        'val_gallery_size': val_gallery_size,
-                                       'threshold_source': 'val', 'subsets': subsets})
+                                       'threshold_source': threshold_source,
+                                       'subsets': subsets})
 
     if not result['rows']:
         raise ValueError('no runs with both validation and test predictions')

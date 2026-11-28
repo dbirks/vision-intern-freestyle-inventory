@@ -365,7 +365,8 @@ def test_to_coco_drops_not_a_cartridge_and_flags_two_plus_partial(store):
     assert counts_of(counts, IMAGE_A)["crop_total"] == 1
 
 
-def test_to_coco_not_cabinet_clears_boxes_and_marks_unusable(store):
+def test_to_coco_not_usable_excludes_the_image_and_is_never_zero(store):
+    """"Not a usable cabinet view" excludes the frame; it does not say "0 cartridges"."""
     answers = _answers_from(store, {"count_a": {"result": "not_cabinet"}})
     for question in store.questions:
         if question["image_id"] == IMAGE_A and question["kind"] == "crop":
@@ -373,10 +374,54 @@ def test_to_coco_not_cabinet_clears_boxes_and_marks_unusable(store):
     doc, counts = to_coco.build_coco(store.queue, answers, "test")
     image = doc["images"][0]
     assert image["attributes"]["usable"] is False
-    assert image["attributes"]["scene"] == "no_cabinet"
-    assert doc["annotations"] == []
-    assert counts_of(counts, IMAGE_A)["human_total"] == 0
-    assert image["attributes"]["verified"] is True
+    assert image["attributes"]["exclude_reason"] == "not_usable"
+    assert image["attributes"]["human_counts"] is None, "there is no human total to score against"
+    assert image["attributes"]["scene"] != "no_cabinet", "uncountable is not the same as no cabinet"
+    assert image["attributes"]["verified"] is False, "not usable image-level ground truth"
+    assert doc["annotations"] == [], "skipped crops on an excluded frame are not GT either"
+    entry = counts_of(counts, IMAGE_A)
+    assert entry["human_total"] is None and entry["usable"] is False
+    assert entry["exclude_reason"] == "not_usable"
+    assert counts["not_usable"] == [IMAGE_A]
+    assert doc["info"]["excluded_not_usable_images"] == 1
+    assert doc["info"]["usable_images"] == 0
+
+
+def test_to_coco_not_usable_frame_keeps_the_crop_identity_a_human_named(store):
+    """A crop a human named on an uncountable frame is still an identity label."""
+    answers = _answers_from(store, {
+        "count_a": {"result": "not_cabinet"},
+        "10": {"result": "class", "class": "sprite"},
+        "11": {"result": "implied_not_usable"},
+    })
+    doc, counts = to_coco.build_coco(store.queue, answers, "test")
+    by_proposal = {a["attributes"]["proposal_ann_id"]: a for a in doc["annotations"]}
+    assert sorted(by_proposal) == [10], "only the crop the human actually named survives"
+    assert by_proposal[10]["attributes"]["identity_source"] == "human"
+    entry = counts_of(counts, IMAGE_A)
+    assert entry["usable"] is False and entry["exclude_reason"] == "not_usable"
+    assert entry["human_total"] is None
+    assert entry["counts_mismatch"] is False, "an excluded frame has no count to disagree with"
+    assert doc["images"][0]["attributes"]["verified"] is False
+
+
+def test_count_answer_semantics_separate_exclusion_from_a_real_zero():
+    assert to_coco.is_not_usable("not_cabinet") is True
+    assert to_coco.is_not_usable("fix") is to_coco.is_not_usable(None) is False
+    assert to_coco.has_human_count("fix") and to_coco.has_human_count("correct")
+    assert not to_coco.has_human_count("not_cabinet"), "an excluded frame states no total"
+    assert not to_coco.has_human_count("skip") and not to_coco.has_human_count(None)
+    assert not to_coco.NO_CARTRIDGES_RESULTS, "no verified 'no cartridges' answer type exists yet"
+
+
+def test_load_answers_ignores_revisit_markers(tmp_path):
+    """A revisit marker re-offers a question; it must not replace its answer."""
+    path = tmp_path / "answers.jsonl"
+    path.write_text(
+        json.dumps({"qid": "count:x/1.jpg", "answer": {"result": "fix", "top": 1, "bottom": 1}})
+        + "\n" + json.dumps({"qid": "count:x/1.jpg", "answer": {"result": "revisit"}}) + "\n")
+    assert to_coco.load_answers(path) == {
+        "count:x/1.jpg": {"result": "fix", "top": 1, "bottom": 1}}
 
 
 def test_to_coco_skip_keeps_model_identity_and_unverifies(store):
@@ -439,9 +484,11 @@ def test_unusable_implies_crops_and_undo_restores_them(store):
     assert all(answers[q["qid"]]["result"] == "implied_not_usable" for q in crops)
     doc, counts = to_coco.build_coco(store.queue, answers, count["split"])
     image = next(im for im in doc["images"] if im["file_name"] == count["image_id"])
-    assert image["attributes"]["verified"]
+    assert not image["attributes"]["verified"], "an uncountable frame is not image-level GT"
     assert not [ann for ann in doc["annotations"] if ann["image_id"] == image["id"]]
-    assert counts["images"][count["image_id"]]["human_total"] == 0
+    entry = counts["images"][count["image_id"]]
+    assert entry["human_total"] is None, "implied_not_usable never means zero cartridges"
+    assert entry["exclude_reason"] == "not_usable" and entry["usable"] is False
     assert store.undo()["qid"] == count["qid"]
     assert not store.state_payload()["answers"]
 
@@ -463,6 +510,86 @@ def test_count_skip_defers_image_once_and_undo(store):
     assert store.next_index() == 0
     store.answer(count["qid"], {"result": "skip"})
     assert store.next_index() == len(store.questions)
+
+
+# ------------------------------------------------------------------ revisit
+
+
+def _skip_until_hidden(store, count_qid) -> None:
+    """Skip a count question twice so the quiz hides that whole image."""
+    store.answer(count_qid, {"result": "skip"})
+    store.answer(count_qid, {"result": "skip"})
+
+
+def test_revisit_writes_a_marker_and_does_not_answer(store):
+    count = store.questions[0]
+    answered_before = store.state_payload()["answered"]
+    record = store.revisit(count["qid"])
+    assert record == {"qid": count["qid"], "answer": {"result": "revisit"}}
+    lines = store.answers_path.read_text().strip().splitlines()
+    assert json.loads(lines[-1]) == {"qid": count["qid"], "answer": {"result": "revisit"}}
+    # a marker is not an answer: the answered count and the answers map are unchanged
+    state = store.state_payload()
+    assert state["answered"] == answered_before
+    assert count["qid"] not in state["answers"]
+    assert state["log_lines"] == len(lines)
+    with pytest.raises(QuizError):
+        store.revisit("count:nope/999.jpg")
+
+
+@pytest.fixture
+def hidden_store(store):
+    """A store whose first image's count question has been skipped twice (hidden)."""
+    count = store.questions[0]
+    _skip_until_hidden(store, count["qid"])
+    return store, count
+
+
+def test_revisit_surfaces_hidden_count_before_all(hidden_store):
+    store, count = hidden_store
+    assert store.next_index() != 0, "a twice-skipped image is not offered first"
+    store.revisit(count["qid"])
+    assert store.questions[store.next_index()]["qid"] == count["qid"], "revisited question goes first"
+    assert store.state_payload()["answered"] == 1, "the two skip records answer one question, not the marker"
+
+
+def test_revisit_survives_reload(hidden_store):
+    store, count = hidden_store
+    store.revisit(count["qid"])
+    reloaded = QuizStore(store.queue, store.answers_path, store.images_root)
+    assert reloaded.questions[reloaded.next_index()]["qid"] == count["qid"]
+    assert reloaded.state_payload()["answered"] == 1, "reloaded marker still not an answer"
+
+
+def test_revisit_closes_once_answered_for_real(hidden_store):
+    store, count = hidden_store
+    store.revisit(count["qid"])
+    store.answer(count["qid"], {"result": "correct"})
+    assert store.questions[store.next_index()]["image_id"] == count["image_id"], \
+        "the crops of the now-answered image come back"
+    assert store.state_payload()["answers"][count["qid"]]["result"] == "correct"
+
+
+def test_revisit_resets_the_skip_budget(store):
+    count = store.questions[0]
+    store.answer(count["qid"], {"result": "skip"})  # first skip: image A hidden (skips==1 -> deferred)
+    store.answer(count["qid"], {"result": "skip"})  # second skip: hidden again
+    assert store.questions[store.next_index()]["image_id"] != count["image_id"]
+    store.revisit(count["qid"])  # budget resets to zero, image resurfaces
+    assert store.questions[store.next_index()]["qid"] == count["qid"]
+    store.answer(count["qid"], {"result": "skip"})  # one skip since the revisit -> deferred, not first
+    assert store.questions[store.next_index()]["image_id"] != count["image_id"]
+    store.answer(count["qid"], {"result": "skip"})  # second skip since the revisit -> hidden again
+    assert store.questions[store.next_index()]["image_id"] != count["image_id"]
+
+
+def test_undo_never_reports_a_revisit_as_removed(store):
+    count = store.questions[0]
+    store.answer(count["qid"], {"result": "correct"})
+    store.revisit(bq.count_qid(IMAGE_B))  # a trailing marker for a different image
+    removed = store.undo()
+    assert removed["qid"] == count["qid"], "undo removes the real answer, not the marker"
+    assert store.state_payload()["answered"] == 0
 
 
 def test_audit_quality_orders_within_split(proposals):
