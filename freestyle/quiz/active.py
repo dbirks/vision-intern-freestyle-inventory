@@ -41,6 +41,7 @@ import random
 import sys
 import time
 from collections import Counter
+from collections.abc import Container
 from pathlib import Path
 from typing import Any, Iterable, Mapping, Sequence
 
@@ -86,6 +87,13 @@ FACE_ANN_OFFSET = 100_000
 DEDUPE_IOU = 0.5
 #: Question blocks in the order the human answers them.
 BLOCK_ORDER = (PURPOSE_EVAL, PURPOSE_TRAIN, PURPOSE_TUNE)
+#: The order the questions still worth answering appear in, once the answered
+#: records are parked at the front of the file: the val counts that gate the
+#: finalize run first, then the train crops that feed the gallery, then the val
+#: crops that tune thresholds. Anything else that is still unanswered (e.g. test
+#: crops the human walked past) comes last.
+UNANSWERED_ORDER = ((PURPOSE_TUNE, COUNT), (PURPOSE_TRAIN, CROP), (PURPOSE_TUNE, CROP))
+_UNANSWERED_RANK = {pair: i for i, pair in enumerate(UNANSWERED_ORDER)}
 
 
 # --------------------------------------------------------------------------- helpers
@@ -264,6 +272,19 @@ def _question_index(questions: Sequence[Mapping[str, Any]]) -> dict[str, int]:
     return {str(q["qid"]): i for i, q in enumerate(questions)}
 
 
+def question_priority(question: Mapping[str, Any], answered: Container[str]) -> int:
+    """Block rank (lower = asked earlier) deciding the final queue order.
+
+    Answered records keep rank 0 so a finished block stays a contiguous history
+    at the front of the file; among the unanswered ones, :data:`UNANSWERED_ORDER`
+    decides the block and anything not listed there comes last.
+    """
+    if str(question.get("qid")) in answered:
+        return 0
+    rank = _UNANSWERED_RANK.get((str(question.get("purpose")), str(question.get("kind"))))
+    return 1 + (len(UNANSWERED_ORDER) if rank is None else rank)
+
+
 def select_questions(
     queue: Mapping[str, Any],
     answers: Mapping[str, Any] | Iterable[str] = (),
@@ -281,8 +302,11 @@ def select_questions(
 
     ``answers`` may be the ``load_answers`` mapping or any iterable of qids;
     ``predictions`` maps qid -> gallery k-NN result (omit entirely to skip the
-    k-NN disagreement test). Returns the questions in block order (test, train,
-    val), each a shallow copy with ``purpose`` and ``selected_by`` set.
+    k-NN disagreement test). Returns the questions ordered by
+    :func:`question_priority`: the answered ones first (in proposal order), then
+    the unanswered val counts, train crops and val crops, each block keeping its
+    proposal order; each is a shallow copy with ``purpose`` and ``selected_by``
+    set.
     """
     validate_queue(queue)
     answered: set[str] = set(answers) if not hasattr(answers, "keys") else set(answers.keys())
@@ -350,7 +374,7 @@ def select_questions(
         question["purpose"] = purpose
         question["selected_by"] = picked[qid]
         out.append(question)
-    out.sort(key=lambda q: (BLOCK_ORDER.index(q["purpose"]), order[str(q["qid"])]))
+    out.sort(key=lambda q: (question_priority(q, answered), order[str(q["qid"])]))
     return out
 
 
@@ -404,7 +428,7 @@ def build_active_queue(
         entry["purposes"] = sorted({str(q.get("purpose")) for q in chosen
                                     if str(q["image_id"]) == str(image["image_id"])})
         images.append(entry)
-    images.sort(key=lambda im: (BLOCK_ORDER.index(str(im["purposes"][0])), im["first_index"]))
+    images.sort(key=lambda im: im["first_index"])
     purposes = [str(q["purpose"]) for q in chosen]
 
     return {
@@ -725,6 +749,7 @@ def main(argv: list[str] | None = None) -> int:
 __all__ = [
     "BLOCK_ORDER",
     "CONF_THR",
+    "UNANSWERED_ORDER",
     "FACE_ANN_OFFSET",
     "MIN_GALLERY",
     "SAMPLE_SEED",
@@ -742,6 +767,7 @@ __all__ = [
     "report",
     "select_crop_sample",
     "select_questions",
+    "question_priority",
     "train_priority",
     "val_priority",
 ]

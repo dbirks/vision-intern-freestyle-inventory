@@ -545,13 +545,21 @@ def _preds(queue, split, default=("sprite", 0.9), overrides=None):
     return out
 
 
-def test_active_queue_selects_test_sample_then_train_then_val(active_doc):
+def test_active_queue_orders_val_counts_then_train_then_val_crops(active_doc):
     queue, _, _ = active_doc
     chosen = act.select_questions(queue, (), _all_preds(active_doc), {}, test_crops=2, val_cap=10,
                                  train_cap=10)
-    purposes = [q["purpose"] for q in chosen]
-    assert purposes == sorted(purposes, key=act.BLOCK_ORDER.index), "test, then train, then val"
-    assert [q["split"] for q in chosen if q["kind"] == bq.COUNT] == ["test", "val"], \
+    ranks = [act.question_priority(q, ()) for q in chosen]
+    assert ranks == sorted(ranks), "unanswered blocks follow UNANSWERED_ORDER, anything else last"
+    keys = [(q["purpose"], q["kind"]) for q in chosen]
+    assert keys[0] == ("tune", "count"), "the val counts that gate finalize come first"
+    assert keys.index(("eval", "crop")) > max(i for i, k in enumerate(keys) if k == ("tune", "crop")), \
+        "the untouched eval block falls behind the val crops"
+    base_order = {str(q["qid"]): i for i, q in enumerate(queue["questions"])}
+    for rank in sorted(set(ranks)):
+        block = [base_order[str(q["qid"])] for q, r in zip(chosen, ranks) if r == rank]
+        assert block == sorted(block), "proposal order is kept inside a block"
+    assert [q["split"] for q in chosen if q["kind"] == bq.COUNT] == ["val", "test"], \
         "every count question stays, the train frame gets no count question"
     assert {q["purpose"] for q in chosen if q["split"] == "test"} == {"eval"}
     assert {q["purpose"] for q in chosen if q["split"] == "val"} == {"tune"}
@@ -559,6 +567,24 @@ def test_active_queue_selects_test_sample_then_train_then_val(active_doc):
     eval_crops = [q for q in chosen if q["purpose"] == "eval" and q["kind"] == bq.CROP]
     assert len(eval_crops) == 2, "exactly the sampled number of evaluation crops"
     assert {q["shelf"] for q in eval_crops} == {"top", "bottom"}
+
+
+def test_active_order_keeps_answered_questions_at_the_front(active_doc):
+    queue, _, _ = active_doc
+    test_count = next(q for q in queue["questions"]
+                      if q["kind"] == bq.COUNT and q["split"] == "test")
+    answered = {test_count["qid"]: {"result": "correct"},
+                _crops(queue, "val")[0]["qid"]: {"result": "class"}}
+    chosen = act.select_questions(queue, answered, _all_preds(active_doc), {}, test_crops=2,
+                                  val_cap=10, train_cap=10)
+    ranks = [act.question_priority(q, answered) for q in chosen]
+    assert ranks == sorted(ranks), "answered records hold the front of the file"
+    done = [q for q, r in zip(chosen, ranks) if r == 0]
+    assert [str(q["qid"]) for q in done] == sorted(
+        answered, key=lambda qid: {str(q["qid"]): i for i, q in enumerate(queue["questions"])}[qid])
+    first_open = next(q for q, r in zip(chosen, ranks) if r > 0)
+    assert (first_open["purpose"], first_open["kind"]) == ("tune", "count"), \
+        "the next unanswered question is a val count"
 
 
 def _all_preds(doc):
@@ -640,7 +666,8 @@ def test_active_build_writes_purposes_counts_and_images(active_doc):
     assert rebuilt["selection"]["before"]["total"] == len(queue["questions"])
     assert rebuilt["selection"]["after"]["total"] == len(rebuilt["questions"])
     assert rebuilt["splits_order"] == ["test", "train", "val"]
-    assert [im["image_id"] for im in rebuilt["images"]] == [IMAGE_A, IMAGE_T, IMAGE_B]
+    assert [im["image_id"] for im in rebuilt["images"]] == [IMAGE_A, IMAGE_B, IMAGE_T], \
+        "the answered test crop leads, then the val count, then the train crops"
     assert all(im["qids"] for im in rebuilt["images"])
     firsts = [im["first_index"] for im in rebuilt["images"]]
     assert firsts == sorted(firsts)
