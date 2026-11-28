@@ -5,12 +5,13 @@ counted**, plus an annotated overlay. The counting model is a frozen *bundle* un
 `artifacts/<name>/` (gitignored).
 
 This document is written against **`rfdetr-faces-final`** — the bundle selected by the **corrected**
-human-GT scoring in [`RESULTS_GT.md`](RESULTS_GT.md) (128 answered quiz questions; the front-face
-detector `G2_rfdetr_small_faces` + the Qwen 3.8 Flash Next reader, count MAE **0.500** and identity
-**0.750** on the **2** usable test photos). **`rfdetr-final-v2`** (whole-cartridge `S2_c2_tile1280`,
-identical reader and counting knobs, count MAE 2.000 but AP50 0.950 vs 0.527) stays documented as the
-alternative: use it when you need cartridge *boxes* rather than a shelf count. Both picks rest on two
-photographs of one cabinet — read §8.9/§11 of [`REPORT.md`](REPORT.md) first. Every number here is either
+human-GT scoring in [`RESULTS_GT.md`](RESULTS_GT.md) (all **180** quiz questions answered; the front-face
+detector `G2_rfdetr_small_faces` + the Qwen 3.8 Flash Next reader, count MAE **1.000** [0.000, 2.000] and
+identity **0.759** (22/29) on the **3** usable test photos: per photo the errors are 0, 1 and 2).
+**`rfdetr-final-v2`** (whole-cartridge `S2_c2_tile1280`, identical reader and counting knobs, count MAE
+2.000 but AP50 0.950 vs 0.527) stays documented as the alternative: use it when you need cartridge *boxes*
+rather than a shelf count. Both picks rest on three photographs of one cabinet and one stocking — read
+§8.9/§11 of [`REPORT.md`](REPORT.md) first. Every number here is either
 read from a run artifact or from a command actually executed on this host.
 
 > Everything here runs on CPU. A trained bundle's detector is happiest on a GPU, but the
@@ -56,13 +57,13 @@ is always labelled **"vs model labels, NOT GT"**, because `freestyle.artifacts e
 *run's* model-label metrics block into the manifest. The human-GT numbers for this bundle are in
 [`RESULTS_GT.md`](RESULTS_GT.md) and [`REPORT.md`](REPORT.md) §8.2/§8.9, not in the manifest.
 
-`rfdetr-faces-final` is the provisional pick on the metric the product cares about (how many cartridges
-are on the shelves: 0.500 vs 2.000 count MAE on the 2 scored photos) and `rfdetr-final-v2` is the
+`rfdetr-faces-final` is the selected bundle on the metric the product cares about (how many cartridges
+are on the shelves: 1.000 vs 2.000 count MAE on the 3 scored photos) and `rfdetr-final-v2` is the
 alternative when box quality matters (AP50 0.950 vs 0.527 — a face box is a *fragment* of a cartridge box,
 so the face detector is penalised by the yardstick as much as by the misses, REPORT §8.2.4/§9).
 `-knn-v0`, `-v1` and `-v2` are the pre-GT candidates, kept so the identifier comparison in §8.2.2 of the
-report is reproducible; against a human their embedding-kNN identifier scores 0.421 (16/38) on `S2` where
-the shipped reader scores 0.579 (22/38), and it collapses to 0.036 (1/28) on the face bundle.
+report is reproducible; against a human their embedding-kNN identifier scores 0.436 (17/39) on `S2` where
+the shipped reader scores 0.590 (23/39), and it collapses to 0.034 (1/29) on the face bundle.
 
 ## 3. Count cartridges in one or more frames
 
@@ -114,26 +115,30 @@ detector only called generically `cartridge`, is reported in `unknown`, **not** 
 Drop `--json` for a human-readable table. `--group <id>` adds a gallery-leakage check that only applies
 to the kNN bundles.
 
-**Read those three outputs against the human answers before believing them.** These are the two test
-photos the whole selection rests on, plus the one usable validation photo:
+**Read those outputs against the human answers before believing them.** The table below covers the demo
+run (the one usable validation photo and the two most fully-boxed test photos) and, for completeness, the
+third scored test photo the demo never ran on:
 
 | Frame | What the human said | What the bundle did (boxes = named + `unknown`) |
 |---|---|---|
 | `local/downloads/frame.jpg` | usable cabinet, **26** cartridges (17 top / 9 bottom), flagged `counts_mismatch` in `data/gt/val_counts.json`; this single frame is what selected `score_thr 0.65` | **26** (19 + 7) — total exact, 7 cartridges left `unknown` |
 | `e194690f…/002.jpg` | usable, **22** (14 top / 8 bottom), fully answered, no mismatch | **21** (11 + 10) — 1 low, **10 unnamed** |
 | `581c0d5e…/045.jpg` | usable, **28** (17 top / 11 bottom), `counts_mismatch: true` (only 22 human-verified boxes exist) | **25** (15 + 10) — 3 low, 10 unnamed |
+| `3270fb41…/065.jpg` | usable, **25** (16 top / 9 bottom), `counts_mismatch: true`, `verified: false` (only **4** boxed cartridges, 3 human-named) | **never run through the live bundle** — it got its human count after this demo |
 
-Two honest wrinkles in that table. **(a)** The scored row says `G2` predicts 22 and 27 on these two photos
-(error 0 and 1, MAE 0.500) while the *live bundle* gives 21 and 25: `score_all` counts the run's saved rows
-above `score_thr`, the CLI additionally applies the bundle's duplicate suppression and 2-shelf refit, which
-costs 1–2 real boxes here (REPORT §7.4 "suppression gap", §8.9 deviation 2). **(b)** The bundle's
-`identity_thr` is **0.45** where the scored identity accuracy (0.750 = 21/28) used **0.25**, so the
+Three honest wrinkles in that table. **(a)** The scored row says `G2` predicts 22 and 27 on the first two
+photos (error 0 and 1; the third scored photo, `065.jpg`, is 23 vs 25 — errors 0 / 1 / 2, MAE **1.000**)
+while the *live bundle* gives 21 and 25: `score_all` counts the run's saved rows above `score_thr`, the CLI
+additionally applies the bundle's duplicate suppression and 2-shelf refit, which costs 1–2 real boxes here
+(REPORT §7.4 "suppression gap", §8.9 deviation 2). **(b)** The bundle's
+`identity_thr` is **0.45** where the scored identity accuracy (0.759 = 22/29) used **0.25**, so the
 named/`unknown` split above is more pessimistic than the scored row — re-export with
 `"identity_thr":0.25` to reproduce it. The named counts are also NNS-skewed (6 of 11, 7 of 15): the
 auto-labelled gallery and the reader both see NNS often and the red/silver bottom shelf rarely.
 
-**Not scored, not evidence:** 8 more test photos were answered *"not a usable cabinet view"* and 2 have no
-count answer at all (`3270fb41…/065.jpg`, `50828e4b…/008.jpg`). Those 10 frames are **excluded** from every
+**Not scored, not evidence:** 9 of the 12 test photos were answered *"not a usable cabinet view"*
+(`019.jpg`, `008.jpg`, `013.jpg`, `7227dc17/001`, `733bc6f7/001`, `006.jpg`, `012.jpg`, `bb2c251e/000`,
+`bb2c251e/001`); no test photo is left without a count answer. Those 9 frames are **excluded** from every
 metric — uncountable photos, not zero-cartridge photos — so running the CLI on one of them proves nothing
 either way. (The old demo in `runs/cli_final_demo/` used two such frames; its `3 boxes on
 10455345…/013.jpg` line was never a measured false positive, it was a box count on a frame nobody
@@ -222,8 +227,8 @@ The pre-GT kNN bundles worked differently: `freestyle.artifacts export` copied a
 rebuilt one from the run's train-split, known-class crop embeddings (`embeddings.npz`) using the same
 embedder, and rejected an `--identifier` model that disagreed with the cached vectors (the vectors would
 not be comparable). None of that applies to either current bundle — passing `--identifier
-'{"type":"embedding_knn",...}'` today would just re-create the weaker reader that scores 0.421 (16/38) on
-`S2` and 0.036 (1/28) on the faces (§8.2.2 of the report).
+'{"type":"embedding_knn",...}'` today would just re-create the weaker reader that scores 0.436 (17/39) on
+`S2` and 0.034 (1/29) on the faces (§8.2.2 of the report).
 
 ## 6. GPU vs CPU
 
@@ -278,7 +283,9 @@ scripts/finalize_after_gt.sh --dry-run          # prints everything, mutates not
 ```
 
 A frame answered *"not a usable cabinet view"* never satisfies that gate — the gate counts photos a human
-actually **counted**, which is currently 2 test + 1 val. Read
+actually **counted**, which is currently **3** test + 1 val (the gate prints `THIN EVIDENCE` below 5).
+The queue itself is exhausted — all 180 questions answered — so re-running the script cannot change a
+number until new photographs enter the `test` split (REPORT §12.8 says how). Read
 [`RESULTS_GT.md`](RESULTS_GT.md)'s header and REPORT §8.9 correction history before trusting a row.
 
 ## What the overlays actually show (honest read, against a human)
@@ -286,11 +293,12 @@ actually **counted**, which is currently 2 test + 1 val. Read
 On the three photos above the face detector finds the stocked shelves and shelves them into two rows, and
 the overlays (`runs/cli_faces_demo/*.png`, private) show what that means: 26/21/25 boxes where a human
 counted 26/22/28, i.e. it is **slightly low on both stocked photos** after suppression rather than
-doubling cartridges. Scored without the CLI's suppression (`score_all`'s rule) the same weights give 22
-and 27 — total-count MAE **0.500**, top **1.000**, bottom **0.500**, and the alternative whole-cartridge
-bundle's scored top/bottom are 1.000/1.000 at MAE 2.000. The face detector's remaining misses are the
-leaning bottom row and the tile edges; its false positives against whole-cartridge boxes are mostly
-**fragments** (16 of 18 on the two scored frames), which is a face box being what a face box is.
+doubling cartridges. Scored without the CLI's suppression (`score_all`'s rule) the same weights give 22,
+27 and 23 on `002.jpg` / `045.jpg` / `065.jpg` — errors 0 / 1 / 2, total-count MAE **1.000**, top
+**0.667**, bottom **1.000**; the alternative whole-cartridge bundle's scored numbers are 2.000 at
+top/bottom 1.000/1.000. The face detector's remaining misses are the leaning bottom row and the tile
+edges; its false positives against whole-cartridge boxes are mostly **fragments** (16 of 18 on the two
+frames whose boxes a human completed), which is a face box being what a face box is.
 
 Identification is good on the brands the auto-labelled gallery and the reader both see often — NNS, Fanta,
 Sprite, Hi-C, AA — and falls off on the red/silver bottom shelf, where the reader answers `unknown` (10 of
@@ -300,11 +308,11 @@ is effectively unavailable: the best reader gets the printed numeral right on **
 named, because the numerals are not legible at this camera's resolution and blur, not because the model is
 weak. `unknown` is the single biggest per-class error term (7 on `002.jpg`).
 
-The operational warning is unchanged but re-justified: **10 of the 12 test photos could not be counted by
+The operational warning is unchanged but re-justified: **9 of the 12 test photos could not be counted by
 a human at all** (door swing, person, blur, angle) and are excluded from every metric, so nothing in this
-document claims the bundle stays quiet on such a frame — that question is simply unmeasured, and the two
-`missing_count` frames are the cheapest way to start measuring it. `neighbour_vote` and `gap` flags fire
+document claims the bundle stays quiet on such a frame — that question is simply unmeasured, and the way to
+measure it is new photographs from a fixed camera, not another re-score (REPORT §12.8). `neighbour_vote` and `gap` flags fire
 on suspicious rows so a human reviews them rather than trusting the count — keep that habit. Every number
-here was chosen on **two** photographs of **one** cabinet with **one** stocking; `coca-cola-part1` and both
-`coke-zero` SKUs never appear at all. Treat per-class numbers as indicative and re-read
+here was chosen on **three** photographs of **one** cabinet with **one** stocking arrangement;
+`coca-cola-part1` and both `coke-zero` SKUs never appear at all. Treat per-class numbers as indicative and re-read
 [`REPORT.md`](REPORT.md) §8.9 and §11 before acting on one.

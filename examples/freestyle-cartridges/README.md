@@ -4,20 +4,23 @@
 > in-door fisheye camera, built on Vision Intern's label → judge → train path and extended
 > where the core can't reach.
 >
-> **Status (2026-11-27): scored against human ground truth, then corrected — and now provisional.**
-> 13 GPU runs were collected (whole-cartridge + front-face detector families), the phone quiz got 128
-> answers, and every run was scored on them
+> **Status (2026-11-28): scored against human ground truth, corrected, and now final for this dataset.**
+> 13 GPU runs were collected (whole-cartridge + front-face detector families), the phone quiz answered all
+> **180** of its questions, and every run was scored on them
 > ([`docs/freestyle/RESULTS_GT.md`](../../docs/freestyle/RESULTS_GT.md)). The first scoring wrongly treated
 > a photo answered *"not a usable cabinet view"* as a zero-cartridge frame; with that fixed those frames are
-> **excluded**, and the remaining evidence is **2 test photographs** (`002.jpg` 22 cartridges, `045.jpg`
-> 28) and **1 validation photograph** (`frame.jpg` 26). On them the **front-face detector wins the count**:
-> **`G2_rfdetr_small_faces` (RF-DETR Small on printed faces, `score_thr 0.65`) + Qwen 3.8 Flash Next as the
-> two-stage reader**, count MAE **0.500** [0.000, 1.000] (errors 0 and 1), identity **0.750** (21/28
-> matched crops), shipped as bundle **`rfdetr-faces-final`**. The whole-cartridge
-> **`S2_c2_tile1280` + the same reader** is the close alternative (2.000 count MAE, 0.579 identity, but
+> **excluded**, and the remaining evidence is **3 test photographs** (`002.jpg` 22 cartridges, `065.jpg`
+> 25, `045.jpg` 28) and **1 validation photograph** (`frame.jpg` 26). On them the **front-face detector wins
+> the count**: **`G2_rfdetr_small_faces` (RF-DETR Small on printed faces, `score_thr 0.65`) + Qwen 3.8 Flash
+> Next as the two-stage reader**, count MAE **1.000** [0.000, 2.000] (errors 0, 1 and 2), identity **0.759**
+> (22/29 matched crops), shipped as bundle **`rfdetr-faces-final`**. The whole-cartridge
+> **`S2_c2_tile1280` + the same reader** is the close alternative (2.000 count MAE, 0.590 identity, but
 > AP50 **0.950** vs 0.527 — it is the better *box* detector) and stays shipped as **`rfdetr-final-v2`**.
-> Read [`docs/freestyle/REPORT.md`](../../docs/freestyle/REPORT.md) §8.9 (selection + correction history)
-> and §11 before repeating any of it: **at n = 2 a 95 % CI is arithmetic, not evidence.** Costs:
+> "Final" means the queue is exhausted — no test count is left unanswered — **not** that the sample is
+> big: only a new photograph can move these numbers now
+> ([`docs/freestyle/REPORT.md`](../../docs/freestyle/REPORT.md) §12.8). Read §8.9 (selection + correction
+> history) and §11 before repeating any of it: **at n = 3 a 95 % CI is still arithmetic, not evidence, and
+> `S2`'s interval [1.000, 3.000] starts exactly where the pick's point estimate sits.** Costs:
 > [`docs/freestyle/RESOURCES.md`](../../docs/freestyle/RESOURCES.md). Failure modes (vs model labels):
 > [`docs/freestyle/FAILURES.md`](../../docs/freestyle/FAILURES.md). Crop readers scored on human answers:
 > [`docs/freestyle/READER_COMPARE.md`](../../docs/freestyle/READER_COMPARE.md). What the core provides and
@@ -36,21 +39,21 @@ stage-decomposed rather than asked of one model: class-agnostic **localise** →
 ## Where it stands — corrected human GT, with the older model-label number kept for contrast
 
 Every human-GT row below is answered on the quiz GT ([`docs/freestyle/RESULTS_GT.md`](../../docs/freestyle/RESULTS_GT.md),
-**2 usable test images** / 2 door-openings, 1,000-replicate group bootstrap, thresholds selected on the 1
-usable val image). Read the n = 2 warning above before using any ordering as a claim.
+**3 usable test images** / 3 door-openings, 1,000-replicate group bootstrap, thresholds selected on the 1
+usable val image). Read the n = 3 warning above before using any ordering as a claim.
 
 | Question | Answer on corrected human GT | Answer vs model labels | Evidence |
 |---|---|---|---|
-| Trained detector or zero-shot open-vocab? | **Trained, still decisive.** `G2` 0.500 / `S2` 2.000 count MAE vs `B1` 4.500, `B3` 10.000, `S6` 14.500; zero-shot AP50 0.507/0.522/0.357 vs 0.950–0.983 for the trained whole-box runs. `B1`'s best prediction score on the whole test set is 0.427, so zero-shot cannot be thresholded into usefulness | RF-DETR 0.614–0.718 AP50 vs OWLv2 0.181 / GroundingDINO 0.232 | `RESULTS_GT.md`, `docs/freestyle/RESULTS.md` |
-| Whole cartridge or just the printed front face? | **Faces lead the count, whole boxes lead the box.** `G2` **0.500** [0.000, 1.000] vs `S2` 2.000 [1.000, 3.000], and the best identity of any row with >12 matched crops (0.750 = 21/28 vs 0.579 = 22/38; only the 12-crop `S6` rows rival it) — but AP50 0.527 vs 0.950 against whole-cartridge human boxes, 16 of whose 18 `FP`s for `G2` are `FP:fragment` because a face *is* a fragment of a cartridge box. `G1` (same faces, Medium, thr 0.45) is 4.000, so "faces count better" is **not** a family property — it is this run on 2 photos | Undecidable — each family was scored against its own model-made answer key | `RESULTS_GT.md` rows `G1/G2/S2`, `REPORT.md` §8.2.4, §9, §11.4 |
-| Tile size? | **1280 px** within the whole-cartridge family: `S2` 2.000 vs `S1` (768 px) 4.000 vs `C2` (1024 px) 5.000 | Same ordering (MAE 3.583 / 6.000 / 4.417) | `RESULTS_GT.md` rows `S1/S2/C2` |
-| Copy-paste augmentation? | **No.** `S3` 2.500 and `S7` 3.000 vs `S2` 2.000 at 2–3× the training time (427.3 s / 327.6 s vs 145.2 s) — no longer the catastrophe it looked like under the broken scoring, still no gain | It *helped*: `S3` had the best model-label AP50 (0.718) | `RESULTS_GT.md`, `runs/S3_*`, `runs/S7_*` |
-| How is identity done? | **A VLM reading the crop, not embedding matching.** On the pick: Flash Next 0.750 (21/28) > Inkling 0.643 (18/28) > `linear_trainvlm` 0.179 > `knn_trainvlm` 0.036 (1/28) — face embeddings do not transfer to whole-box crops. On `S2` the same comparison is 0.579 / 0.474 / 0.421 / 0.421. Adding human val crops to any gallery changes nothing (0 usable val crops answered) | Hybrid (Inkling family + class-balanced kNN refinement), picked by an unverified visual read | `RESULTS_GT.md` §8.2.2 of REPORT, `READER_COMPARE.md` |
-| Which VLM reads the crops? | **Qwen 3.8 Flash Next, two-stage + shelf hint** — better than Inkling on **all 13** localizers now that identity is defined everywhere. Standalone bake-off on 39 human-labelled crops: top-1 0.56 (CI 0.41–0.71) vs 0.49 (0.34–0.64), family 0.69 vs 0.67, abstention 18 % vs 44 %, at 9.1 s vs 3.5 s per crop | Inkling 2 Mini (faster, and it was the labeller) | `READER_COMPARE.md`, `RESULTS_GT.md` |
+| Trained detector or zero-shot open-vocab? | **Trained, still decisive.** `G2` 1.000 / `S2` 2.000 count MAE vs `B1` 4.000, `B3` 13.000, `S6` 14.000; zero-shot AP50 0.507/0.522/0.357 vs 0.950–0.983 for the trained whole-box runs. `B1`'s best prediction score on the whole test set is 0.427, so zero-shot cannot be thresholded into usefulness | RF-DETR 0.614–0.718 AP50 vs OWLv2 0.181 / GroundingDINO 0.232 | `RESULTS_GT.md`, `docs/freestyle/RESULTS.md` |
+| Whole cartridge or just the printed front face? | **Faces lead the count, whole boxes lead the box.** `G2` **1.000** [0.000, 2.000] vs `S2` 2.000 [1.000, 3.000] — `G2` is never worse per photo (2 vs 2, **0 vs 3**, 1 vs 1) — and the best identity of any `pair=off` row (0.759 = 22/29 vs 0.590 = 23/39; only the 12-crop `S6` row with the pair rule scores higher) — but AP50 0.527 vs 0.950 against whole-cartridge human boxes, 16 of whose 18 `FP`s for `G2` on the fully-boxed frames are `FP:fragment` because a face *is* a fragment of a cartridge box. `G1` (same faces, Medium, thr 0.45) is 3.667, so "faces count better" is **not** a family property — it is this run on 3 photos | Undecidable — each family was scored against its own model-made answer key | `RESULTS_GT.md` rows `G1/G2/S2`, `REPORT.md` §8.2.4, §9, §11.4 |
+| Tile size? | **1280 px** within the whole-cartridge family: `S2` 2.000 vs `S1` (768 px) 3.333 vs `C2` (1024 px) 8.000 — the third photo made 1024 px look far worse than it did at n = 2 | Same ordering (MAE 3.583 / 6.000 / 4.417) | `RESULTS_GT.md` rows `S1/S2/C2` |
+| Copy-paste augmentation? | **No.** `S3` 3.667 and `S7` 3.000 vs `S2` 2.000 at 2–3× the training time (427.3 s / 327.6 s vs 145.2 s) — no longer the catastrophe it looked like under the broken scoring, still no gain | It *helped*: `S3` had the best model-label AP50 (0.718) | `RESULTS_GT.md`, `runs/S3_*`, `runs/S7_*` |
+| How is identity done? | **A VLM reading the crop, not embedding matching.** On the pick: Flash Next 0.759 (22/29) > Inkling 0.655 (19/29) > `linear_trainvlm` 0.172 (5/29) > `knn_trainvlm` 0.034 (1/29) — face embeddings do not transfer to whole-box crops. On `S2` the same comparison is 0.590 / 0.487 / 0.436 / 0.436. Adding human val crops to any gallery changes nothing: all 40 val crop questions are answered now, but 39 belong to refused frames and the 40th is a `two_plus` box classed `unknown`, so every `+val` gallery is still empty | Hybrid (Inkling family + class-balanced kNN refinement), picked by an unverified visual read | `RESULTS_GT.md` §8.2.2 of REPORT, `READER_COMPARE.md` |
+| Which VLM reads the crops? | **Qwen 3.8 Flash Next, two-stage + shelf hint** — better than Inkling on **all 13** localizers where both readers are defined. Standalone bake-off on 39 human-labelled crops: top-1 0.56 (CI 0.41–0.71) vs 0.49 (0.34–0.64), family 0.69 vs 0.67, abstention 18 % vs 44 %, at 9.1 s vs 3.5 s per crop | Inkling 2 Mini (faster, and it was the labeller) | `READER_COMPARE.md`, `RESULTS_GT.md` |
 | Can Part 1 / Part 2 be read? | **No — unchanged by the correction.** Best reader: numeral right on **1 of 11** crops (0.09), Inkling **0 of 11**; the Flash re-pass found a digit on **3 of 47** part-capable crops vs 2 of 123 on whole crops. `unknown` (7 on the one class-scored frame) is the largest per-class error | 2 of 123 whole crops (Inkling), 59 of 597 faces (never human-checked) | `READER_COMPARE.md`, `runs/bootstrap_v3_flash/summary.md`, `runs/bootstrap_v2/summary.md` |
-| Does the pair rule work? | **Direction confirmed, sample too small.** 92 pair-comparable rows, identity defined on 79: **0 lowered, 12 raised, 67 unchanged**, every count/AP number bit-identical. It helps the abstaining Inkling rows (10 of the 12) and moves **0 crops on the shipped configuration** | Untestable — review #5 found `pair=on` was a 100 % no-op before `5ff55c2` | `REPORT.md` §10.2, `results_gt.json` |
+| Does the pair rule work? | **Direction confirmed, sample too small.** 92 pair-comparable rows, identity defined on 79: **0 lowered, 12 raised, 67 unchanged**, every count/AP number bit-identical. It helps the abstaining Inkling rows (9 of the 12) and moves **0 crops on the shipped configuration** | Untestable — review #5 found `pair=on` was a 100 % no-op before `5ff55c2` | `REPORT.md` §10.2, `results_gt.json` |
 | What is the architecture? | **Bundle `rfdetr-faces-final`** = `G2` front-face weights + duplicate suppression + 2-shelf counting + `shelf_hint` + Flash Next two-stage reader, `score_thr 0.65` (the val-selected value), `pair_rule: report`. **Live deviations:** `identity_thr 0.45` vs the scored 0.25, and the CLI's suppression drops 1–2 real boxes the scored row kept (21/25 live vs 22/27 scored) | Bundle `rfdetr-m-1280-v1` (provisional) | `artifacts/rfdetr-faces-final/pipeline.yaml`, `REPORT.md` §7.4, §8.9 |
-| Is it good enough? | **No.** Two photos, one cabinet, one stocking; AP50 is not independent GT (every human box came from a model proposal); exact inventory is computable on **1** frame and is 0.000 for every run; identification costs one API call per cartridge (3–9 s each) | — | `REPORT.md` §11, `results_gt.json` |
+| Is it good enough? | **No.** Three photos, one cabinet, one stocking arrangement — and `065.jpg`, the third, has a human count of 25 but boxes for only 4 cartridges, so it strengthened counting and almost nothing else; AP50 is not independent GT (every human box came from a model proposal); exact inventory is computable on **1** frame and is 0.000 for every run; identification costs one API call per cartridge (3–9 s each) | — | `REPORT.md` §11, `results_gt.json` |
 
 ## Data
 - **Source:** `data/raw/freestyle-vision-data/` — read-only, **private**, original encoders
@@ -82,10 +85,10 @@ with exponential backoff + jitter, `retry_budget_s=600`, ≤2 in-flight requests
 
 | Role | Model | Where | Notes |
 |---|---|---|---|
-| **Reader / identifier (in both shipped bundles)** | **`qwen3-8-flash-next`** (`two_stage` + shelf hint) | Collective | **Chosen on human answers**: better than Inkling on **all 13** localizers — 0.750 (21/28) vs 0.643 on the pick, 0.579 vs 0.474 on `S2`; standalone bake-off 0.56 vs 0.49 top-1 on 39 human-labelled test crops; 9.1 s mean / 6.3 s median per crop measured there, **3.0 s/crop** in today's live CLI demo (budget the slow one); thinking model — needs `max_tokens=8192` |
+| **Reader / identifier (in both shipped bundles)** | **`qwen3-8-flash-next`** (`two_stage` + shelf hint) | Collective | **Chosen on human answers**: better than Inkling on **all 13** localizers — 0.759 (22/29) vs 0.655 on the pick, 0.590 vs 0.487 on `S2`; standalone bake-off 0.56 vs 0.49 top-1 on 39 human-labelled test crops; 9.1 s mean / 6.3 s median per crop measured there, **3.0 s/crop** in today's live CLI demo (budget the slow one); thinking model — needs `max_tokens=8192` |
 | Labeller (stage A + front faces) | `david-birks/inkling-2-mini` | Collective | 0.4–5.4 s/call, reliable; obeys whichever coordinate convention you prompt; 2.8 s median per crop as a reader — the cheap fallback |
 | Judge (crop sheets) | `qwen3-8-flash-next` | Collective | needs `max_tokens=4096`, intermittently 429-throttled (use the `david-birks/` prefix for stability) |
-| Embedder (superseded kNN identifier) | `google/siglip2-base-patch16-224` | local / k8s | also `facebook/dinov2-base` in the B/C/D runs. Scored **0.421** (16/38, `S2` gallery) / **0.036** (1/28, face gallery) against a human where the VLM reader scores 0.579 / 0.750 — the reason neither shipped bundle carries a `gallery.npz` |
+| Embedder (superseded kNN identifier) | `google/siglip2-base-patch16-224` | local / k8s | also `facebook/dinov2-base` in the B/C/D runs. Scored **0.436** (17/39, `S2` gallery) / **0.034** (1/29, face gallery) against a human where the VLM reader scores 0.590 / 0.759 — the reason neither shipped bundle carries a `gallery.npz` |
 | Trained detector | `RFDETR{Small,Medium,Large}` @ 512/576 px, tiled | **k8s Job only** | never `workflows.train_rfdetr` (hardcodes large @ 704², drops negatives, flips/hues the image) |
 | Text-only drafting | `qwen3-8-27b` | — | **not** a vision judge: the endpoint returns 404 for it |
 
@@ -194,14 +197,15 @@ All local — no Hub repos, no public registry.
 - Runs: `runs/<exp_id>-<hash>/{resolved.yaml,meta.json,provenance.json,env.txt,val/,test/,metrics.json,failures/}`
   (`failures/{failures.json,index.html,galleries/,overlays/}` are private images — paths only in docs)
 - Models: `runs/<exp>/training/` (best weights kept, intermediates pruned; full set on the PVC)
-- **Bundles:** `artifacts/rfdetr-faces-final` — **the provisional pick of the corrected human-GT scoring**
+- **Bundles:** `artifacts/rfdetr-faces-final` — **the selected bundle of the corrected human-GT scoring (final for this dataset)**
   (`G2` front-face weights, detector class `cartridge` again because the family is class-agnostic,
   `vlm_crop qwen3-8-flash-next two_stage`, 2-shelf counting/suppression, `score_thr 0.65`,
   `pair_rule: report`; 3 files, 127,904,367-byte checkpoint `5f7f0bc9…`, **no `gallery.npz`**).
   `artifacts/rfdetr-final-v2` is the whole-cartridge **alternative** (`S2` weights, same reader,
   `score_thr 0.308` — its own val-selected value is 0.20). Superseded pre-GT candidates kept for
   comparison: `rfdetr-m-1280-knn-v0` (plain kNN), `rfdetr-m-1280-v1` (hybrid), `rfdetr-m-1280-v2`
-  (v1 knobs + a gallery refreshed from the 6 human train crops). Each has `pipeline.yaml`,
+  (v1 knobs + a gallery refreshed from the 11 human train crop labels in `data/gt/train_crop_labels.json`,
+  150 rows total). Each has `pipeline.yaml`,
   `manifest.json` (SHA-256 per file) and, where applicable, `gallery.npz`. All gitignored — never
   committed, never pushed to a registry.
 - Tables: `docs/freestyle/RESULTS.md` (generated by `freestyle/eval/report.py`, **vs model labels**),
@@ -216,8 +220,10 @@ All local — no Hub repos, no public registry.
 - **The judge can only delete, and the quiz inherits that.** Stage-A recall bounds every counting
   number, and the human GT proves it: `581c0d5e…/045.jpg` came back `counts_mismatch` (a human counted
   28 cartridges, only 22 answered crops exist) because the labeller merged boxes the quiz can only
-  reject, never redraw. `S2` under-counts both stocked frames at its scored threshold (14 boxes on 22
-  cartridges, 16 on 28). Measure stage-A recall before believing any count number.
+  reject, never redraw. At `S2`'s scored threshold the boxes are there (its human-GT failure decomposition
+  on that frame is 1 missed box out of 44 on the two fully-boxed frames) but the *count* is 29 against the
+  human's 28 — stage-A merging and the detector's own over-firing are different failures, and both distort
+  the count. Measure stage-A recall before believing any count number.
 - **Token ceilings.** `judge_labels` defaults to `max_tokens=1024` unless the model name contains
   `lfm3-vl` (≈20-25 verdicts/image, silently truncating); thinking models return **empty text** at
   `max_tokens≤64` because the reasoning tokens eat the budget. Always pass `max_tokens` +
@@ -234,7 +240,7 @@ All local — no Hub repos, no public registry.
   `score_thr` at all and hardcodes the bundle name — wire it to `results_gt.json` before trusting a
   re-exported bundle (`docs/freestyle/REPORT.md` §8.9 deviations, §12.6/§12.7).
 - **Copy-paste augmentation doubles train time and did not buy counting** (`S3` 427.3 s / `S7`
-  327.6 s vs `S2` 145.2 s; corrected count MAE 2.50 / 3.00 vs 2.00, count AP50 0.964 / 0.964 vs 0.950)
+  327.6 s vs `S2` 145.2 s; corrected count MAE 3.667 / 3.000 vs 2.000, count AP50 0.964 / 0.964 vs 0.950)
   — it had been tuned against an answer key that merged cartridges, and inherited the merging. Under the
   *broken* scoring it looked catastrophic (4.50 / 4.40 vs 2.10); the correction moved everyone.
 - **Threshold selection is only as good as the validation split — and it is now down to one frame.**
@@ -246,12 +252,12 @@ All local — no Hub repos, no public registry.
   show a cabinet, and get more of them.
 - **Peak VRAM does not track model size:** Small @ 512 px peaks at 6.15 GiB, every Medium @ 576 at
   4.09 GiB, `G2` (Small, 1024 px tiles) at 6.89 GiB. Resolution and batch size drive it.
-- **The GT quiz answers whole-cartridge boxes, and the pick is now a face detector.** `G2` wins the count
-  on 2 photos but is scored against boxes that describe whole cartridges: its AP50 is 0.527 vs `S2` 0.950 /
-  `C1` 0.983, and §9 of REPORT shows 16 of its 18 false positives on the scored frames are
+- **The GT quiz answers whole-cartridge boxes, and the selected bundle is a face detector.** `G2` wins the count
+  on 3 photos but is scored against boxes that describe whole cartridges: its AP50 is 0.527 vs `S2` 0.950 /
+  `C1` 0.983, and §9 of REPORT shows 16 of its 18 false positives on the two fully-boxed frames are
   `FP:fragment` — a face box inside a cartridge box. Face-level human box GT would have to be drawn in the
   review app over `data/labels/faces_v2.json` before that gap could be read as anything but the mismatch.
-  This is the strongest reason not to treat the pick as settled.
+  This is the strongest reason not to read the (final) selection as a measurement of the product.
 - **AP50 here is not independent GT.** Every human-GT annotation carries `box_source = "model"`; the
   human kept, corrected and rejected model proposals. 0.983 is agreement with what the labeller chose
   to draw.
@@ -259,36 +265,42 @@ All local — no Hub repos, no public registry.
   Anything that claims to have measured the pair rule before that commit is measuring nothing.
 
 ## Open / next
-1. ~~Answer the quiz~~ **done** — 128 questions answered, `data/gt/{test,val}.json` exported,
+1. ~~Answer the quiz~~ **done, twice over** — all 180 questions answered (the last session added the two
+   open test counts, 4 test crops, 47 train crops and 1 val crop), `data/gt/{test,val}.json` exported,
    `scripts/finalize_after_gt.sh` scored all 13 localizers; the scoring was then **corrected** (uncountable
-   photos excluded, not zeroed) and the winner moved from `S2` to `G2`. See REPORT §8.9.1.
+   photos excluded, not zeroed) and the winner moved from `S2` to `G2`. See REPORT §8.9.1 for both passes.
 2. **Make the shipped bundle the scored configuration.** `rfdetr-faces-final` already ships the val-selected
    `score_thr 0.65`, but it ships `identity_thr 0.45` where scoring used **0.25**, and the CLI's duplicate
    suppression costs 1–2 real boxes per photo relative to `score_all`'s counting (21/25 live vs 22/27
-   scored, REPORT §7.4). Re-export with `identity_thr 0.25` and either re-tune `suppress_*` on the usable
-   photos or teach `score_all` the same suppression — until then nobody should quote 0.500 as "what the
+   scored, REPORT §7.4), and the third scored photo (`065.jpg`) has never been run through the live bundle
+   at all. Re-export with `identity_thr 0.25`, run all three scored photos, and either re-tune `suppress_*`
+   on them or teach `score_all` the same suppression — until then nobody should quote 1.000 as "what the
    bundle does".
-3. **Go get the frames that make the numbers mean something — this is the whole ballgame now.** The 2
-   skipped test counts (`3270fb41…/065.jpg`, `50828e4b…/008.jpg`) turn n = 2 into n = 4 and
-   `scripts/finalize_after_gt.sh --skip-quiz` re-scores every row; the 4 unanswered test crops, the 47
-   unanswered train gallery questions, and — most of all — a **fixed, well-positioned camera** and a
-   **second cabinet / re-stocked shelf**. 10 of 12 test photos carry no usable cabinet at all, so more
-   usable photos are worth more than another detector sweep. Cross-cabinet and stocking-change
-   generalisation is completely unmeasured, and slot memorisation cannot be ruled out.
+3. **Go get the frames that make the numbers mean something — this is the whole ballgame now, and it is the
+   only move left.** The queue is exhausted: all 180 questions are answered, `065.jpg` is counted (25) and
+   `008.jpg` was refused, so `scripts/finalize_after_gt.sh --skip-quiz` will keep reproducing the same 184
+   rows until new images enter the `test` split. REPORT §12.8 is the recipe (capture from a **fixed,
+   well-positioned camera** → `freestyle.audit` → `freestyle.make_splits` → proposals + k8s inference →
+   `freestyle.quiz.active` → answer → finalize). 9 of 12 test photos carry no usable cabinet at all, so more
+   usable photos are worth more than another detector sweep; so is a `freestyle.review.server` box pass over
+   `065.jpg`, whose 4 human boxes are why per-class inventory, exact inventory and AP50 still have a
+   **1-image** denominator. Cross-cabinet and stocking-change generalisation is completely unmeasured, and
+   slot memorisation cannot be ruled out.
 4. **Teach Part 1 vs Part 2 to be learned instead of read.** The numeral is unreadable (1 of 11 crops
-   for the best reader, 3 of 47 digits found in a 315-crop re-pass); the 6 human train crops, 12 human
-   `part` answers and the pair-rule geometry are the only plausible signal, and no run here uses them.
+   for the best reader, 3 of 47 digits found in a 315-crop re-pass); the 11 human train crop labels
+   (`data/gt/train_crop_labels.json` — all two-part brands except one `hi-c`), the 14 human `part` answers
+   (7 test + 7 train) and the pair-rule geometry are the only plausible signal, and no run here uses them.
    The pair rule itself remains a hypothesis that never hurts (REPORT §10.2: 12 of 79 defined rows raised,
    0 lowered, and 0 crops moved on the shipped configuration).
 5. **Batch the reader.** Identification is one Collective call per cartridge — 65–80 s per stocked photo
    today (3.0 s/crop, `runs/cli_faces_demo/counts.json`), 9.1 s/crop mean in the bake-off, so plan on
    75–225 s per photo — and `LLMC_API_KEY` is required at inference time. Batched/cached reading is the
    biggest latency win left; contact sheets are already disproven (top-1 0.21 / 0.00).
-6. **Settle the face question properly.** Family G now leads on counts, so its two open debts matter:
+6. **Settle the face question properly.** Family G leads on counts, so its two open debts matter:
    a **face-level box-GT pass** in the review app over `data/labels/faces_v2.json` (53 residual duplicate
    face pairs await a human), and negative-aware training — `G1`'s dominant model-label error is 56
    `FP:background`, i.e. faces invented on slats and door edges, and `G2` still shows 2 `FP:background`
-   plus 13 missed cartridges against whole-box GT on the two scored frames (REPORT §9).
+   plus 13 missed cartridges against whole-box GT on the two fully-boxed frames (REPORT §9).
 7. Unrun configs: `S4_c2_long`, `A1`–`A3` (pure VLM localizers), `E1` (shelf + kNN),
    `F1` (shelf + VLM id). `B2_sam3_siglip2` is blocked by HF gated access (403).
 
