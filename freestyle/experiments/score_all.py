@@ -1,6 +1,15 @@
 """Prepare human-only quiz ground truth for the scoring pass.
 
 Score human quiz counts and identities against experiment predictions.
+
+Identity variants that read model-labelled proposals (``data/labels/*.json``, never GT):
+    ``vlm``       Inkling 2 Mini two-stage identities from ``--proposals``
+    ``vlm_flash`` Qwen 3.8 Flash Next two-stage + shelf-hint identities from
+                  ``--proposals-flash`` (``data/labels/bootstrap_v3_flash.json``, made by
+                  ``python -m freestyle.reidentify --mode two_stage_shelf --profile
+                  reader_compare``). Same IoU >= 0.5 box matching, only the reader differs,
+                  so the two rows are a direct A/B of the readers on human answers.
+Both are also scored with the pair rule off and on.
 """
 
 from __future__ import annotations
@@ -177,8 +186,35 @@ def train_gallery(emb, proposals, splits, confidence):
     return indexes, targets
 
 
+def apply_proposal_identities(rows, image, proposals, modes=('two_stage',)):
+    """Copy a VLM two-stage identity onto predicted boxes that match a proposal box.
+
+    ``proposals`` is ``proposal_data(...)`` of a model-labelled COCO keyed by image file
+    name; only proposals whose ``id_mode`` is in *modes* are used (the plain ``vlm``
+    identifier keeps the strict ``two_stage`` match it was validated with, while
+    ``vlm_flash`` also accepts the ``two_stage_shelf`` replies of the flash reader).
+    A predicted box with no proposal at IoU >= 0.5 keeps no identity.
+    """
+    candidates = [p for p in proposals.get(image['file_name'], [])
+                  if str(p.get('attributes', {}).get('id_mode') or '') in modes]
+    if not candidates or not rows:
+        return rows
+    overlaps = box_iou([r['bbox'] for r in rows], [p['bbox'] for p in candidates])
+    for row, ious in zip(rows, overlaps, strict=True):
+        idx = int(np.argmax(ious))
+        if ious[idx] >= .5:
+            candidate = candidates[idx]
+            attrs = candidate.get('attributes', {})
+            row.update({'class': candidate['class'],
+                        'identity_score': float(attrs.get('id_confidence') or 0),
+                        'family': attrs.get('id_family'), 'part': attrs.get('id_part'),
+                        'family_confidence': float(attrs.get('id_confidence') or 0),
+                        'part_confidence': float(attrs.get('id_confidence') or 0)})
+    return rows
+
+
 def identify(preds, image, method, proposals, emb, val_gt, validation=False,
-             train_items=None, fitted=None):
+             train_items=None, fitted=None, flash_proposals=None):
     rows = [dict(p, **{'class': 'unknown', 'identity_score': 0.0}) for p in preds]
     if method == 'none':
         return rows
@@ -188,21 +224,11 @@ def identify(preds, image, method, proposals, emb, val_gt, validation=False,
             row['identity_score'] = float(row.get('id_score', row.get('score', 0)))
         return rows
     if method == 'vlm':
-        candidates = [p for p in proposals.get(image['file_name'], [])
-                      if p.get('attributes', {}).get('id_mode') == 'two_stage']
-        if not candidates or not rows:
-            return rows
-        overlaps = box_iou([r['bbox'] for r in rows], [p['bbox'] for p in candidates])
-        for row, ious in zip(rows, overlaps, strict=True):
-            idx = int(np.argmax(ious))
-            if ious[idx] >= .5:
-                candidate = candidates[idx]
-                attrs = candidate.get('attributes', {})
-                row.update({'class': candidate['class'], 'identity_score': float(attrs.get('id_confidence') or 0),
-                            'family': attrs.get('id_family'), 'part': attrs.get('id_part'),
-                            'family_confidence': float(attrs.get('id_confidence') or 0),
-                            'part_confidence': float(attrs.get('id_confidence') or 0)})
-        return rows
+        return apply_proposal_identities(rows, image, proposals)
+    if method == 'vlm_flash':
+        # Same IoU>=0.5 box matching as 'vlm', identities from the Flash Next pass.
+        return apply_proposal_identities(rows, image, flash_proposals or {},
+                                         modes=('two_stage', 'two_stage_shelf'))
     if emb is None or not rows:
         return rows
     uses_train = 'trainvlm' in method
@@ -458,6 +484,12 @@ def run(args):
     audit = {i['image_id']: i for i in read_json(args.audit)['images']}
     proposal_coco = read_json(args.proposals)
     proposals = proposal_data(proposal_coco)
+    flash_proposals = None
+    if getattr(args, 'proposals_flash', None):
+        flash_path = Path(args.proposals_flash)
+        if not flash_path.is_file():
+            raise ValueError(f'flash proposal file does not exist: {flash_path}')
+        flash_proposals = proposal_data(read_json(flash_path))
     gt, counts, excluded = {}, {}, {}
     for split in ('val', 'test'):
         gt[split], counts[split], excluded[split] = build_human_gt(queue, answers, split)
@@ -473,6 +505,10 @@ def run(args):
                               'Training and validation splits may include near-duplicate images.',
                               'Validation embeddings use leave-one-group-out gallery; test uses all eligible validation crops.',
                               'Training VLM gallery confidence is selected on validation; test labels are never used.']}
+    if flash_proposals is not None:
+        result['limitations'].append(
+            f'vlm_flash identities come from {args.proposals_flash}: model-generated, '
+            'matched to predicted boxes at IoU>=0.5, never human labels.')
     # Val crops are optional: with none answered, the val-only embedding galleries are empty
     # and the identifier variants that depend on them cannot produce meaningful numbers.
     val_gallery_total = len(gt['val']['annotations'])
@@ -498,6 +534,8 @@ def run(args):
         emb = load_embeddings(path / 'embeddings.npz')
         val_gallery_size = len(gallery(emb, gt['val'])[1]) if emb is not None else 0
         methods = ['none', 'vlm']
+        if flash_proposals is not None:
+            methods.append('vlm_flash')
         if family.startswith('D_'):
             methods.append('own')
         if emb is not None:
@@ -518,8 +556,7 @@ def run(args):
                 train_items = train_gallery(emb, proposals, splits, confidence) if train_variant else None
                 if train_variant and not train_items[0]:
                     continue
-                val_rows = {im['id']: identify((predictions['val'].get(im['id']) or predictions['val'].get(im['file_name'], [])), im, method, proposals, emb,
-                                                gt['val'], validation=True, train_items=train_items, fitted=fitted)
+                val_rows = {im['id']: identify((predictions['val'].get(im['id']) or predictions['val'].get(im['file_name'], [])), im, method, proposals, emb, gt['val'], validation=True, train_items=train_items, fitted=fitted, flash_proposals=flash_proposals)
                             for im in gt['val']['images']}
                 variants[confidence] = (train_items, val_rows)
             if not variants:
@@ -537,8 +574,7 @@ def run(args):
                 tied.sort(key=lambda item: item[1] if item[1] is not None else -1.)
                 key, confidence, train_items = tied[(len(tied) - 1) // 2]
                 score_thr, id_thr = key[2:4]
-                test_rows = {im['id']: identify((predictions['test'].get(im['id']) or predictions['test'].get(im['file_name'], [])), im, method, proposals, emb,
-                                                 gt['val'], train_items=train_items, fitted=fitted)
+                test_rows = {im['id']: identify((predictions['test'].get(im['id']) or predictions['test'].get(im['file_name'], [])), im, method, proposals, emb, gt['val'], train_items=train_items, fitted=fitted, flash_proposals=flash_proposals)
                              for im in gt['test']['images']}
                 images = gt['test']['images']
                 sharp, partial = audit_subsets(images, audit)
@@ -569,6 +605,9 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument('--splits', type=Path, default=Path('data/splits.json'))
     parser.add_argument('--audit', type=Path, default=Path('data/derived/audit/audit.json'))
     parser.add_argument('--proposals', type=Path, default=Path('data/labels/bootstrap_v2.json'))
+    parser.add_argument('--proposals-flash', type=Path, default=None,
+                        help='second reader proposal COCO (e.g. data/labels/bootstrap_v3_flash.json); '
+                             'adds the vlm_flash identifier variant when given')
     parser.add_argument('--bootstrap', type=int, default=1000)
     parser.add_argument('--demo', action='store_true')
     args = parser.parse_args(argv)

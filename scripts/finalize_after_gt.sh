@@ -10,8 +10,10 @@
 #                      val COUNT question is answered. Val crops and all train questions are
 #                      optional — score_all only reads val counts to pick its thresholds.
 #   3. to_coco       — export data/gt/test.json + data/gt/val.json (+ *_counts.json mismatches)
-#   4. score_all     — score every run with both val and test predictions, 1000 bootstrap reps
-#                      -> docs/freestyle/RESULTS_GT.md + results_gt.json
+#   4. score_all     — score every run with both val and test predictions, 1000 bootstrap reps,
+#                      identifier variants: none/vlm (Inkling identities) and vlm_flash (Flash
+#                      Next identities, when --proposals-flash exists), each with the pair rule
+#                      off and on -> docs/freestyle/RESULTS_GT.md + results_gt.json
 #   5. report        — print which <!-- GT-PENDING --> markers are still in REPORT.md and which
 #                      GT numbers exist now, so the table swap is mechanical
 #   6. export        — export the winning run as a frozen bundle (best test total-count MAE,
@@ -26,6 +28,8 @@
 # Usage:
 #   scripts/finalize_after_gt.sh [--dry-run] [--skip-quiz] [--skip-export] [--bootstrap N]
 #                                [--min-frac 0.80] [--answer-file PATH] [--queue PATH]
+#                                [--runs GLOB] [--proposals PATH] [--proposals-flash PATH]
+#                                [--bundle-name NAME] [--quiz-host H] [--quiz-port P]
 #
 # --dry-run validates inputs, runs the answer gate against whatever is in the answers file today,
 # prints every command it would run, and mutates nothing (no quiz, no exports, no bundles).
@@ -39,6 +43,10 @@ QUEUE="data/gt/quiz_queue.json"
 ANSWERS="data/gt/quiz_answers.jsonl"
 SPLITS="data/splits.json"
 PROPOSALS="data/labels/bootstrap_v2.json"
+# Flash Next re-identification of the same boxes (freestyle.reidentify --mode two_stage_shelf
+# --profile reader_compare). Optional: score_all only adds the vlm_flash identifier rows when
+# the file is there, so the script still finalizes without it.
+PROPOSALS_FLASH="data/labels/bootstrap_v3_flash.json"
 AUDIT="data/derived/audit/audit.json"
 RUNS_GLOB='runs/*'
 GT_OUT_DIR="data/gt"
@@ -73,11 +81,13 @@ while [ $# -gt 0 ]; do
     --min-frac) MIN_FRAC="${2:?--min-frac needs a value}"; shift ;;
     --queue) QUEUE="${2:?}"; shift ;;
     --answer-file|--answers) ANSWERS="${2:?}"; shift ;;
+    --proposals) PROPOSALS="${2:?}"; shift ;;
+    --proposals-flash) PROPOSALS_FLASH="${2:?}"; shift ;;
     --runs) RUNS_GLOB="${2:?}"; shift ;;
     --bundle-name) BUNDLE_NAME="${2:?}"; shift ;;
     --quiz-host) QUIZ_HOST="${2:?}"; shift ;;
     --quiz-port) QUIZ_PORT="${2:?}"; shift ;;
-    -h|--help) sed -n '2,30p' "${BASH_SOURCE[0]}"; exit 0 ;;
+    -h|--help) sed -n '2,33p' "${BASH_SOURCE[0]}"; exit 0 ;;
     *) die "unknown argument: $1 (try --help)" ;;
   esac
   shift
@@ -110,6 +120,18 @@ PYENV=(uv run python)
 if [ "${UV_PROJECT_ENVIRONMENT:-}" = "" ] && [ ! -d .venv ]; then
   say "note: no local .venv; using UV_PROJECT_ENVIRONMENT=/var/tmp/vision-intern-test-venv to avoid filling the RAM disk"
   PYENV=(env "UV_PROJECT_ENVIRONMENT=/var/tmp/vision-intern-test-venv" uv run python)
+fi
+
+# The Inkling identities are always scored; the Flash Next ones join as 'vlm_flash' when
+# data/labels/bootstrap_v3_flash.json exists (score_all fails loudly if it is named but absent).
+SCORE_ARGS=(--proposals "$PROPOSALS")
+if [ -f "$PROPOSALS_FLASH" ]; then
+  say "identifier readers: vlm ($PROPOSALS) + vlm_flash ($PROPOSALS_FLASH)"
+  SCORE_ARGS+=(--proposals-flash "$PROPOSALS_FLASH")
+else
+  say "note: $PROPOSALS_FLASH not found — scoring the vlm (Inkling) reader only"
+  say "      make it with: ${PYENV[*]} -m freestyle.reidentify --in $PROPOSALS --out $PROPOSALS_FLASH \\"
+  say "        --model qwen3-8-flash-next --mode two_stage_shelf --profile reader_compare --only-split val --only-split test"
 fi
 run "${PYENV[@]}" -m freestyle.experiments.score_all --help >/dev/null
 
@@ -265,7 +287,7 @@ say "box fixes in freestyle.review.server before its numbers can be trusted."
 run "${PYENV[@]}" -m freestyle.experiments.score_all \
   --queue "$QUEUE" --answers "$ANSWERS" \
   --runs "$RUNS_GLOB" \
-  --splits "$SPLITS" --audit "$AUDIT" --proposals "$PROPOSALS" \
+  --splits "$SPLITS" --audit "$AUDIT" "${SCORE_ARGS[@]}" \
   --bootstrap "$BOOTSTRAP" \
   --out "$RESULTS_MD"
 run "${PYENV[@]}" -m freestyle.eval.report --runs-dir runs --out docs/freestyle/RESULTS.md
@@ -327,6 +349,9 @@ PY
 HYBRID_IDENTIFIER_JSON='{"type":"hybrid_vlm_knn","family_threshold":0.45,"embedding":{"model":"google/siglip2-base-patch16-224","k":5,"max_per_class":10},"vlm":{"model":"david-birks/inkling-2-mini","upscale":2}}'
 KNN_IDENTIFIER_JSON='{"type":"embedding_knn","model":"google/siglip2-base-patch16-224","k":5,"max_per_class":10}'
 VLM_IDENTIFIER_JSON='{"type":"vlm_crop","model":"david-birks/inkling-2-mini","mode":"two_stage","upscale":2}'
+# the reader comparison's winner (docs/freestyle/READER_COMPARE.md); the pipeline supplies the
+# per-box shelf hint, which is what score_all's vlm_flash identities were read with
+VLM_FLASH_IDENTIFIER_JSON='{"type":"vlm_crop","model":"qwen3-8-flash-next","mode":"two_stage","upscale":2}'
 COUNTING_JSON='{"identity_thr":0.45,"neighbour_vote":"report","max_rows":2,"suppress_iou":0.45,"suppress_containment":0.7,"suppress_row_iou":0.3,"suppress_row_x_overlap":0.5,"shelf_hint":true,"pair_rule":"report"}'
 
 if [ "$SKIP_EXPORT" = 1 ]; then
@@ -344,6 +369,7 @@ else
       knn|proto|knn_trainvlm|knn_trainvlm+val|linear_trainvlm|linear_trainvlm+val) IDENT_JSON="$KNN_IDENTIFIER_JSON" ;;
       own)   IDENT_JSON='{"type":"own"}' ;;
       vlm)   IDENT_JSON="$VLM_IDENTIFIER_JSON" ;;
+      vlm_flash) IDENT_JSON="$VLM_FLASH_IDENTIFIER_JSON" ;;
       none|*) IDENT_JSON="$HYBRID_IDENTIFIER_JSON" ;;
     esac
     say "note: score_all's 'knn/proto/linear' identifiers are gallery variants of embedding_knn;"

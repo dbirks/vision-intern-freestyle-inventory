@@ -384,3 +384,170 @@ def test_audit_subsets_exclude_verified_negative():
     negative = {'file_name': 'negative', 'attributes': {'usable': False}}
     sharp, partial = audit_subsets([negative], {'negative': {'motion_blur': 'severe'}})
     assert sharp == partial == []
+
+
+# --------------------------------------------------------------------------- vlm_flash
+
+
+def _fake_run_fixture(tmp_path, flash_class=None):
+    """Two val + two test frames, one answered crop each, one run, no embeddings.
+
+    ``proposals.json`` carries the Inkling two_stage identities (``sprite``, matching the
+    human answer); ``proposals_flash.json`` carries the Flash Next ``two_stage_shelf``
+    identities for the same boxes (``flash_class``, default ``fanta-orange``).
+    """
+    import json
+
+    def save(path, obj):
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(json.dumps(obj))
+
+    classes = [{'id': 1, 'name': 'sprite'}, {'id': 2, 'name': 'unknown'},
+               {'id': 3, 'name': 'fanta-orange'}]
+    flash_class = flash_class or 'fanta-orange'
+    flash_id = {'sprite': 1, 'fanta-orange': 3}[flash_class]
+    images, questions, records, audit, splits_map, groups = [], [], [], [], {}, {}
+    predictions = {'val': [], 'test': []}
+    v2, v3 = [], []
+    for idx, split in enumerate(['val', 'val', 'test', 'test'], 1):
+        name = f'local/{idx}.jpg'
+        splits_map[name], groups[name] = split, split
+        images.append({'image_id': name, 'coco_image_id': idx, 'split': split, 'width': 100,
+                       'height': 100, 'model_top': 1, 'model_bottom': 0, 'model_total': 1})
+        audit.append({'image_id': name, 'scene_label': 'cabinet_full', 'motion_blur': 'none'})
+        count, crop = f'count:{name}', f'crop:{name}:{idx}'
+        questions += [{'qid': count, 'image_id': name, 'kind': 'count'},
+                      {'qid': crop, 'image_id': name, 'kind': 'crop', 'ann_id': idx,
+                       'bbox': [10, 10, 20, 30], 'guess': 'sprite'}]
+        records += [{'qid': count, 'answer': {'result': 'correct'}},
+                    {'qid': crop, 'answer': {'result': 'correct'}}]
+        v2.append({'id': idx, 'image_id': idx, 'bbox': [10, 10, 10, 20], 'category_id': 1,
+                   'attributes': {'id_mode': 'two_stage', 'id_confidence': .9,
+                                  'id_family': 'sprite', 'source': 'vlm:inkling-2-mini'}})
+        v3.append({'id': idx, 'image_id': idx, 'bbox': [10, 10, 10, 20],
+                   'category_id': flash_id,
+                   'attributes': {'id_mode': 'two_stage_shelf', 'id_confidence': .8,
+                                  'id_family': 'sprite', 'id_part': None,
+                                  'source': 'vlm:qwen3-8-flash-next'}})
+        predictions[split].append({'image_id': idx, 'bbox': [10, 10, 10, 20], 'category_id': 1,
+                                   'score': .9, 'proposed_class': 'sprite', 'id_score': .9})
+    # a flash box that matches no predicted box (IoU 0) keeps no identity
+    v3.append({'id': 99, 'image_id': 3, 'bbox': [80, 80, 10, 10], 'category_id': 3,
+               'attributes': {'id_mode': 'two_stage_shelf', 'id_confidence': .8}})
+    coco_images = [{'id': i + 1, 'file_name': im['image_id']} for i, im in enumerate(images)]
+    queue_path, answer_path = tmp_path / 'queue.json', tmp_path / 'answers.jsonl'
+    save(queue_path, {'version': 1, 'classes': classes, 'images': images,
+                      'questions': questions})
+    answer_path.write_text(''.join(json.dumps(r) + '\n' for r in records))
+    save(tmp_path / 'splits.json', {'images': splits_map, 'groups': groups})
+    save(tmp_path / 'audit.json', {'images': audit})
+    save(tmp_path / 'proposals.json', {'images': coco_images, 'annotations': v2,
+                                       'categories': classes})
+    save(tmp_path / 'proposals_flash.json', {'images': coco_images, 'annotations': v3,
+                                             'categories': classes})
+    run = tmp_path / 'runs' / 'C_fake'
+    save(run / 'meta.json', {'config': {'family': 'C_det_agnostic'}})
+    for split in predictions:
+        save(run / split / 'predictions.json', predictions[split])
+    return ['--queue', str(queue_path), '--answers', str(answer_path), '--runs', str(run),
+            '--splits', str(tmp_path / 'splits.json'), '--audit', str(tmp_path / 'audit.json'),
+            '--proposals', str(tmp_path / 'proposals.json'),
+            '--proposals-flash', str(tmp_path / 'proposals_flash.json'), '--bootstrap', '20']
+
+
+def test_vlm_flash_scores_beside_vlm(tmp_path):
+    import json
+
+    argv = _fake_run_fixture(tmp_path) + ['--out', str(tmp_path / 'RESULTS_GT.md')]
+    assert main(argv) == 0
+    data = json.loads((tmp_path / 'results_gt.json').read_text())
+    rows = {(row['identifier'], row['pair_rule']): row for row in data['rows']}
+    assert set(rows) == {('none', 'off'), ('none', 'on'), ('vlm', 'off'), ('vlm', 'on'),
+                         ('vlm_flash', 'off'), ('vlm_flash', 'on')}
+
+    vlm = rows[('vlm', 'off')]['subsets']['all']['metrics']
+    flash = rows[('vlm_flash', 'off')]['subsets']['all']['metrics']
+    assert vlm['identity_accuracy'] == 1 and vlm['exact_inventory'] == 1
+    assert vlm['total_error'] == flash['total_error'] == 0        # same boxes, same counts
+    # the flash reader calls every box fanta-orange, so it loses identity and inventory
+    assert flash['identity_accuracy'] == 0
+    assert flash['exact_inventory'] == 0
+    assert flash['class:fanta-orange'] == 1 and flash['class:sprite'] == 1
+    assert any('bootstrap' not in note and 'vlm_flash identities' in note
+               for note in data['limitations'])
+    for row in data['rows']:
+        if row['identifier'] == 'vlm_flash':
+            assert row['train_gallery_size'] == 0 and row['threshold_source'] == 'val'
+
+
+def test_vlm_flash_agrees_when_the_readers_agree(tmp_path):
+    import json
+
+    argv = (_fake_run_fixture(tmp_path, flash_class='sprite')
+            + ['--out', str(tmp_path / 'RESULTS_GT.md')])
+    assert main(argv) == 0
+    rows = {(row['identifier'], row['pair_rule']): row
+            for row in json.loads((tmp_path / 'results_gt.json').read_text())['rows']}
+    for key in (('vlm', 'off'), ('vlm_flash', 'off')):
+        assert rows[key]['subsets']['all']['metrics']['identity_accuracy'] == 1
+    # with the pair rule on, the family hint still resolves the second box's part
+    assert rows[('vlm_flash', 'on')]['subsets']['all']['metrics']['identity_accuracy'] == 1
+
+
+def test_vlm_flash_requires_its_proposal_file(tmp_path):
+    argv = _fake_run_fixture(tmp_path) + ['--out', str(tmp_path / 'RESULTS_GT.md'),
+                                          '--proposals-flash', str(tmp_path / 'nope.json')]
+    with pytest.raises(SystemExit):
+        main(argv)
+    assert not (tmp_path / 'RESULTS_GT.md').exists()
+
+
+def test_vlm_flash_matching_and_iou_gate():
+    from freestyle.experiments.score_all import identify
+
+    image = {'id': 1, 'file_name': 'a', 'group_id': 'g', 'height': 100,
+             'attributes': {'human_counts': {'total': 1}}}
+    pred = [{'bbox': [0, 0, 10, 10], 'score': .9}]
+    shelf = {'a': [{'bbox': [0, 0, 10, 10], 'class': 'hi-c',
+                    'attributes': {'id_mode': 'two_stage_shelf', 'id_confidence': .7,
+                                   'id_family': 'hi c'}}]}
+    rows = identify(pred, image, 'vlm_flash', {}, None, {}, flash_proposals=shelf)
+    assert (rows[0]['class'], rows[0]['identity_score'], rows[0]['family']) == ('hi-c', .7, 'hi c')
+
+    # 'vlm' stays strict: it does not borrow the shelf-mode replies of the other reader
+    assert identify(pred, image, 'vlm', shelf, {}, None)[0]['class'] == 'unknown'
+
+    # and vlm_flash needs a real box match: IoU 0 leaves the prediction unidentified
+    far = {'a': [{'bbox': [60, 60, 10, 10], 'class': 'hi-c',
+                  'attributes': {'id_mode': 'two_stage_shelf', 'id_confidence': .7}}]}
+    assert identify(pred, image, 'vlm_flash', {}, None, {}, flash_proposals=far)[0]['class'] == 'unknown'
+
+
+def _without(argv, flag):
+    """Drop one ``--flag VALUE`` pair from an argv list (demo mode synthesizes answers)."""
+    out = list(argv)
+    index = out.index(flag)
+    del out[index:index + 2]
+    return out
+
+
+def test_demo_works_with_and_without_the_flash_file(tmp_path, monkeypatch):
+    import json
+
+    argv = _fake_run_fixture(tmp_path) + ['--out', str(tmp_path / 'RESULTS_GT.md')]
+    monkeypatch.chdir(tmp_path)
+    demo = tmp_path / 'runs' / 'score_all_demo'
+
+    # no --proposals-flash (how finalize_after_gt.sh behaves while the file is missing)
+    no_flash = _without(argv, '--proposals-flash')
+    assert main(['--demo', *_without(no_flash, '--answers')]) == 0
+    assert {row['identifier'] for row in
+            json.loads((demo / 'results_gt.json').read_text())['rows']} == {'none', 'vlm'}
+
+    assert main(['--demo', *_without(argv, '--answers')]) == 0
+    data = json.loads((demo / 'results_gt.json').read_text())
+    assert data['demo'] is True
+    assert {row['identifier'] for row in data['rows']} == {'none', 'vlm', 'vlm_flash'}
+    assert len((demo / 'quiz_answers.jsonl').read_text().splitlines()) == 8
+    assert 'DEMO' in (demo / 'RESULTS_GT.md').read_text()
+
