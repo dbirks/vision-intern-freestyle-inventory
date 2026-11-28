@@ -161,7 +161,13 @@ def _is_retryable(exc: Exception) -> bool:
     return isinstance(
         exc,
         (openai.RateLimitError, openai.APITimeoutError, openai.APIConnectionError),
-    ) or (isinstance(exc, openai.APIStatusError) and exc.status_code >= 500)
+    ) or (isinstance(exc, openai.APIStatusError) and exc.status_code >= 500) or (
+        # The Collective answers 404 "not currently available" / "backend at
+        # capacity" while a model's backend is busy or swapping; it recovers.
+        isinstance(exc, openai.APIStatusError)
+        and exc.status_code == 404
+        and any(s in str(exc) for s in ("not currently available", "at capacity"))
+    )
 
 
 def chat_image(
