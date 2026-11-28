@@ -9,7 +9,7 @@ milestones:
   - {id: gpu-window-1, title: "GPU window 1 + sweep: zero-shot vs RF-DETR (11 runs)", status: done}
   - {id: quiz, title: "Phone quiz for human ground truth (test + val) — live at :8766", status: done}
   - {id: gt, title: "Human ground truth collected (65 test answers + 6 val counts)", status: done}
-  - {id: eval, title: "Score every architecture against ground truth", status: done}
+  - {id: eval, title: "Score every architecture against ground truth (re-scoring: unusable photos excluded)", status: active}
   - {id: iterate, title: "Iterate on failures (identity, bottom shelf, pairs)", status: todo}
   - {id: faces, title: "Front-face detector experiment (family G, your idea): trained G1/G2", status: done}
   - {id: select, title: "Select architecture + export bundle: RF-DETR Medium 1280 + Flash Next reader (rfdetr-final-v2)", status: done}
