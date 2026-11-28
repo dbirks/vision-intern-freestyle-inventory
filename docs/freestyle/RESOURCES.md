@@ -50,6 +50,8 @@ Notes:
   collected without `metrics.json`/`meta.json`.
 * Copy-paste augmentation is the dominant train-time cost: S3 (427.3 s) vs C2 (289.0 s) and
   S7 (327.6 s) vs S2 (145.2 s) at the same model/resolution/epochs.
+* Bundle exports cost one local copy of the checkpoint each (`G2` 127,904,367 B →
+  `artifacts/rfdetr-faces-final/`, verified `OK: rfdetr-faces-final (3 files verified)`); no GPU time.
 * Face runs train on fewer frames than the whole-cartridge runs (597 cleaned faces over 9 train
   frames vs 563 boxes over 10), which is most of why G1's train time is 75.3 s against S2's 145.2 s
   at the same model and tile size (`runs/faces_v2/summary.md`).
@@ -72,6 +74,10 @@ model-made and more variants could not separate faces from whole-cartridge boxes
 
 | Bundle / stage | Per-frame timings (ms) | Process cost | Source |
 |---|---|---|---|
+| **`rfdetr-faces-final`** (provisional pick: front-face RF-DETR-S tile 1024 + Flash Next two-stage reader, `score_thr 0.65`) — the current bundle | `frame.jpg` (val): localize 1,783.9 / dedup 616.3 / **identify 64,901.3** / count 5.2 · `e194690f…/002.jpg` (test, human 22): 1,712.7 / 490.7 / **71,154.9** / 4.8 · `581c0d5e…/045.jpg` (test, human 28): 1,740.5 / 608.5 / **80,072.4** / 2.9 | **3 frames in 230.54 s wall, exit 0, peak RSS 1.26 GB**; 72 crops identified → **3.00 s/crop** mean (identify = 216.1 s of the stage time, ~94 %); requires `LLMC_API_KEY` | `runs/cli_faces_demo/{counts.json,wall.json,stderr.log}` (wrapper `runs/cli_faces_demo/_run_demo.py`, log `~/.local/share/vision-intern/faces-demo.log`) |
+| `rfdetr-final-v2` (close alternative: whole-cartridge RF-DETR-M tile 1280, same reader) — run A | `frame.jpg`: localize 1,520.8 / dedup 621.9 / **identify 82,651.1** / count 6.9 (23 boxes → 3.59 s/crop) · `50828e4b…/008.jpg`: 1,284.8 / 499.9 / 79,169.7 / 2.5 · `10455345…/013.jpg`: 3,330.5 / 5.3 / 16,477.0 / 0.3 | 3 frames / 46 boxes → identify **178,298 ms** ≈ 94 % of stage time; 3.96 s/crop avg. Two of its three frames (`008.jpg`, `013.jpg`) are excluded from scoring — display only | `runs/cli_final_demo/counts.json` |
+| same bundle — run B (endpoint was faster) | `frame.jpg`: 1,330.6 / 596.2 / **44,965.7** / 1.8 (22 boxes → 2.04 s/crop) · `50828e4b…/008.jpg`: 1,778.8 / 472.7 / **123,815.4** / 4.5 (20 boxes → 6.19 s/crop) | same weights, same reader: identify per crop moved 2.04 ↔ 6.19 s between runs — the number to plan on is the slow one | `runs/cli_final_demo_flash/counts.json` |
+| GPU reference for the same detector weights | `G2` test **0.242 s/img**, val 0.365 s/img, train 191.4 s, peak 6.89 GiB, job wall 262 s (`S2`: 0.223 / 0.309 s/img, 145.2 s, 4.09 GiB, 213 s) | the CPU identify stage is 25–330× the whole GPU frame time: one Collective call per crop | `runs/G2_rfdetr_small_faces-7c7b4587/meta.json`, `runs/S2_c2_tile1280-db269936/meta.json` |
 | `rfdetr-m-1280-knn-v0` (RF-DETR-M tile 1280 + plain SigLIP2 kNN) | `frame.jpg`: localize 5,516.5 / identify 9,363.8 / count 635.7 · `50828e4b…/008.jpg`: 3,355.0 / 10,202.3 / 697.2 · `10455345…/013.jpg`: 2,003.9 / 821.2 / 2.6 | 3 frames in **67.18 s** wall, exit 0, peak RSS **1.73 GB** (~15 s of it one-time model load) | `runs/bundle_demo/frames/counts.json`, `runs/bundle_demo/count.err` (`WALL_SECONDS=67.18 EXIT=0 PEAK_RSS_GB=1.73`, measured by `runs/bundle_demo/_measure.py`) |
 | `rfdetr-m-1280-v1` (same detector + duplicate suppression + 2-shelf counting + hybrid VLM-family/kNN identifier) | `frame.jpg`: localize 6,195.0 / **dedup 981.1** / identify **38,797.1** / count 3.5 · `008.jpg`: 5,483.3 / 663.4 / 35,297.7 / 1.8 · `013.jpg`: 2,601.6 / 5.6 / 7,775.5 / 0.2 | ~15–20 s of local compute per photo **plus** ~3 s per batch of Inkling calls; requires `LLMC_API_KEY` at inference time | `runs/bundle_demo_v1/counts.json` (`count.json` is the same run), `devlog/content/2026-11-27-bundle-v1.md` |
 | Comparison vs GPU | GPU detector inference is 0.223 s/img for the same checkpoint (S2 test split) | the CPU identify stage is 5–12× the whole GPU frame time, because the hybrid identifier makes one Collective call per crop | `runs/S2_c2_tile1280-db269936/meta.json`, rows above |
@@ -91,7 +97,12 @@ not only accuracy.
 | Face-label cleanup `faces_v2` | 0 fresh (pure geometry + verdict filter) | — | — | — | `runs/faces_v2/summary.md` |
 | Front-face cleanup `faces_v2` | 0 fresh (pure geometry + verdict filter) | — | — | — | `runs/faces_v2/summary.md` |
 | Endpoint probe (3 real frames, tiny/detect/identify/count modes) | per-model rows | sequential single run 2026-11-26 18:49 UTC | `inkling-2-mini` 0.4–5.4 · `qwen3-8-flash-next` 9–107 (429 storm: 502.9 s tiny probe, >14 min hang) · `david-birks/qwen3-8-flash-next` 1.7–46 | heavy 429s only for unprefixed `qwen3-8-flash-next`; `qwen3-8-27b` hard 404 (no vision) | `runs/probe-collective/results.json`, `docs/freestyle/llm_collective.md` |
+| `rfdetr-faces-final` CPU demo (this pass, 2026-11-27) | 72 crops → ~72+ family calls (+ part calls on two-part brands) | 230.54 s wall for 3 frames | 3.00 s/crop mean in-pipeline (9.1 s mean measured in `reader_compare`) | 0 / 0 | `runs/cli_faces_demo/{wall.json,stderr.log}` |
 | v1 identifier at inference (per frame) | ~26–40 crops × 1 Inkling family call | 35–39 s CPU-bound per dense frame | see §2 | retried with backoff ≤600 s (`freestyle/collective.py`) | `runs/bundle_demo_v1/counts.json` |
+
+The demo's 3.0 s/crop is what the endpoint gave today; `reader_compare` measured 9.1 s mean / 6.3 s
+median for the same model and mode under a different load, so budget **3–9 s per cartridge**
+(≈75–225 s per stocked photo) rather than either number alone.
 
 Reference cost ceiling for the whole quiz-adjacent VLM budget: the two bootstrap passes plus face
 labelling together spent ~1,149 API calls and ~110 minutes of wall time, with zero failed calls,
