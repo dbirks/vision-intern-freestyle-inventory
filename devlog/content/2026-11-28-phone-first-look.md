@@ -20,5 +20,5 @@ two Fanta faces are visible.
 every call kept retrying. A client fix now retries the Collective's temporary "not currently
 available" 404 instead of crashing.
 
-**Next:** your true counts for these two photos, to check how close 26/24 is. The Medium (S2)
-bundle is still running for comparison.
+**Next:** your true counts for these two photos, to check how close 26/24 is. The Medium (S2) bundle
+boxed only **25** and **18** on the same photos, so front faces find more here too.
