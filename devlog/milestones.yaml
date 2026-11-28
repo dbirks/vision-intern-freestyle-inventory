@@ -12,5 +12,5 @@ milestones:
   - {id: eval, title: "Score every architecture against ground truth", status: done}
   - {id: iterate, title: "Iterate on failures (identity, bottom shelf, pairs)", status: todo}
   - {id: faces, title: "Front-face detector experiment (family G, your idea): trained G1/G2", status: done}
-  - {id: select, title: "Select architecture + export model bundle (candidate bundle in progress)", status: active}
-  - {id: report, title: "Final report + how-to-run", status: todo}
+  - {id: select, title: "Select architecture + export bundle: RF-DETR Medium 1280 + Flash Next reader (rfdetr-final-v2)", status: done}
+  - {id: report, title: "Final report + how-to-run", status: active}
