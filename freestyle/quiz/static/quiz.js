@@ -374,6 +374,28 @@
     }).catch(function () { busy = false; toast('undo failed', true); });
   }
 
+  // Re-offer the current question even if it was skipped/hidden (POST /api/revisit).
+  // A revisit is not an answer: it only resets the skip budget server-side.
+  function revisit(question) {
+    if (busy || !question) return;
+    busy = true;
+    fetch('/api/revisit', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ qid: question.qid })
+    }).then(function (response) {
+      return response.json().then(function (body) { return { ok: response.ok, body: body }; });
+    }).then(function (result) {
+      busy = false;
+      if (!result.ok) { toast(result.body.error || 'revisit failed', true); return; }
+      var state = result.body.state || {};
+      answers = state.answers || answers;
+      index = typeof state.next_index === 'number' ? state.next_index : index;
+      render();
+      toast('\u21ba back to it \u2014 tap \u21b5 or \u0079 to answer');
+    }).catch(function () { busy = false; toast('revisit failed', true); });
+  }
+
   function answerFromDataset(q, dataset) {
     if (dataset.class) return { result: 'class', class: dataset.class };
     if (dataset.crop) return dataset.crop === 'skip' ? { result: 'skip' } : { result: dataset.crop };
@@ -462,6 +484,7 @@
     var key = event.key;
     if (key === 'Escape' && !els.lightbox.hidden) { event.preventDefault(); closeZoom(); return; }
     if (key === 'u') { event.preventDefault(); undo(); return; }
+    if (key === 'r') { event.preventDefault(); revisit(q); return; }
     if (key === 's') { event.preventDefault(); send(q.qid, { result: 'skip' }, q); return; }
     if (key === 'Enter') {
       if (selected) { event.preventDefault(); pressNext(); }

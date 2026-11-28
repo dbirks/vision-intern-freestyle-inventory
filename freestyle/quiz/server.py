@@ -18,6 +18,8 @@ Endpoints (JSON unless noted):
     GET  /img/crop?i=<q idx>     one padded crop from ORIGINAL pixels, upscaled
     GET  /img/context?i=<q idx>  small frame thumbnail with that box highlighted
     POST /api/answer             append one answer line
+    POST /api/revisit            append a revisit marker (re-offer a hidden/skipped
+                                 question; does not count as an answer)
     POST /api/undo               drop the last answer line
 
 Images are only ever read from ``--images-root`` and only for image ids present
@@ -43,10 +45,15 @@ from typing import Any
 
 from PIL import Image, ImageDraw, ImageFont
 
-from freestyle.quiz.build_queue import COUNT, CROP, validate_queue
+from freestyle.quiz.build_queue import COUNT, CROP, qid_image_id, validate_queue
 from freestyle.review.server import CONTENT_TYPES, safe_join
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
+
+#: Answer result for a revisit marker. A revisit is not an answer: it is never
+#: placed in the answered map (so it does not change the answered count) and it
+#: resets a count question's skip budget so a twice-skipped question can be answered.
+REVISIT = "revisit"
 DEFAULT_IMAGES_ROOT = REPO_ROOT / "data" / "raw" / "freestyle-vision-data" / "images"
 STATIC_DIR = Path(__file__).resolve().parent / "static"
 
@@ -69,6 +76,19 @@ CROP_RESULTS = {"correct", "class", "part", "not_cartridge", "two_plus", "partia
 
 class QuizError(ValueError):
     """Bad request the UI should surface (-> HTTP 400)."""
+
+
+def _is_revisit(record: Any) -> bool:
+    """True for a revisit marker record (which is not an answer)."""
+    return isinstance(record, dict) and (record.get("answer") or {}).get("result") == REVISIT
+
+
+def _record_image_id(record: dict[str, Any]) -> str:
+    """Image id a log record belongs to (from ``image_id``, else parsed from the qid)."""
+    image_id = record.get("image_id")
+    if image_id:
+        return str(image_id)
+    return qid_image_id(str(record.get("qid") or ""))
 
 
 # --------------------------------------------------------------------------- images
@@ -215,7 +235,10 @@ class QuizStore:
                         continue
                     if isinstance(record, dict) and record.get("qid") in self.by_qid:
                         self._answers.append(record)
-                        self._answered[str(record["qid"])] = record
+                        # A revisit marker belongs to the log but is not an answer,
+                        # so it must not mark its question as answered.
+                        if not _is_revisit(record):
+                            self._answered[str(record["qid"])] = record
             return len(self._answers)
 
     def _write_log(self, records: list[dict[str, Any]]) -> None:
@@ -258,6 +281,27 @@ class QuizStore:
             self._answers.extend(records)
             for item in records:
                 self._answered[item["qid"]] = item
+        return record
+
+    def revisit(self, qid: str) -> dict[str, Any]:
+        """Append a revisit marker so a hidden/skipped question is offered again.
+
+        The marker is ``{"qid": ..., "answer": {"result": "revisit"}}``. It is not
+        an answer: it never enters the answered map (the answered count is
+        unchanged) and it clears that image's skip budget for ``next_index``.
+        """
+        question = self.by_qid.get(str(qid))
+        if question is None:
+            raise QuizError(f"unknown question id {qid!r}")
+        record = {"qid": question["qid"], "answer": {"result": REVISIT}}
+        with self._lock:
+            line = json.dumps(record, separators=(",", ":"), sort_keys=True) + "\n"
+            self.answers_path.parent.mkdir(parents=True, exist_ok=True)
+            with open(self.answers_path, "a", encoding="utf-8") as fh:
+                fh.write(line)
+                fh.flush()
+                os.fsync(fh.fileno())
+            self._answers.append(record)
         return record
 
     def _normalize(self, question: dict[str, Any], answer: Any) -> dict[str, Any]:
@@ -305,31 +349,64 @@ class QuizStore:
         }
 
     def undo(self) -> dict[str, Any] | None:
-        """Drop the last log line and re-replay; returns what was removed."""
+        """Drop the last answer and re-replay; returns what was removed.
+
+        Trailing implied answers and revisit markers are skipped when picking the
+        answer to remove: a revisit marker is not an answer, so undo keeps it (and
+        the question it re-opened) rather than discarding it.
+        """
         with self._lock:
             if not self._answers:
                 return None
             end = len(self._answers)
-            while end and self._answers[end - 1].get("implied_by"):
+            while end and (self._answers[end - 1].get("implied_by") or _is_revisit(self._answers[end - 1])):
                 end -= 1
-            if end:
-                end -= 1
+            if end == 0:
+                return None  # only markers / implied answers left: no answer to undo
+            end -= 1
             removed = self._answers[end]
-            self._write_log(self._answers[:end])
-            self._answers = self._answers[:end]
+            # keep the earlier answers plus any revisit markers after the removed one;
+            # drop the answer itself and the implied records generated by it.
+            kept = self._answers[:end] + [r for r in self._answers[end + 1 :] if _is_revisit(r)]
+            self._write_log(kept)
+            self._answers = kept
             self._answered = {}
             for record in self._answers:
-                self._answered[record["qid"]] = record
+                if not _is_revisit(record):
+                    self._answered[record["qid"]] = record
             return removed
 
     # -- progress -----------------------------------------------------------
 
     def next_index(self) -> int:
         with self._lock:
+            # Position of the latest revisit marker for each image. Skips recorded
+            # before an image's latest revisit no longer count toward hiding it.
+            last_revisit: dict[str, int] = {}
+            for pos, record in enumerate(self._answers):
+                if _is_revisit(record):
+                    last_revisit[_record_image_id(record)] = pos
+            revisited_qids = {
+                str(record["qid"]) for record in self._answers if _is_revisit(record)
+            }
             skips: dict[str, int] = {}
-            for record in self._answers:
-                if record.get("kind") == COUNT and record.get("answer", {}).get("result") == "skip":
-                    skips[record["image_id"]] = skips.get(record["image_id"], 0) + 1
+            for pos, record in enumerate(self._answers):
+                if (record.get("kind") == COUNT
+                        and record.get("answer", {}).get("result") == "skip"):
+                    image_id = record.get("image_id") or qid_image_id(str(record.get("qid") or ""))
+                    if pos > last_revisit.get(image_id, -1):
+                        skips[image_id] = skips.get(image_id, 0) + 1
+            # 1. A revisited question the human has not really answered yet (still
+            #    unanswered, or last answer was a skip and it has not been skipped
+            #    again since the revisit) is offered before anything else.
+            for i, question in enumerate(self.questions):
+                qid = str(question["qid"])
+                if qid not in revisited_qids or skips.get(question["image_id"], 0):
+                    continue
+                current = self._answered.get(qid, {}).get("answer", {}).get("result")
+                if current is None or current == "skip":
+                    return i
+            # 2. Otherwise the first unanswered question, deferring once-skipped ones.
             deferred = []
             for i, question in enumerate(self.questions):
                 image_id = question["image_id"]
@@ -540,6 +617,10 @@ class QuizHandler(BaseHTTPRequestHandler):
             if path == "/api/answer":
                 body = self._body()
                 record = store.answer(body.get("qid", ""), body.get("answer"))
+                self._json(200, {"ok": True, "record": record, "state": store.state_payload()})
+            elif path == "/api/revisit":
+                body = self._body()
+                record = store.revisit(body.get("qid", ""))
                 self._json(200, {"ok": True, "record": record, "state": store.state_payload()})
             elif path == "/api/undo":
                 removed = store.undo()
